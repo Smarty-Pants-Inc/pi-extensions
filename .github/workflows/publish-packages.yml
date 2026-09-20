@@ -21,6 +21,7 @@ jobs:
   # changesets are present this job opens/updates the Version Packages PR; only
   # the later main revision with those changesets consumed reaches publish.
   version:
+    if: github.repository == 'signalridge/pi-extensions'
     name: Create version pull request or publish to npm
     environment: npm-publish
     runs-on: ubuntu-latest

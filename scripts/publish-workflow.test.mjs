@@ -1,8 +1,34 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { readdir, readFile } from "node:fs/promises";
 import test from "node:test";
 
 const workflowUrl = new URL("../.github/workflows/publish-packages.yml", import.meta.url);
+
+for (const [repository, allowed] of [
+  ["signalridge/pi-extensions", true],
+  ["Smarty-Pants-Inc/pi-extensions", false],
+  ["other-owner/pi-extensions", false],
+  ["signalridge/pi-extensions-copy", false],
+]) {
+  test(`release job admission for ${repository} is ${allowed}`, async () => {
+    const workflow = JSON.parse(
+      execFileSync("bun", ["-e", "console.log(JSON.stringify(Bun.YAML.parse(await Bun.stdin.text())))"], {
+        input: await readFile(workflowUrl, "utf8"),
+        encoding: "utf8",
+      }),
+    );
+    const job = workflow.jobs.version;
+    assert.ok(job.steps.length > 0);
+    // Accept only this narrow Actions expression grammar, not arbitrary JS or a
+    // step-level guard that would leave earlier setup and credentials exposed.
+    const condition = /^github\.repository\s*==\s*'([^']+)'$/.exec(job.if);
+    assert.ok(condition, "release admission must be a job-level repository equality");
+    // GitHub Actions string equality ignores case.
+    const admitted = repository.toLowerCase() === condition[1].toLowerCase();
+    assert.equal(admitted, allowed);
+  });
+}
 
 test("publish workflow versions release transitions before invoking npm publish", async () => {
   const workflow = await readFile(workflowUrl, "utf8");
