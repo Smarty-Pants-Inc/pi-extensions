@@ -6,6 +6,14 @@ merge_queue:
 # smarty-dev's plain rule (smarty-dev#865), as on pi and herdr: the PR, its required checks and this queue
 # are the review. The Astra reviewer queues a ready PR after its success verdict; `hold` and DO NOT LAND
 # titles keep a PR out.
+#
+# Cutover (smarty-dev#440, #1110): Mergify injects every required branch-protection check into the
+# queue draft, where nobody posts review/astra, so this queue is usable only once main's classic
+# protection requires smarty-ci alone. Until then review/astra stays required there too and nothing
+# is queued here; PRs land by the owner's direct merge under that protection. The protection change
+# (the admin path, smarty-dev#1599) needs the owner's approval bound to its plan digests, and runs
+# only after this file is on main, so review/astra is required at every step. Before the first queue
+# command, the read-back must show smarty-ci (app 15368) only, and the factory host check must pass.
 queue_rules:
   - name: default
     batch_size: 1
