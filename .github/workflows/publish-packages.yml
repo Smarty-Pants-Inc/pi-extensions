@@ -22,6 +22,8 @@ jobs:
   # the later main revision with those changesets consumed reaches publish.
   version:
     name: Create version pull request or publish to npm
+    # The Smarty-Pants-Inc fork never versions or publishes @signalridge packages (smarty-dev#755).
+    if: github.repository == 'signalridge/pi-extensions'
     environment: npm-publish
     runs-on: ubuntu-latest
 
