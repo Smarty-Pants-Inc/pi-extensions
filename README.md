@@ -85,7 +85,8 @@ Full detail lives in each package's README —
 resume semantics, and routing table;
 [`pi-subagents`](packages/pi-subagents/README.md) for agent types, tiers,
 FleetView, and scheduling. For the released Pi host compatibility matrix and
-current upstream extension references, see [the Pi 0.99.1 compatibility review](docs/pi-0.99-compatibility.md) and its [0.87.1 baseline](docs/pi-0.87-compatibility.md).
+current upstream extension references, see [the Pi 1.0.0 compatibility review](docs/pi-1.0-compatibility.md),
+[the Pi 0.99.1 review](docs/pi-0.99-compatibility.md), and the [0.87.1 baseline](docs/pi-0.87-compatibility.md).
 
 ---
 
