@@ -146,13 +146,14 @@ HTTP 429 responses are registry/account-side throttling. Switching npm to pnpm, 
 package manager, or parallelizing publishes does not bypass the limit. After the authenticated
 release-transition gate passes, the publisher queries only the package manifests changed by that
 transition, from the immutable PR-head snapshot. It publishes missing versions serially; versions
-already present are integrity-checked and release/tag-reconciled, while packages outside the current
-transition are not inspected. A package name absent from npm still fails as unbootstrapped. The
+already present are integrity-checked and their GitHub releases/tags reconciled; existing npm
+dist-tags are not rewritten by this path and must be verified after recovery. Packages outside the
+current transition are not inspected. A package name absent from npm still fails as unbootstrapped. The
 publisher retries transient 429 responses with exponential backoff and `Retry-After` when available,
 and checks `dist.integrity` before resuming a matching version. Every successful package (including
 an integrity-confirmed recovery) is reported immediately before the next package is attempted; a
-later failure does not roll back an earlier tag/release report. The default cooldown between package
-The selected npm dist-tag is monotonic: if the registry already points it at a newer SemVer, the older publish fails closed instead of moving the tag backward.
+later failure does not roll back an earlier tag/release report. The selected npm dist-tag is monotonic: if the registry already points it at a newer SemVer, the
+older publish fails closed instead of moving the tag backward. The default cooldown between package
 writes is 10 seconds; set `PUBLISH_COOLDOWN_MS` only when a deliberate override is needed.
 
 For a partial custom release, rerun a dry preflight for the affected package and then rerun the same
@@ -170,3 +171,9 @@ GitHub releases. The direct-release target remains the merged `GITHUB_SHA`; its 
 body still come from the PR-head snapshot. The retained workflow queue serializes release writes, and only the checkout that still matches the current `origin/main` may update the Version Packages PR. Do not create a
 new version or force a tag to compensate for a transient failure. If a package name has never existed
 on npm, bootstrap that single package first, then configure OIDC and resume the release.
+
+A rerun always executes the publisher from that original SHA, so a publisher fix merged later cannot
+reach it. Rerun only while `main` still points at the release commit: the Changesets action creates
+missing tags against the current `main`, and a later commit there would tag the wrong revision. GitHub
+API reads in the publisher retry transport failures, 5xx responses, and rate limits (including
+secondary limits) with bounded backoff, so a transient GitHub outage no longer aborts a release midway.

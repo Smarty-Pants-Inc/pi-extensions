@@ -1,6 +1,6 @@
 {
   "name": "@signalridge/pi-gpt-fast",
-  "version": "1.2.5",
+  "version": "1.2.6",
   "description": "Opt-in OpenAI and Codex priority service tier for Pi.",
   "type": "module",
   "license": "MIT",
@@ -9,7 +9,7 @@
     "lifecycle": "stable"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.84.0 || ^0.85.0"
+    "@earendil-works/pi-coding-agent": "^0.84.0 || ^0.85.0 || ^0.86.0 || ^0.87.0 || ^0.99.1"
   },
   "pi": {
     "extensions": [
