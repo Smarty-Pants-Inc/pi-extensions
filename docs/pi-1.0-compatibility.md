@@ -20,18 +20,19 @@ The `/btw` command remains restricted to `ctx.mode === "tui"`. Other extension c
 - Pi's new ChatGPT sign-in route belongs to the `openai` provider. The experimental remote Codex compaction package remains deliberately bound to legacy `openai-codex` checkpoints; widening its host peer range does **not** add support for the new sign-in route or migrate existing checkpoint payloads.
 - Packages already use TypeScript 7 development pins where they invoke the compiler. There are no package-manifest `tsx` dependencies to migrate. The release/configuration tooling uses Node `.mjs` entrypoints.
 
-## Verification and remaining gate
+## Verification
 
-No dependency installation was performed. Existing read-only Pi 1.0 dependencies and test tools were used for bounded checks. Comparable subsets at the fork baseline and refreshed checkout passed:
+`bun install --frozen-lockfile` and the workflow's complete `bun run check` passed with Pi 1.0.0, Node 24.19.0, and Bun 1.4.0. The frozen install left `bun.lock` unchanged. CI pins Bun 1.3.14; this local verification used the available newer Bun satisfying the repository's engine constraint, not the exact CI binary.
 
-| Suite | Before | After |
-| --- | ---: | ---: |
-| Release tooling | 34 | 37 |
-| Package configuration | 49 | 49 |
-| BTW fullscreen | 9 | 14 |
-| Shared UI borders | 13 | 13 |
-| **Subset total** | **105** | **113** |
+| Suite | Passed | Failed | Skipped |
+| --- | ---: | ---: | ---: |
+| Package tests (29 packages) | 3,592 | 0 | 33 |
+| Release tooling | 37 | 0 | 0 |
+| Package configuration | 49 | 0 | 0 |
+| **Total** | **3,678** | **0** | **33** |
 
-The fullscreen suite had 12 passing cases immediately after the upstream merge, before the two new cases. Native TypeScript 7.0.2 typechecking of the fullscreen source and regression tests passed against Pi 1.0 declarations. Package boundaries, shared dependency ranges, the 260-file test inventory, npm version comparisons, changeset coverage against the fork baseline, capability generation, all 29 package tarball checks, and secret scanning passed. All 54 Pi peer entries, 46 development pins, eight npm-integrity lock records, workspace lock entries, and retained fork CI commits were mechanically checked; Bun parsed and hashed the lock successfully.
+The 33 skipped subagent cases span four opt-in live-provider test files. All 29 package lint and typecheck commands passed, and the test inventory covers 260 files. The full gate also passed JSON/package/boundary/shared-dependency checks, npm version comparisons, capability generation, packaged-loader smoke, all 29 tarball validations, and secret scanning. The loader smoke activated 27 extensions independently, the subagent/workflow pair, and all 24 stable extensions together.
 
-**The full CI gate is still unverified.** The checkout has no installed dependency tree: `bun run check` stops on missing `semver`, while standalone lint, full typecheck, package tests, and packaged-loader smoke stop on missing tooling or Pi modules. Bounded fallback checks are not a substitute for `bun install --frozen-lockfile` followed by the workflow's `bun run check` in an authorized disposable environment. Live providers, external MCP/LSP servers, physical terminal behavior, the full child-session suite, and the new ChatGPT authentication route were not exercised.
+Without a default-branch ref the full command reports changeset comparison as skipped. A separate `CHANGESET_BASE=fork-main bun run check:changesets` passed with enforcement enabled. A mechanical probe confirmed all 54 Pi peer entries across 28 packages, all 46 development pins, all eight installed Pi 1.0 lock packages, the 28 pending minor changeset entries, and the retained CI check name and install/check commands.
+
+The first complete run after installation was green; no additional Pi 1.0 production fixes were necessary. The earlier missing-dependency failures are resolved by the checkout-local install. Live providers, external MCP/LSP servers, physical terminal behavior, and the new ChatGPT authentication route remain outside this verification. Experimental Codex compaction retains its legacy-provider boundary described above.
