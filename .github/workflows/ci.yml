@@ -24,7 +24,9 @@ jobs:
       - run: find . -name '*.json' -not -path './node_modules/*' -print0 | xargs -0 -n1 jq empty
       - run: bun run check:package-config
       - run: bun run check:boundaries
-      - run: bun run check:versions
+      # No check:versions here: it compares each package with npm's `latest`, which upstream
+      # signalridge publishes and this fork never does (no npm publish from the fork, smarty-dev#755).
+      # Upstream releasing a newer version failed every fork PR (pi-extensions#4, 10-02).
       - run: bun run check:changesets
       - run: bun run lint
       - run: bun run typecheck
