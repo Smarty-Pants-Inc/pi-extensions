@@ -342,15 +342,17 @@ export default function btw(pi: ExtensionAPI, dependencies: BtwExtensionDependen
         activeSessionManager === commandSessionManager &&
         commandSessionManager.getSessionId?.() === commandSessionId;
 
+      // Menus and credential loaders both use Pi's editor-replacing custom UI.
+      // Close them before a navigation can populate the destination editor.
+      const registerClose = (close: () => void) => {
+        if (!ownsCommandSession()) close();
+        else closeActiveMenu = close;
+        return () => {
+          if (closeActiveMenu === close) closeActiveMenu = undefined;
+        };
+      };
       let menuResult: BtwCommandMenuResult = "start";
       if (!question) {
-        const registerClose = (close: () => void) => {
-          if (!ownsCommandSession()) close();
-          else closeActiveMenu = close;
-          return () => {
-            if (closeActiveMenu === close) closeActiveMenu = undefined;
-          };
-        };
         menuResult = await showCommandMenu(pi, ctx, listResumeThreads(), ownsCommandSession, registerClose);
         if (!ownsCommandSession() || menuResult === "closed") return;
       }
@@ -379,7 +381,7 @@ export default function btw(pi: ExtensionAPI, dependencies: BtwExtensionDependen
       try {
         const settings = await loadSettings(ctx);
         if (!ownsCommandSession()) return;
-        const resolution = await resolveModel(settings, ctx);
+        const resolution = await resolveModel(settings, ctx, ownsCommandSession, registerClose);
         if (!ownsCommandSession()) return;
         if (resolution.kind === "cancelled") {
           notifySafely(ctx, "Cancelled", "info");
@@ -488,15 +490,32 @@ type ModelResolutionOutcome =
 async function resolveBtwModelWithLoader(
   settings: BtwSettings,
   ctx: ExtensionCommandContext,
+  isSessionCurrent: () => boolean = () => true,
+  registerClose?: (close: () => void) => () => void,
 ): Promise<ModelResolutionOutcome> {
+  if (!isSessionCurrent()) return { kind: "cancelled" };
   return wrapCustomUi(ctx.ui).custom<ModelResolutionOutcome>((tui, theme, _keybindings, done) => {
     const loader = new BorderedLoader(tui, theme, "Resolving /btw model credentials...");
     let settled = false;
-    loader.onAbort = () => {
+    let unregisterClose: (() => void) | undefined;
+    const finish = (outcome: ModelResolutionOutcome) => {
       if (settled) return;
       settled = true;
-      done({ kind: "cancelled" });
+      unregisterClose?.();
+      const liveEditorText = isSessionCurrent() ? ctx.ui.getEditorText() : undefined;
+      done(outcome);
+      // Pi synchronously restores its opening draft in done(). Restore the live
+      // draft now, not in a later continuation that may follow navigation.
+      if (liveEditorText !== undefined && isSessionCurrent()) ctx.ui.setEditorText(liveEditorText);
     };
+    const close = () => finish({ kind: "cancelled" });
+    loader.onAbort = close;
+    unregisterClose = registerClose?.(close);
+    if (settled) {
+      unregisterClose?.();
+      loader.dispose();
+      return loader;
+    }
 
     resolveBtwModel({
       settings,
@@ -507,14 +526,12 @@ async function resolveBtwModelWithLoader(
       },
     })
       .then((selected) => {
-        if (settled) return;
-        settled = true;
-        done(selected ? { kind: "selected", selected } : { kind: "unavailable" });
+        if (settled || !isSessionCurrent()) return;
+        finish(selected ? { kind: "selected", selected } : { kind: "unavailable" });
       })
       .catch(() => {
-        if (settled) return;
-        settled = true;
-        done({ kind: "unavailable" });
+        if (settled || !isSessionCurrent()) return;
+        finish({ kind: "unavailable" });
       });
 
     return loader;

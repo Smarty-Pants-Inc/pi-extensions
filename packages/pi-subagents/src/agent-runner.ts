@@ -386,6 +386,7 @@ const TOOL_TIMEOUT_CEILING_MS = 600_000;
 // timer can turn that result into an unhelpful "Operation aborted".
 const TOOL_CALL_ABORT_GRACE_MS = 25;
 interface ApprovalTimer {
+  hasInteractiveAsk: boolean;
   isInteractiveAsk: (name: string) => boolean;
   armApproved: (toolCallId: string, toolName: string) => void;
 }
@@ -1110,6 +1111,7 @@ export async function runAgent(
   const resolvedExplicitNames = new Set<string>();
   const interactiveAskNames = new Set(ctx.hasUI ? (agentConfig?.askTools ?? []).map((name) => name.toLowerCase()) : []);
   const approvalTimer: ApprovalTimer = {
+    hasInteractiveAsk: interactiveAskNames.size > 0,
     isInteractiveAsk: (name) => interactiveAskNames.has(name.toLowerCase()),
     armApproved: () => {},
   };
@@ -1552,6 +1554,13 @@ export async function runAgent(
 
   const { session } = await runInChildSessionContext(() => createAgentSession(sessionOpts));
   approvalTimers.set(session, approvalTimer);
+  // Pi prepares parallel siblings before running any execution closure. A
+  // human dialog for the next sibling must not spend an approved tool's clock.
+  // Timeout-enabled interactive children serialize preflight + execution;
+  // ordinary children retain the host's parallel strategy.
+  if (approvalTimer.hasInteractiveAsk && defaultToolTimeoutMs > 0 && session.agent && "toolExecution" in session.agent) {
+    session.agent.toolExecution = "sequential";
+  }
   // Install the forwarding listener immediately after session creation, before
   // bindExtensions/session_start can do asynchronous work. The old placement
   // just before prompt missed an abort during extension activation.
@@ -1802,6 +1811,9 @@ export async function resumeAgent(
   // original prompt's timer callback so a delayed approval cannot arm a stale
   // timer that the first prompt no longer clears.
   const approvalTimer = approvalTimers.get(session);
+  if (approvalTimer?.hasInteractiveAsk && defaultToolTimeoutMs > 0 && session.agent && "toolExecution" in session.agent) {
+    session.agent.toolExecution = "sequential";
+  }
   const toolTimeouts = createToolTimeouts(session, TOOL_CALL_ABORT_GRACE_MS,
     approvalTimer?.isInteractiveAsk ?? (() => false));
   if (approvalTimer) approvalTimer.armApproved = toolTimeouts.armApproved;

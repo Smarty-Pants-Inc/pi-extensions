@@ -20,19 +20,42 @@ The `/btw` command remains restricted to `ctx.mode === "tui"`. Other extension c
 - Pi's new ChatGPT sign-in route belongs to the `openai` provider. The experimental remote Codex compaction package remains deliberately bound to legacy `openai-codex` checkpoints; widening its host peer range does **not** add support for the new sign-in route or migrate existing checkpoint payloads.
 - Packages already use TypeScript 7 development pins where they invoke the compiler. There are no package-manifest `tsx` dependencies to migrate. The release/configuration tooling uses Node `.mjs` entrypoints.
 
+## Review repairs
+
+The round-one safety review identified production fixes beyond dependency admission:
+
+- BTW credential-resolution custom UI now closes before editor-changing navigation, retains the live editor draft on ordinary completion or cancellation, and fences late credential callbacks.
+- Timeout-enabled interactive subagent children use sequential preflight/execution for sibling tool calls, on fresh and resumed turns. Human approval for a sibling cannot consume an earlier tool's timeout. Other children retain the host's execution strategy.
+- The PR status extension clears old status and expiry as soon as a refresh observes a different Git HEAD. An aborted, unrendered request is not coverage that can suppress the installed watcher's recovery.
+
+Each fix has a package-local regression observed failing before the fix and passing afterward. The four deterministic Pi SDK safety suites now admit Pi 1.x rather than silently excluding the pinned target.
+
 ## Verification
 
-`bun install --frozen-lockfile` and the workflow's complete `bun run check` passed with Pi 1.0.0, Node 24.19.0, and Bun 1.4.0. The frozen install left `bun.lock` unchanged. CI pins Bun 1.3.14; this local verification used the available newer Bun satisfying the repository's engine constraint, not the exact CI binary.
+The repair run used Pi 1.0.0, Node 24.19.0 and Bun 1.4.0. `bun install --frozen-lockfile` left `bun.lock` unchanged. CI pins Bun 1.3.14; the local binary satisfies the engine constraint but is not that exact CI version.
+
+`CHANGESET_BASE=fork-main nice -n 10 bun run check` passed with changeset enforcement enabled. The root gate includes npm version comparisons; the fork's pull-request workflow deliberately excludes that upstream publishing check while registering every other root check once under `smarty-ci`.
 
 | Suite | Passed | Failed | Skipped |
 | --- | ---: | ---: | ---: |
-| Package tests (29 packages) | 3,592 | 0 | 33 |
+| Package tests (29 packages) | 3,635 | 0 | 4 |
 | Release tooling | 37 | 0 | 0 |
 | Package configuration | 49 | 0 | 0 |
-| **Total** | **3,678** | **0** | **33** |
+| **Total** | **3,721** | **0** | **4** |
 
-The 33 skipped subagent cases span four opt-in live-provider test files. All 29 package lint and typecheck commands passed, and the test inventory covers 260 files. The full gate also passed JSON/package/boundary/shared-dependency checks, npm version comparisons, capability generation, packaged-loader smoke, all 29 tarball validations, and secret scanning. The loader smoke activated 27 extensions independently, the subagent/workflow pair, and all 24 stable extensions together.
+The earlier 33-skip claim was incorrect: 29 deterministic safety cases were excluded by 0.99-only guards. All now run on Pi 1.0. The only remaining skips are these four explicitly opt-in live-model cases in `packages/pi-subagents/test/subagents-print-mode-e2e.test.ts` (`PI_E2E_LIVE` is unset):
 
-Without a default-branch ref the full command reports changeset comparison as skipped. A separate `CHANGESET_BASE=fork-main bun run check:changesets` passed with enforcement enabled. A mechanical probe confirmed all 54 Pi peer entries across 28 packages, all 46 development pins, all eight installed Pi 1.0 lock packages, the 28 pending minor changeset entries, and the retained CI check name and install/check commands.
+1. `FOREGROUND spawn — real model spawns a subagent and reports its output`
+2. `BACKGROUND spawn + get_subagent_result — model backgrounds work then retrieves it`
+3. `Explore subagent_type — model dispatches a non-default agent type`
+4. `SELF-SMOKE — the agent drives a multi-feature smoke of its own Agent toolset`
 
-The first complete run after installation was green; no additional Pi 1.0 production fixes were necessary. The earlier missing-dependency failures are resolved by the checkout-local install. Live providers, external MCP/LSP servers, physical terminal behavior, and the new ChatGPT authentication route remain outside this verification. Experimental Codex compaction retains its legacy-provider boundary described above.
+All 29 package lint/typecheck commands passed, and the inventory covers 261 test files. JSON/package/boundary/shared-dependency checks, npm versions, changesets, capabilities, release/configuration tests, packaged-loader smoke, all 29 tarball validations and secret scanning passed. Loader smoke activated 27 extensions independently, the subagent/workflow pair, and all 24 stable extensions together.
+
+Real repo-local Pi CLI recordings now cover fullscreen and regular modes in an isolated HOME and PTY, with BTW, input history, subagents, Codex compaction and PR status loaded. They show BTW menu cancellation, the real side-thread missing-key failure and return to the parent transcript; history popup acceptance/cancellation and editor restoration; subagent management and failed-run surfaces; and the Codex settings menu. A recording-only interposer delays real empty-auth resolution and triggers competing-extension committed tree navigation/session replacement: pending loaders close and destination drafts survive late completion. These are real CLI/rendering paths, not SDK-session substitutes; the interposer is explicitly test-only and does not inject model credentials.
+
+## Remaining evidence and compatibility boundary
+
+No model-backed successful turn, live approval interaction, real GitHub response, external MCP/LSP server, or new ChatGPT sign-in flow was exercised. Successful BTW bring-to-main/resume, running-child chat/stop/resume and model-backed compaction still require the authorized release operator's Pi 1.0 evidence gate. Credential-boundary recordings do not substitute for that gate or authorize merging a held release.
+
+Experimental Codex compaction remains bound to legacy `openai-codex`. Its registration-based comparison still safely falls back to native compaction for prepared tool descriptions, including unchanged codemode loadouts. Fixing that reviewed limitation requires a public effective-loadout API (with pending changes observable), not removal of description/ownership validation. Prepared-loadout remote compaction is not claimed as supported by this proof.

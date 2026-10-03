@@ -5,7 +5,7 @@ import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi
 import { streamSimple as compatStreamSimple } from "@earendil-works/pi-ai/compat";
 import { type ExtensionAPI, type ExtensionContext, type ModelRuntime, VERSION } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { runAgent, setDefaultToolTimeoutMs } from "../src/agent-runner.js";
+import { resumeAgent, runAgent, setDefaultToolTimeoutMs } from "../src/agent-runner.js";
 import { registerAgents } from "../src/agent-types.js";
 import type { AgentConfig } from "../src/types.js";
 import { registerFauxProvider } from "./helpers/pi-ai.js";
@@ -14,7 +14,7 @@ vi.setConfig({ testTimeout: 30_000 });
 
 // Tool exposure and nested ctx.executeTool are public Pi 0.99 APIs. The older
 // supported loaders are exercised by agent-runner.test.ts and loader-sdk.test.ts.
-describe.skipIf(!VERSION.startsWith("0.99."))("child tool policy on real Pi 0.99", () => {
+describe.skipIf(!VERSION.startsWith("0.99.") && !VERSION.startsWith("1."))("child tool policy on real Pi 0.99", () => {
   let root: string;
   let cwd: string;
   let agentDir: string;
@@ -49,14 +49,14 @@ describe.skipIf(!VERSION.startsWith("0.99."))("child tool policy on real Pi 0.99
 
   async function runChild(
     paths: string[],
-    calls: string[],
+    calls: Array<string | string[]>,
     onCreated?: (session: Awaited<ReturnType<typeof runAgent>>["session"]) => void,
-    approval?: { tool: string; confirm: () => Promise<boolean> },
+    approval?: { tool: string | string[]; confirm: () => Promise<boolean> },
   ) {
     registerAgents(new Map([["policy", {
       name: "policy", description: "policy", builtinToolNames: [],
       extensions: paths, skills: false, systemPrompt: "Use the requested tools.",
-      ...(approval ? { askTools: [approval.tool] } : {}),
+      ...(approval ? { askTools: Array.isArray(approval.tool) ? approval.tool : [approval.tool] } : {}),
       promptMode: "replace", inheritContext: false, runInBackground: false, isolated: false,
     } as AgentConfig]]));
     const model = faux.getModel();
@@ -70,7 +70,7 @@ describe.skipIf(!VERSION.startsWith("0.99."))("child tool policy on real Pi 0.99
       getProviders: () => [], getProvider: () => undefined,
     } as unknown as ModelRuntime;
     faux.setResponses([
-      ...calls.map((name) => () => fauxAssistantMessage(fauxToolCall(name, {}), { stopReason: "toolUse" })),
+      ...calls.map((names) => () => fauxAssistantMessage((Array.isArray(names) ? names : [names]).map((name) => fauxToolCall(name, {})), { stopReason: "toolUse" })),
       () => fauxAssistantMessage(fauxText("done")),
     ]);
     const modelRegistry = {
@@ -191,6 +191,42 @@ describe.skipIf(!VERSION.startsWith("0.99."))("child tool policy on real Pi 0.99
       isError: false,
       text: JSON.stringify({ isError: false, text: "approved" }),
     }]);
+  });
+
+  it.each([
+    ["fresh", "both-asked"], ["resumed", "both-asked"],
+    ["fresh", "allowed-first"], ["resumed", "allowed-first"],
+  ] as const)("excludes sibling decision time on %s turns (%s)", async (turn, policy) => {
+    setDefaultToolTimeoutMs(20);
+    const path = extension("sibling-approval", `
+      export default function(pi) {
+        const p = { type: "object", properties: {}, additionalProperties: false };
+        for (const name of ["first_probe", "second_probe"]) {
+          pi.registerTool({ name, label: name, description: name, parameters: p,
+            async execute() { return { content: [{ type: "text", text: name }] }; },
+          });
+        }
+      }
+    `);
+    const confirm = vi.fn(async () => {
+      // The second preflight decision outlives the first tool's whole budget.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      return true;
+    });
+    const calls = [["first_probe", "second_probe"]];
+    const { session } = await runChild([path], turn === "fresh" ? calls : [], undefined, {
+      tool: policy === "both-asked" ? ["first_probe", "second_probe"] : "second_probe", confirm,
+    });
+    if (turn === "resumed") {
+      faux.setResponses([
+        () => fauxAssistantMessage([fauxToolCall("first_probe", {}), fauxToolCall("second_probe", {})], { stopReason: "toolUse" }),
+        () => fauxAssistantMessage(fauxText("done")),
+      ]);
+      await resumeAgent(session, "continue");
+    }
+    expect(confirm).toHaveBeenCalledTimes(policy === "both-asked" ? 2 : 1);
+    expect(resultTexts(session, "first_probe")).toEqual([{ isError: false, text: "first_probe" }]);
+    expect(resultTexts(session, "second_probe")).toEqual([{ isError: false, text: "second_probe" }]);
   });
 
   it("times a tool_call handler registered during session_start", async () => {

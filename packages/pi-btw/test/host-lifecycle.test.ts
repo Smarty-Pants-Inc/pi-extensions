@@ -12,6 +12,7 @@ import {
   type ExtensionAPI,
   type ExtensionCommandContext,
   InteractiveMode,
+  initTheme,
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
@@ -229,6 +230,121 @@ async function withRealPiMenu(transition: Transition) {
 test.each(["new", "tree", "cancelled-new", "cancelled-tree"] as const)(
   "real Pi %s transition closes pending BTW menu before editor restoration",
   withRealPiMenu,
+);
+
+test.each(["new", "tree", "complete", "cancel"] as const)(
+  "real credential loader preserves the destination draft on %s and ignores late auth",
+  async (transition) => {
+    initTheme("dark", false);
+    const cwd = await mkdtemp(join(tmpdir(), "pi-btw-credentials-boundary-"));
+    const host = createPiEditorHost("outgoing draft");
+    let runtime: AgentSessionRuntime | undefined;
+    let release!: () => void;
+    const credentials = new Promise<{ ok: true; apiKey: string }>((resolve) => {
+      release = () => resolve({ ok: true, apiKey: "test-only" });
+    });
+    let threadStarts = 0;
+    try {
+      const settingsManager = SettingsManager.inMemory({});
+      const loader = new DefaultResourceLoader({
+        cwd,
+        agentDir: cwd,
+        settingsManager,
+        extensionFactories: [
+          {
+            name: "btw-credential-boundary",
+            factory: (pi) => {
+              btw(pi, {
+                loadSettings: async () => ({}),
+                runFullscreen: async (ctx, run) => run(ctx),
+                runThread: async () => {
+                  threadStarts++;
+                  return { kind: "closed" };
+                },
+              });
+            },
+          },
+        ],
+        noSkills: true,
+        noPromptTemplates: true,
+        noThemes: true,
+        noContextFiles: true,
+      });
+      await loader.reload();
+      const model = { provider: "test", id: "test", reasoning: false } as Model<Api>;
+      const createRuntime: CreateAgentSessionRuntimeFactory = async (options) => {
+        const result = await createAgentSession({
+          ...options,
+          model,
+          resourceLoader: loader,
+          settingsManager,
+          noTools: "all",
+        });
+        return { ...result, services: { cwd, agentDir: cwd } as never, diagnostics: [] };
+      };
+      runtime = new AgentSessionRuntime(
+        (await createRuntime({ cwd, agentDir: cwd, sessionManager: SessionManager.inMemory(cwd) })).session,
+        { cwd, agentDir: cwd } as never,
+        createRuntime,
+      );
+      const bind = async (session: AgentSession) => {
+        await session.bindExtensions({
+          mode: "tui",
+          uiContext: {
+            custom: host.custom,
+            getEditorText: () => host.text,
+            setEditorText: (text: string) => host.editor.setText(text),
+            notify() {},
+          } as never,
+        });
+      };
+      await bind(runtime.session);
+      runtime.setRebindSession(bind);
+      const session = runtime.session;
+      const target = session.sessionManager.appendMessage({ role: "user", content: "branch", timestamp: 1 });
+      session.sessionManager.appendMessage({ role: "user", content: "other branch", timestamp: 2 });
+      const ctx = session.extensionRunner.createCommandContext();
+      ctx.modelRegistry.getApiKeyAndHeaders = async () => credentials;
+      const command = session.extensionRunner.getCommand("btw");
+      assert.ok(command);
+      const running = command.handler("side question", ctx);
+      await Promise.race([
+        host.waitForOpen(),
+        running.then(() => {
+          throw new Error("command finished before credential loader opened");
+        }),
+        new Promise<never>((_resolve, reject) =>
+          setTimeout(() => reject(new Error("credential loader did not mount")), 1_000),
+        ),
+      ]);
+      if (transition === "new") {
+        await runtime.newSession({ withSession: async () => host.editor.setText("destination draft") });
+      } else if (transition === "tree") {
+        await session.navigateTree(target);
+        host.editor.setText("destination draft");
+      } else {
+        host.editor.setText("live draft while resolving");
+        if (transition === "cancel") host.openComponent?.handleInput?.("\u001b");
+      }
+      if (transition === "new" || transition === "tree" || transition === "cancel") {
+        assert.equal(host.closeCount, 1, "pending credential UI closes before auth settles");
+        await running;
+      }
+      release();
+      await running;
+      await Promise.resolve();
+      assert.equal(host.closeCount, 1, "late auth cannot close the old UI a second time");
+      assert.equal(
+        host.text,
+        transition === "new" || transition === "tree" ? "destination draft" : "live draft while resolving",
+      );
+      assert.equal(threadStarts, transition === "complete" ? 1 : 0);
+    } finally {
+      release();
+      await runtime?.dispose();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  },
 );
 
 type WriterOrder = "writer-before-btw" | "btw-before-writer";

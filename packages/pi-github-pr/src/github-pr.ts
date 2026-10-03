@@ -89,10 +89,15 @@ export default function githubPr(pi: ExtensionAPI, options: GithubPrOptions = {}
     session === branchWatch.session && ctx.sessionManager === branchWatch.sessionManager && ctx.cwd === branchWatch.cwd;
   const refreshStatus = async (ctx: ExtensionContext, signal: AbortSignal, generation: number, session: number) => {
     const request = ++branchWatch.request;
-    branchWatch.requestHead = readCurrentHead(ctx.cwd, branchWatch.headPath);
     // A turn that is already cancelled gets no `gh` spawn at all, and its rendered
     // status and expiry timer are left exactly as they are.
     if (signal.aborted) return request;
+    const currentHead = readCurrentHead(ctx.cwd, branchWatch.headPath);
+    if (currentHead !== branchWatch.requestHead) {
+      branchWatch.requestHead = currentHead;
+      clearExpiryTimer(branchWatch);
+      clearStatus(ctx);
+    }
     let status: PullRequestStatus;
     try {
       status = await runGhPrView(pi, ctx.cwd, signal);
@@ -227,7 +232,9 @@ export default function githubPr(pi: ExtensionAPI, options: GithubPrOptions = {}
       if (!ownsSession(session, ctx)) return;
       // HEAD notifications can arrive after agent_end already refreshed that HEAD.
       const currentHead = readCurrentHead(ctx.cwd, headPath);
-      if (currentHead !== undefined && currentHead === branchWatch.requestHead) return;
+      const inFlight = branchWatch.refreshController && !branchWatch.refreshController.signal.aborted;
+      const completed = branchWatch.lastRenderedRequest === branchWatch.request && branchWatch.refreshTimer;
+      if (currentHead !== undefined && currentHead === branchWatch.requestHead && (inFlight || completed)) return;
       scheduleBranchRefresh(ctx, session);
     });
     if (

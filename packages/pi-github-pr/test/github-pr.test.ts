@@ -957,6 +957,69 @@ test("a HEAD change after watcher installation still replaces the prior refresh"
   }
 });
 
+test.each(["observes-head", "watcher-recovery"] as const)(
+  "installed watcher handles aborted new-HEAD refresh (%s)",
+  async (phase) => {
+    const { root, headPath } = createGitHeadFixture();
+    const mock = createMockPi();
+    const pendingB = deferred<ExecResult>();
+    let requestCount = 0;
+    const calls = installExec(mock, async (command, args) => {
+      if (command === "git") return textResult(".git/HEAD\n");
+      if (args[0] === "pr") {
+        requestCount++;
+        if (requestCount === 2) return pendingB.promise;
+        return okResult(
+          requestCount === 1 ? samplePr : { ...samplePr, number: 456, url: "https://github.com/o/r/pull/456" },
+        );
+      }
+      return okResult(sampleCounts);
+    });
+    githubPr(mock.pi, { refreshIntervalMs: 60_000 });
+    const context = createMockContext({ cwd: root });
+    const start = mock.events.get("session_start")?.[0];
+    const end = mock.events.get("agent_end")?.[0];
+    const shutdown = mock.events.get("session_shutdown")?.[0];
+    assert.ok(start);
+    assert.ok(end);
+    assert.ok(shutdown);
+    let running: unknown;
+    try {
+      start({}, context.ctx);
+      await waitForMicrotasks(
+        () => (context.statuses.get("github-pr") ?? "").includes("#123"),
+        "HEAD A displayed with watcher installed",
+      );
+      const turn = new AbortController();
+      // fs.watch notification is queued, while agent_end observes HEAD B first.
+      writeFileSync(headPath, "ref: refs/heads/main\n");
+      running = end({}, { ...context.ctx, signal: turn.signal });
+      await waitForMicrotasks(() => requestCount === 2, "HEAD B request starts before queued watcher notification");
+      const signal = calls.filter((call) => call.args[0] === "pr")[1]?.options?.signal;
+      assert.equal(signal?.aborted, false);
+      if (phase === "observes-head")
+        assert.equal(
+          context.statuses.get("github-pr"),
+          undefined,
+          "old PR clears on first observation of a different HEAD",
+        );
+      turn.abort();
+      pendingB.reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+      await running;
+      await waitFor(
+        () => requestCount >= 3,
+        "installed watcher retries aborted unrendered HEAD B without waiting 60 seconds",
+      );
+      assert.match(context.statuses.get("github-pr") ?? "", /#456/);
+      assert.equal(requestCount, 3);
+    } finally {
+      pendingB.resolve(okResult(samplePr));
+      await running;
+      await shutdown({}, context.ctx);
+    }
+  },
+);
+
 test.each(["in-flight", "completed"])(
   "watch installation replaces a %s HEAD A request after HEAD becomes B",
   async (phase) => {
