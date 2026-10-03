@@ -842,7 +842,7 @@ for (const change of ["prompt", "tools"] as const) {
   });
 }
 
-for (const change of ["prompt", "tools", "context edit"] as const) {
+for (const change of ["prompt", "tools", "schema", "context edit"] as const) {
   test(`real Codex response is discarded if live ${change} changes during the request`, async () => {
     const session = SessionManager.inMemory();
     const originalTool = { name: "inspect", description: "Inspect a path", parameters: Type.Object({}) };
@@ -854,7 +854,8 @@ for (const change of ["prompt", "tools", "context edit"] as const) {
       timestamp: 1,
     });
     const keptId = session.appendMessage({ role: "user", content: "Task", timestamp: 2 });
-    const mock = createMockPi({ activeTools: [originalTool.name], allTools: [originalTool, nextTool] });
+    const registeredTool = { ...originalTool, parameters: Type.Object({}) };
+    const mock = createMockPi({ activeTools: [originalTool.name], allTools: [registeredTool, nextTool] });
     let release!: () => void;
     const blocked = new Promise<void>((resolve) => {
       release = resolve;
@@ -895,6 +896,7 @@ for (const change of ["prompt", "tools", "context edit"] as const) {
     await sent;
     if (change === "prompt") livePrompt = "Changed while awaiting Codex";
     else if (change === "tools") mock.pi.setActiveTools([nextTool.name]);
+    else if (change === "schema") registeredTool.parameters = Type.Object({ path: Type.Number() });
     else session.appendContextEdit(keptId, { content: "Changed after request started" });
     release();
     assert.equal(await inFlight, undefined);
@@ -904,6 +906,61 @@ for (const change of ["prompt", "tools", "context edit"] as const) {
       session.getBranch().some((entry) => entry.type === "compaction"),
       false,
     );
+  });
+}
+
+for (const ambiguity of [
+  "missing tool",
+  "duplicate active name",
+  "duplicate registration",
+  "missing schema",
+] as const) {
+  test(`unprovable live declarations fail closed: ${ambiguity}`, async () => {
+    const session = SessionManager.inMemory();
+    const tool = { name: "inspect", description: "Inspect a path", parameters: Type.Object({}) };
+    session.appendMessage({ role: "system", content: "Instructions", toolsAdded: [tool], timestamp: 1 });
+    const keptId = session.appendMessage({ role: "user", content: "Task", timestamp: 2 });
+    const mock = createMockPi({
+      activeTools:
+        ambiguity === "missing tool"
+          ? [tool.name, "unresolved"]
+          : ambiguity === "duplicate active name"
+            ? [tool.name, tool.name]
+            : [tool.name],
+      allTools:
+        ambiguity === "duplicate registration"
+          ? [tool, tool]
+          : ambiguity === "missing schema"
+            ? [{ ...tool, parameters: undefined }]
+            : [tool],
+    });
+    let fetches = 0;
+    createCodexCompactExtension({
+      settingsRuntime: settingsRuntime(),
+      fetch: async () => {
+        fetches++;
+        return sseResponse();
+      },
+    })(mock.pi);
+    const { ctx } = createMockContext({
+      model,
+      getSystemPrompt: () => "Instructions",
+      sessionManager: session,
+      modelRegistry: {
+        getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fixture" }),
+        getProvider: () => openaiCodexProvider(),
+      },
+    });
+    const result = await mock.events.get("session_before_compact")?.[0](
+      {
+        ...event(),
+        branchEntries: session.getBranch(),
+        preparation: { ...event().preparation, firstKeptEntryId: keptId },
+      },
+      ctx,
+    );
+    assert.equal(result, undefined);
+    assert.equal(fetches, 0);
   });
 }
 

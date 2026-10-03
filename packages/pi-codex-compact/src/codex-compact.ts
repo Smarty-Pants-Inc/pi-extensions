@@ -117,15 +117,32 @@ function keptMessages(event: SessionBeforeCompactEvent): AgentMessage[] {
 }
 
 function activeTools(pi: ExtensionAPI): Tool[] {
-  const enabled = new Set(pi.getActiveTools());
-  return pi
-    .getAllTools()
-    .filter((tool) => enabled.has(tool.name))
-    .map((tool) => ({
-      name: tool.name,
-      description: tool.description,
-      parameters: tool.parameters,
-    }));
+  const names = pi.getActiveTools();
+  const enabled = new Set(names);
+  const tools = pi.getAllTools().filter((tool) => enabled.has(tool.name));
+  // Every active name must resolve exactly once. A partial/ambiguous registry
+  // cannot prove equivalence, even if its visible subset matches the transcript.
+  if (
+    enabled.size !== names.length ||
+    tools.length !== names.length ||
+    new Set(tools.map((tool) => tool.name)).size !== names.length
+  ) {
+    throw new Error("Active tool declarations cannot be resolved unambiguously");
+  }
+  return tools.map((tool) => ({
+    name: tool.name,
+    description: tool.description,
+    parameters: tool.parameters,
+  }));
+}
+
+function comparableTools(tools: Tool[]): Tool[] {
+  return tools.map(({ name, parameters }) => {
+    if (!parameters || typeof parameters !== "object" || Array.isArray(parameters)) {
+      throw new Error("Active tool parameter schema is unavailable");
+    }
+    return { name, description: "", parameters };
+  });
 }
 
 function transcriptMatchesLiveState(messages: AgentMessage[], pi: ExtensionAPI, ctx: ExtensionContext): boolean {
@@ -134,15 +151,15 @@ function transcriptMatchesLiveState(messages: AgentMessage[], pi: ExtensionAPI, 
   if (!piCodingAgentCompat.buildSessionProjection) return true;
   const { getCurrentSystemPrompt, getCurrentTools, getToolStateChanges } = piAiCompat;
   if (!getCurrentSystemPrompt || !getCurrentTools || !getToolStateChanges) return false;
-  // The extension API's getAllTools() omits constrainedSampling even when the
-  // persisted declaration carries it. Compare the fields both surfaces expose
-  // rather than treating every built-in sampled tool as a pending change.
-  const recorded = getCurrentTools(messages).map(({ name, description, parameters }) => ({
-    name,
-    description,
-    parameters,
-  }));
-  const { toolsAdded, toolsRemoved } = getToolStateChanges(recorded, activeTools(pi));
+  // Pi's public ExtensionAPI exposes registration descriptions, not the effective
+  // ones produced by prepareLoadout(). That hook only changes descriptions and
+  // request visibility, never names or parameter schemas. Prove the complete
+  // declared name/schema set instead; ignore only the top-level description.
+  // Schema descriptions and all other JSON Schema fields remain part of the
+  // comparison. constrainedSampling is also absent from public ToolInfo, as before.
+  const recorded = comparableTools(getCurrentTools(messages));
+  const live = comparableTools(activeTools(pi));
+  const { toolsAdded, toolsRemoved } = getToolStateChanges(recorded, live);
   return (
     getCurrentSystemPrompt(messages) === ctx.getSystemPrompt() && toolsAdded.length === 0 && toolsRemoved.length === 0
   );
