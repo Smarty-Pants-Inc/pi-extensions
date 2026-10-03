@@ -1,0 +1,10 @@
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+Bring what back to the main thread?
+
+→ Latest question and answer 1 Q&A · ~18 tokens
+  From a question onward… Choose a starting question
+  Select exact text… Lines or characters
+  Entire side thread 2 Q&A · ~37 tokens
+  Cancel Return to the side thread
+↑/↓ navigate • enter select • esc back • ctrl+c close
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────

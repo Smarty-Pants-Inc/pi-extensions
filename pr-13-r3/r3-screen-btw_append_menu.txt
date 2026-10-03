@@ -1,0 +1,8 @@
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+The main editor already has a draft
+
+→ Append after current draft Recommended
+  ⚠ Replace current draft Discards current editor text
+  Cancel Return to the side thread
+↑/↓ navigate • enter select • esc back • ctrl+c close
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────

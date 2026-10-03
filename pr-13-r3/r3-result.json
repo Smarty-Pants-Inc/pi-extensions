@@ -1,0 +1,21 @@
+{
+  "revision": "d566d42c3252d041d2eaf36b69edcb1d51309b6b",
+  "pi_version": "1.0.0",
+  "cli_exit": 0,
+  "checks": {
+    "actual_pty": true,
+    "parent_success": true,
+    "btw_success_return": true,
+    "btw_resume_success": true,
+    "btw_bring_append": true,
+    "btw_cancel_return": true,
+    "btw_failure_return": true,
+    "child_success_viewer_return": true,
+    "no_implicit_side_messages": true,
+    "draft_not_submitted": true
+  },
+  "status": "GREEN",
+  "provider": "cliproxyapi",
+  "model": "gpt-6.1-sol",
+  "runtime": "repo-local Pi 1.0.0 CLI; actual script(1) PTY; existing authorized route; no injected credentials or model responses"
+}

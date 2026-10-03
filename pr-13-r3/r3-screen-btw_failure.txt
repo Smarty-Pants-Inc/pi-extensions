@@ -1,0 +1,12 @@
+─ btw · side thread · thinking low ─────────────────────────────────────────────────────────────────────────────────────
+
+ --with-parent=not-a-provider/not-a-model What is one plus one?
+
+
+ Error: Parent history was not shared: selected model is cliproxyapi/gpt-6.1-sol, not not-a-provider/not-a-model. Retry
+ with --with-parent=cliproxyapi/gpt-6.1-sol.
+
+btw • Enter send • Ctrl+C exit • thinking low • Shift+Tab cycle
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────

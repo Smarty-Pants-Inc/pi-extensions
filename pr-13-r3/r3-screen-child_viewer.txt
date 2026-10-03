@@ -1,0 +1,60 @@
+
+ Reply with exactly R3_PARENT_TRANSCRIPT_OK.
+
+
+ R3_PARENT_TRANSCRIPT_OK
+
+ Started @r3-proof
+
+What is 21 plus 21? Reply exactly the n… · completed
+  460 ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  42_R│ ● completed · R3 proof · What is 21 plus 21? Reply exactly the n… · 5.4s · 460 tokens (0%)               │
+      │   invocation · isolated · background                                                                     │
+      │ ──────────────────────────────────────────────────────────────────────────────────────────────────────── │
+      │ User                                                                                                     │
+      │ What is 21 plus 21? Reply exactly the number followed by _R3_CHILD.                                      │
+      │                                                                                                          │
+      │ Assistant                                                                                                │
+      │ 42_R3_CHILD                                                                                              │
+      │                                                                                                          │
+      │                                                                                                          │
+      │                                                                                                          │
+      │                                                                                                          │
+      │                                                                                                          │
+      │                                                                                                          │
+      │                                                                                                          │
+      │                                                                                                          │
+      │                                                                                                          │
+      │                                                                                                          │
+      │                                                                                                          │
+      │                                                                                                          │
+      │                                                                                                          │
+      │                                                                                                          │
+      │                                                                                                          │
+      │                                                                                                          │
+      │                                                                                                          │
+      │                                                                                                          │
+      │                                                                                                          │
+      │                                                                                                          │
+      │                                                                                                          │
+      │                                                                                                          │
+      │                                                                                                          │
+      │                                                                                                          │
+      │                                                                                                          │
+      │                                                                                                          │
+      │                                                                                                          │
+      │                                                                                                          │
+      │                                                                                                          │
+      │                                                                                                          │
+      │ ──────────────────────────────────────────────────────────────────────────────────────────────────────── │
+      │ 5 lines · 100%                           up/down scroll · page up/page down or shift up/down · esc close │
+      ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+── ⠼ Working ───────────────────────────────────────────────────────────────────────────────────────────────────────────
+R3_PARENT_DRAFT_UNSENT
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ↑↓ navigate · Enter view · Esc back
+
+  ● main · current
+  ● R3 proof · What is 21 plus 21? Reply exactly the n… · completed                                      5s · 460 tokens
+<test-dir>/test-project
+↑1.0k ↓10 $0.000 0.4%/272k (auto)                                                        (cliproxyapi) gpt-6.1-sol • low

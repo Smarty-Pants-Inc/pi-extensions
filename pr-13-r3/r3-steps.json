@@ -1,0 +1,270 @@
+[
+  {
+    "t": 1.302,
+    "input": "'\\x1b[?0u'"
+  },
+  {
+    "t": 1.302,
+    "input": "'\\x1b[?1;2c'"
+  },
+  {
+    "t": 1.303,
+    "input": "'\\x1b[?1;2c'"
+  },
+  {
+    "t": 1.805,
+    "input": "'Reply with exactly R3_PARENT_TRANSCRIPT_OK.\\r'"
+  },
+  {
+    "t": 6.018,
+    "frame": "parent_success"
+  },
+  {
+    "t": 6.018,
+    "input": "'\\x1b[24~'"
+  },
+  {
+    "t": 6.519,
+    "input": "'/r3-arm /btw What is 17 plus 25? Reply exactly the number followed by _R3_SIDE.\\r'"
+  },
+  {
+    "t": 7.019,
+    "input": "'\\r'"
+  },
+  {
+    "t": 7.025,
+    "input": "'\\x1b[?0u'"
+  },
+  {
+    "t": 7.025,
+    "input": "'\\x1b[?1;2c'"
+  },
+  {
+    "t": 14.437,
+    "frame": "btw_answer"
+  },
+  {
+    "t": 14.437,
+    "input": "'\\x03'"
+  },
+  {
+    "t": 14.438,
+    "input": "'\\x1b[?0u'"
+  },
+  {
+    "t": 14.438,
+    "input": "'\\x1b[?1;2c'"
+  },
+  {
+    "t": 15.839,
+    "frame": "btw_success_return"
+  },
+  {
+    "t": 15.843,
+    "input": "'\\x1b[24~'"
+  },
+  {
+    "t": 16.343,
+    "input": "'/r3-arm /btw\\r'"
+  },
+  {
+    "t": 16.844,
+    "input": "'\\r'"
+  },
+  {
+    "t": 19.145,
+    "input": "'\\x1b[B\\r'"
+  },
+  {
+    "t": 20.547,
+    "frame": "btw_resume_picker"
+  },
+  {
+    "t": 20.547,
+    "input": "'\\r'"
+  },
+  {
+    "t": 20.554,
+    "input": "'\\x1b[?0u'"
+  },
+  {
+    "t": 20.554,
+    "input": "'\\x1b[?1;2c'"
+  },
+  {
+    "t": 21.148,
+    "input": "'Add one to the number you just gave, with the same suffix.\\r'"
+  },
+  {
+    "t": 25.756,
+    "frame": "btw_resumed_answer"
+  },
+  {
+    "t": 25.757,
+    "input": "'\\x12'"
+  },
+  {
+    "t": 27.158,
+    "frame": "btw_bring_menu"
+  },
+  {
+    "t": 27.158,
+    "input": "'\\r'"
+  },
+  {
+    "t": 28.56,
+    "frame": "btw_append_menu"
+  },
+  {
+    "t": 28.56,
+    "input": "'\\r'"
+  },
+  {
+    "t": 28.562,
+    "input": "'\\x1b[?0u'"
+  },
+  {
+    "t": 28.562,
+    "input": "'\\x1b[?1;2c'"
+  },
+  {
+    "t": 29.962,
+    "frame": "btw_bring_append"
+  },
+  {
+    "t": 30.8,
+    "frame": "btw_brought_unsent"
+  },
+  {
+    "t": 30.8,
+    "input": "'\\x1b[24~'"
+  },
+  {
+    "t": 31.301,
+    "input": "'/r3-arm /btw Count integers from 1 to 10000, one per line, without stopping.\\r'"
+  },
+  {
+    "t": 31.801,
+    "input": "'\\r'"
+  },
+  {
+    "t": 31.806,
+    "input": "'\\x1b[?0u'"
+  },
+  {
+    "t": 31.806,
+    "input": "'\\x1b[?1;2c'"
+  },
+  {
+    "t": 34.81,
+    "frame": "btw_running_cancel"
+  },
+  {
+    "t": 34.811,
+    "input": "'\\x03'"
+  },
+  {
+    "t": 34.833,
+    "input": "'\\x1b[?0u'"
+  },
+  {
+    "t": 34.833,
+    "input": "'\\x1b[?1;2c'"
+  },
+  {
+    "t": 36.23,
+    "frame": "btw_cancel_return"
+  },
+  {
+    "t": 36.245,
+    "input": "'\\x1b[24~'"
+  },
+  {
+    "t": 36.745,
+    "input": "'/r3-arm /btw --with-parent=not-a-provider/not-a-model What is one plus one?\\r'"
+  },
+  {
+    "t": 37.246,
+    "input": "'\\r'"
+  },
+  {
+    "t": 37.251,
+    "input": "'\\x1b[?0u'"
+  },
+  {
+    "t": 37.251,
+    "input": "'\\x1b[?1;2c'"
+  },
+  {
+    "t": 40.248,
+    "frame": "btw_failure"
+  },
+  {
+    "t": 40.248,
+    "input": "'\\x03'"
+  },
+  {
+    "t": 40.249,
+    "input": "'\\x1b[?0u'"
+  },
+  {
+    "t": 40.249,
+    "input": "'\\x1b[?1;2c'"
+  },
+  {
+    "t": 41.65,
+    "frame": "btw_failure_return"
+  },
+  {
+    "t": 41.654,
+    "input": "'\\x1b[24~'"
+  },
+  {
+    "t": 42.154,
+    "input": "'@r3-proof What is 21 plus 21? Reply exactly the number followed by _R3_CHILD.\\r'"
+  },
+  {
+    "t": 42.763,
+    "input": "'\\x1b[24~'"
+  },
+  {
+    "t": 43.263,
+    "input": "'/r3-arm\\r'"
+  },
+  {
+    "t": 43.664,
+    "input": "'\\x1b[B'"
+  },
+  {
+    "t": 43.865,
+    "input": "'\\x1b[B'"
+  },
+  {
+    "t": 44.065,
+    "input": "'\\r'"
+  },
+  {
+    "t": 48.97,
+    "frame": "child_viewer"
+  },
+  {
+    "t": 48.971,
+    "input": "'\\x1b'"
+  },
+  {
+    "t": 49.771,
+    "input": "'\\x1b'"
+  },
+  {
+    "t": 63.558,
+    "frame": "child_success_viewer_return"
+  },
+  {
+    "t": 63.572,
+    "input": "'\\x1b[24~'"
+  },
+  {
+    "t": 63.873,
+    "input": "'/quit\\r'"
+  }
+]
