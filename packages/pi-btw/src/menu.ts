@@ -252,6 +252,15 @@ export async function runBtwMenuPreservingEditor(
   if (!ownsSession()) return { kind: "stale" };
   let liveEditorText = ctx.ui.getEditorText();
   let completed = false;
+  const restoreLiveEditor = () => {
+    if (completed && ownsSession()) {
+      try {
+        if (ctx.ui.getEditorText() !== liveEditorText && ownsSession()) ctx.ui.setEditorText(liveEditorText);
+      } catch {
+        // A replaced context owns a different editor and must not receive stale restoration.
+      }
+    }
+  };
   const ui = new Proxy(wrapCustomUi(ctx.ui), {
     get(target, property) {
       if (property === "custom") {
@@ -266,6 +275,9 @@ export async function runBtwMenuPreservingEditor(
                 }
                 completed = true;
                 done(value);
+                // Pi restores its opening snapshot synchronously. Restore the live
+                // draft before the menu mounts another screen and captures it.
+                restoreLiveEditor();
               }),
             customOptions,
           );
@@ -275,13 +287,7 @@ export async function runBtwMenuPreservingEditor(
     },
   });
   const result = await run({ mode: ctx.mode, hasUI: ctx.hasUI, ui });
-  if (completed && ownsSession()) {
-    try {
-      if (ctx.ui.getEditorText() !== liveEditorText && ownsSession()) ctx.ui.setEditorText(liveEditorText);
-    } catch {
-      // A replaced context owns a different editor and must not receive stale restoration.
-    }
-  }
+  restoreLiveEditor();
   return ownsSession() ? result : { kind: "stale" };
 }
 

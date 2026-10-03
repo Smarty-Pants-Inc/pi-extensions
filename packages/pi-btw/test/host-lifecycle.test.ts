@@ -20,7 +20,7 @@ import type { Component } from "@earendil-works/pi-tui";
 import { test } from "vitest";
 import btw from "../src/btw.js";
 import { runBtwFullscreen } from "../src/fullscreen-ui.js";
-import { showBtwCommandMenu } from "../src/menu.js";
+import { runBtwMenuPreservingEditor, showBtwCommandMenu } from "../src/menu.js";
 
 // Call Pi's actual showExtensionCustom implementation on a minimal TUI shell.
 // In particular, its savedText/restoreEditor logic must not be simulated away.
@@ -89,6 +89,55 @@ function createPiEditorHost(initialText: string) {
     },
   };
 }
+
+test("real Pi successive menu screens retain a draft changed while the first screen is open", async () => {
+  initTheme("dark", false);
+  const host = createPiEditorHost("");
+  const sessionManager = SessionManager.inMemory();
+  const ctx = {
+    mode: "tui",
+    hasUI: true,
+    sessionManager,
+    ui: {
+      custom: host.custom,
+      getEditorText: () => host.text,
+      setEditorText: (text: string) => host.editor.setText(text),
+    },
+  } as ExtensionCommandContext;
+  let closeFirst!: () => void;
+  let closeSecond!: () => void;
+  let secondOpened!: () => void;
+  const secondReady = new Promise<void>((resolve) => {
+    secondOpened = resolve;
+  });
+  const running = runBtwMenuPreservingEditor(ctx, async (menuContext) => {
+    const ui = menuContext.ui as ExtensionCommandContext["ui"];
+    await ui.custom((_tui, _theme, _keys, done) => {
+      closeFirst = () => done(undefined);
+      return { render: () => [], invalidate() {} };
+    });
+    await ui.custom((_tui, _theme, _keys, done) => {
+      closeSecond = () => done(undefined);
+      secondOpened();
+      return { render: () => [], invalidate() {} };
+    });
+    return { kind: "closed", reason: "close" };
+  });
+  await host.waitForOpen();
+  host.editor.setText("live parent draft");
+  closeFirst();
+  await secondReady;
+  const betweenScreens = host.text;
+  closeSecond();
+  assert.deepEqual(await running, { kind: "closed", reason: "close" });
+  assert.equal(host.closeCount, 2);
+  assert.equal(
+    betweenScreens,
+    "live parent draft",
+    "the next screen must capture the live draft, not Pi's old snapshot",
+  );
+  assert.equal(host.text, "live parent draft");
+});
 
 type Transition = "new" | "tree" | "cancelled-new" | "cancelled-tree";
 
@@ -332,7 +381,9 @@ test.each(["new", "tree", "complete", "cancel"] as const)(
       }
       release();
       await running;
-      await Promise.resolve();
+      // Cancellation can finish the command before the deferred auth callback.
+      // Drain a task boundary so the assertions observe that callback as well.
+      await new Promise<void>((resolve) => setImmediate(resolve));
       assert.equal(host.closeCount, 1, "late auth cannot close the old UI a second time");
       assert.equal(
         host.text,

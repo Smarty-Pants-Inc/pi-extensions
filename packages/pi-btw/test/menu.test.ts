@@ -105,11 +105,13 @@ test("a completed menu cannot restore its cached old draft after Pi commits a ne
           ((value: unknown) => {
             cachedEditor = "side draft";
             completed = value;
+            // Commit during close so both synchronous and final restoration
+            // must refuse to write through the captured old context.
+            session.newSession();
+            replacementEditor = "new session editor";
+            cachedEditor = "main draft"; // Pi's old context still exposes its cached editor.
           }) as never,
         );
-        session.newSession();
-        replacementEditor = "new session editor";
-        cachedEditor = "main draft"; // Pi's old command context still exposes its cached editor.
         return completed;
       },
     },
