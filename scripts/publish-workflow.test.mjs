@@ -6,27 +6,29 @@ const workflowUrl = new URL("../.github/workflows/publish-packages.yml", import.
 
 test("publish workflow versions release transitions before invoking npm publish", async () => {
   const workflow = await readFile(workflowUrl, "utf8");
-
-  assert.doesNotMatch(workflow, /^ {2}release-transition:|Publish current release transition/m);
-  assert.doesNotMatch(workflow, /^\s*run:\s*bun run publish-packages\s*$/m);
-  assert.match(workflow, /--classify-release-transition/);
-  assert.match(
-    workflow,
-    /if: steps\.release-selection\.outputs\.current-main == 'true' \|\| steps\.release-selection\.outputs\.release-transition == 'true'/,
-  );
-
   const validation = workflow.indexOf("run: bun run check");
   const revalidation = workflow.indexOf("id: release-revalidation", validation);
   const action = workflow.indexOf("uses: changesets/action@", revalidation);
   const version = workflow.indexOf("version: bun run version-packages", action);
   const publish = workflow.indexOf("publish: bun run publish-packages", action);
+  const versionJob = workflow.indexOf("  version:\n");
+  const jobSteps = workflow.indexOf("    steps:\n", versionJob);
+  const jobEnvironment = workflow.indexOf("    environment: npm-publish\n", versionJob);
+  const permissions = workflow.slice(workflow.indexOf("permissions:\n"), workflow.indexOf("concurrency:\n"));
+
+  assert.match(
+    workflow,
+    /if: steps\.release-selection\.outputs\.current-main == 'true' \|\| steps\.release-selection\.outputs\.release-transition == 'true'/,
+  );
   assert.ok(validation >= 0, "the exact release revision must pass the full repository check");
   assert.ok(revalidation > validation, "main/release eligibility must be revalidated after the check");
   assert.ok(action > revalidation, "Changesets writes must stay downstream of final revalidation");
-  assert.match(workflow, /if: steps\.release-revalidation\.outputs\.eligible == 'true'/);
+  assert.match(workflow, /if: steps\.release-revalidation\.outputs\.eligible == 'true'\n\s+uses: changesets\/action@/);
   assert.equal(workflow.match(/--classify-release-transition/g)?.length, 2);
   assert.ok(version > action, "Changesets action must version packages");
   assert.ok(publish > version, "publish must remain downstream of Changesets versioning");
+  assert.ok(versionJob >= 0 && jobEnvironment > versionJob && jobEnvironment < jobSteps);
+  assert.match(permissions, /^ {2}id-token: write$/m);
 });
 
 /**
