@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import type { Component, TUI } from "@earendil-works/pi-tui";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { type Component, type TUI, TuiAltScreen } from "@earendil-works/pi-tui";
 import { test } from "vitest";
 import { type BtwFullscreenTuiFactory, runBtwFullscreen } from "../src/fullscreen-ui.js";
 
@@ -180,6 +181,71 @@ test("default fullscreen enables application-owned mouse selection and restores 
   }
 });
 
+test.each(["completed", "failed"] as const)(
+  "fullscreen parent regains terminal ownership after %s side flow",
+  async (outcome) => {
+    const writes: string[] = [];
+    const terminal = {
+      columns: 80,
+      rows: 24,
+      start() {},
+      stop() {},
+      write(data: string) {
+        writes.push(data);
+      },
+      hideCursor() {},
+      showCursor() {},
+    } as never;
+    const parent = new TuiAltScreen(terminal, false, undefined, { mouse: true });
+    const mainComponent: Component = { render: () => ["main transcript"], invalidate() {} };
+    parent.addChild(mainComponent);
+    let editorText = "main draft";
+    const ctx = {
+      ui: {
+        custom: (factory: (...args: never[]) => FakeComponent) =>
+          new Promise((resolve) => {
+            factory(
+              parent as never,
+              { fg: (_color: string, text: string) => text } as never,
+              {} as never,
+              resolve as never,
+            );
+          }),
+        getEditorText: () => editorText,
+        setEditorText: (value: string) => {
+          editorText = value;
+        },
+      },
+    } as never;
+    parent.start();
+    try {
+      const running = runBtwFullscreen(ctx, async (fullscreenCtx) => {
+        fullscreenCtx.ui.setEditorText("updated draft");
+        if (outcome === "failed") throw new Error("side failed");
+        return fullscreenCtx.ui.custom((_tui, _theme, _keys, done) => immediateComponent(done, []));
+      });
+      if (outcome === "failed") await assert.rejects(running, /side failed/);
+      else assert.equal(await running, "side result");
+
+      const output = writes.join("");
+      // Parent exits before BTW enters, then BTW exits before the parent re-enters.
+      // stop({ preserveScreen: true }) exits fullscreen without projecting it into scrollback.
+      const screenTransitions = output
+        .split("\u001b")
+        .filter((part) => part.startsWith("[?1049"))
+        .map((part) => part.slice(0, 7));
+      assert.deepEqual(screenTransitions, ["[?1049h", "[?1049l", "[?1049h", "[?1049l", "[?1049h"]);
+      assert.equal(parent.mode, "fullscreen");
+      assert.equal(parent.children.includes(mainComponent), true);
+      assert.equal(editorText, "updated draft");
+      assert.equal(output.lastIndexOf("main transcript") > output.lastIndexOf("\u001b[?1049h"), true);
+      assert.equal(output.lastIndexOf("\u001b[?1006h") > output.lastIndexOf("\u001b[?1006l"), true);
+    } finally {
+      parent.stop({ preserveScreen: true });
+    }
+  },
+);
+
 test("default fullscreen activates OSC-8 links through the configured URL opener", async () => {
   let handleInput: ((data: string) => void) | undefined;
   const terminal = {
@@ -254,6 +320,70 @@ test("default fullscreen activates OSC-8 links through the configured URL opener
 
   assert.equal(await running, "closed");
   assert.deepEqual(openedBeforeClose, [url]);
+});
+
+test.each([
+  "new session before completion",
+  "new session after completion",
+  "tree navigation after completion",
+] as const)("fullscreen %s does not restore a cached obsolete draft", async (transitionAt) => {
+  const session = SessionManager.inMemory();
+  const earlier = session.appendMessage({ role: "user", content: "Earlier", timestamp: 1 });
+  session.appendMessage({ role: "user", content: "Later", timestamp: 2 });
+  const originalSessionId = session.getSessionId();
+  let generation = 0;
+  let liveEditor = "main draft";
+  let cachedEditor = "main draft";
+  const writes: string[] = [];
+  const replace = () => {
+    if (transitionAt === "tree navigation after completion") {
+      session.branch(earlier);
+      generation += 1;
+    } else {
+      session.newSession();
+    }
+    liveEditor = "replacement editor";
+    cachedEditor = "main draft"; // The old Pi UI proxy may still expose its cached draft.
+  };
+  const parent = { stop() {}, start() {}, renderNow() {} } as unknown as TUI;
+  const fullscreen = { start() {}, stop() {} } as unknown as TUI;
+  const ctx = {
+    sessionManager: session,
+    ui: {
+      getEditorText: () => cachedEditor,
+      setEditorText: (text: string) => {
+        writes.push(text);
+        liveEditor = text;
+        cachedEditor = text;
+      },
+      custom: (factory: (...args: never[]) => unknown) =>
+        new Promise((resolve) => {
+          factory(
+            parent as never,
+            { fg: (_color: string, text: string) => text } as never,
+            {} as never,
+            ((outcome: unknown) => {
+              if (transitionAt !== "new session before completion") replace();
+              resolve(outcome);
+            }) as never,
+          );
+        }),
+    },
+  } as never;
+  const result = await runBtwFullscreen(
+    ctx,
+    async (fullscreenCtx) => {
+      fullscreenCtx.ui.setEditorText("brought side draft");
+      if (transitionAt === "new session before completion") replace();
+      return "closed";
+    },
+    { createTui: () => fullscreen, isSessionCurrent: () => generation === 0 },
+  );
+
+  assert.equal(result, "closed");
+  assert.equal(session.getSessionId() === originalSessionId, transitionAt === "tree navigation after completion");
+  assert.equal(liveEditor, "replacement editor");
+  assert.deepEqual(writes, ["brought side draft"]);
 });
 
 test("dedicated fullscreen owns the terminal while side custom UI runs and restores it afterward", async () => {

@@ -14,6 +14,10 @@ export const DEFAULT_PUBLISH_COOLDOWN_MS = 10_000;
 export const DEFAULT_RELEASE_BRANCH = "changeset-release/main";
 export const DEFAULT_RELEASE_BASE_BRANCH = "main";
 const githubApiBase = "https://api.github.com";
+const githubReadRetryDelaysMs = [1_000, 3_000, 9_000];
+const githubRateLimitRetryDelaysMs = [30_000, 60_000, 120_000];
+const githubReadTimeoutMs = 15_000;
+const maxGithubRetryAfterMs = 120_000;
 
 function diagnostic(result) {
   return [result?.error?.message, result?.stderr, result?.stdout].filter(Boolean).join("\n");
@@ -490,11 +494,73 @@ async function responseDetails(response) {
   }
 }
 
+function githubReadRetryAfterMs(response, fallback) {
+  const value = response.headers?.get("retry-after");
+  if (value) {
+    const seconds = Number(value);
+    const delay = Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : Date.parse(value) - Date.now();
+    if (Number.isFinite(delay) && delay >= 0) return Math.min(Math.ceil(delay), maxGithubRetryAfterMs);
+  }
+  return fallback;
+}
+
+async function retryableGitHubResponse(response) {
+  if (response.status === 429 || response.status >= 500) return true;
+  if (response.status !== 403) return false;
+  if (response.headers?.get("x-ratelimit-remaining") === "0" || response.headers?.has("retry-after")) return true;
+  try {
+    const body = await response.clone().text();
+    return /secondary rate limit|API rate limit exceeded|abuse detection mechanism/iu.test(body);
+  } catch {
+    return false;
+  }
+}
+
+export async function fetchGitHubRead(
+  url,
+  headers,
+  {
+    request = fetch,
+    delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+    retryDelaysMs = githubReadRetryDelaysMs,
+    warn = console.warn,
+  } = {},
+) {
+  for (let attempt = 0; attempt <= retryDelaysMs.length; attempt += 1) {
+    let response;
+    try {
+      response = await request(url, { headers, signal: AbortSignal.timeout(githubReadTimeoutMs) });
+    } catch (error) {
+      const cause = error instanceof Error && error.cause instanceof Error ? `: ${error.cause.message}` : "";
+      if (attempt === retryDelaysMs.length) {
+        throw new Error(`GitHub GET ${url} failed after ${attempt + 1} attempts: ${error}${cause}`, { cause: error });
+      }
+      warn(`GitHub GET retry ${attempt + 1} for ${url}: ${error}${cause}`);
+      await delay(retryDelaysMs[attempt]);
+      continue;
+    }
+    if (!(await retryableGitHubResponse(response))) return response;
+    if (attempt === retryDelaysMs.length) {
+      throw new Error(`GitHub GET ${url} failed after ${attempt + 1} attempts: HTTP ${response.status}`);
+    }
+    const rateLimited = response.status === 403 || response.status === 429;
+    const fallback = rateLimited
+      ? (githubRateLimitRetryDelaysMs[attempt] ?? retryDelaysMs[attempt])
+      : retryDelaysMs[attempt];
+    const retryAfter = githubReadRetryAfterMs(response, fallback);
+    await response.body?.cancel();
+    warn(`GitHub GET retry ${attempt + 1} for ${url}: HTTP ${response.status}; waiting ${retryAfter}ms`);
+    await delay(retryAfter);
+  }
+  throw new Error(`GitHub GET ${url} exhausted retries`);
+}
+
 async function githubReleaseExists(tag, context = githubContext()) {
   if (!context) return undefined;
-  const response = await fetch(githubUrl(context, `/releases/tags/${encodeURIComponent(tag)}`), {
-    headers: githubHeaders(context.token),
-  });
+  const response = await fetchGitHubRead(
+    githubUrl(context, `/releases/tags/${encodeURIComponent(tag)}`),
+    githubHeaders(context.token),
+  );
   if (response.status === 404) return false;
   if (!response.ok) {
     throw new Error(`GitHub release lookup failed for ${tag}: HTTP ${response.status}`);
@@ -504,9 +570,10 @@ async function githubReleaseExists(tag, context = githubContext()) {
 
 async function requireReleasePullRequest(currentHead) {
   const context = githubContext({ required: true });
-  const response = await fetch(githubUrl(context, `/commits/${encodeURIComponent(currentHead)}/pulls`), {
-    headers: githubHeaders(context.token),
-  });
+  const response = await fetchGitHubRead(
+    githubUrl(context, `/commits/${encodeURIComponent(currentHead)}/pulls`),
+    githubHeaders(context.token),
+  );
   if (!response.ok) {
     throw new Error(`GitHub release PR lookup failed for ${currentHead}: HTTP ${response.status}`);
   }
