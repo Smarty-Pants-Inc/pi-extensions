@@ -8,6 +8,7 @@ import {
   createTagBuffer,
   DEFAULT_PUBLISH_COOLDOWN_MS,
   extractChangelogSection,
+  fetchGitHubRead,
   findQualifyingReleasePullRequest,
   hasQualifyingReleasePullRequest,
   isQualifyingReleasePullRequest,
@@ -309,4 +310,162 @@ test("orders changed packages after their changed local dependencies", () => {
     },
   };
   assert.deepEqual(orderPublishPackages([runtime, protocol]), [protocol, runtime]);
+});
+
+test("retries transient GitHub GET failures and preserves real HTTP outcomes", async () => {
+  const url = "https://api.github.com/repos/signalridge/pi-extensions/releases/tags/test";
+  const delays = [];
+  const seen = [];
+  const options = {
+    delay: async (milliseconds) => {
+      delays.push(milliseconds);
+    },
+    warn: () => {},
+    retryDelaysMs: [1_000, 3_000],
+    request: async (requestedUrl, requestOptions) => {
+      seen.push({ requestedUrl, authorization: requestOptions.headers.authorization });
+      if (seen.length === 1) throw new TypeError("fetch failed", { cause: new Error("socket reset") });
+      return new Response(null, { status: 200 });
+    },
+  };
+  const response = await fetchGitHubRead(url, { authorization: "Bearer test" }, options);
+  assert.equal(response.status, 200);
+  assert.deepEqual(seen, [
+    { requestedUrl: url, authorization: "Bearer test" },
+    { requestedUrl: url, authorization: "Bearer test" },
+  ]);
+  assert.deepEqual(delays, [1_000]);
+
+  let calls = 0;
+  for (const status of [404, 401, 403]) {
+    const result = await fetchGitHubRead(
+      url,
+      {},
+      {
+        request: async () => {
+          calls += 1;
+          return new Response(null, { status });
+        },
+        delay: async () => {
+          throw new Error("permanent status must not be retried");
+        },
+        warn: () => {},
+      },
+    );
+    assert.equal(result.status, status);
+  }
+  assert.equal(calls, 3);
+});
+
+test("honors bounded GitHub rate-limit and server retries without swallowing failure", async () => {
+  const url = "https://api.github.com/repos/example/repo/pulls/1";
+  const delays = [];
+  const responses = [
+    new Response(null, { status: 429, headers: { "retry-after": "2" } }),
+    new Response(null, { status: 503 }),
+    new Response(null, { status: 200 }),
+  ];
+  const response = await fetchGitHubRead(
+    url,
+    {},
+    {
+      request: async () => responses.shift(),
+      delay: async (milliseconds) => {
+        delays.push(milliseconds);
+      },
+      retryDelaysMs: [1_000, 3_000],
+      warn: () => {},
+    },
+  );
+  assert.equal(response.status, 200);
+  assert.deepEqual(delays, [2_000, 3_000]);
+
+  let attempts = 0;
+  await assert.rejects(
+    fetchGitHubRead(
+      url,
+      {},
+      {
+        request: async () => {
+          attempts += 1;
+          throw new TypeError("fetch failed");
+        },
+        delay: async () => {},
+        retryDelaysMs: [1, 2],
+        warn: () => {},
+      },
+    ),
+    /GitHub GET .* failed after 3 attempts: TypeError: fetch failed/,
+  );
+  assert.equal(attempts, 3);
+});
+
+test("retries headerless secondary throttling but preserves an ordinary forbidden response", async () => {
+  const url = "https://api.github.com/repos/signalridge/pi-extensions/releases/tags/test";
+  const delays = [];
+  const responses = [
+    new Response(JSON.stringify({ message: "You have exceeded a secondary rate limit. Please wait a few minutes." }), {
+      status: 403,
+      headers: { "x-ratelimit-remaining": "4999" },
+    }),
+    new Response(null, { status: 200 }),
+  ];
+  const recovered = await fetchGitHubRead(
+    url,
+    {},
+    {
+      request: async () => responses.shift(),
+      delay: async (milliseconds) => {
+        delays.push(milliseconds);
+      },
+      retryDelaysMs: [1_000],
+      warn: () => {},
+    },
+  );
+  assert.equal(recovered.status, 200);
+  assert.deepEqual(delays, [30_000]);
+  assert.equal(responses.length, 0);
+
+  const denied = await fetchGitHubRead(
+    url,
+    {},
+    {
+      request: async () =>
+        new Response(JSON.stringify({ message: "Resource not accessible by integration" }), {
+          status: 403,
+          headers: { "x-ratelimit-remaining": "4999" },
+        }),
+      delay: async () => {
+        throw new Error("ordinary authorization failure must not be retried");
+      },
+      warn: () => {},
+    },
+  );
+  assert.equal(denied.status, 403);
+  assert.match(await denied.text(), /Resource not accessible by integration/);
+
+  const throttledDelays = [];
+  let attempts = 0;
+  await assert.rejects(
+    fetchGitHubRead(
+      url,
+      {},
+      {
+        request: async () => {
+          attempts += 1;
+          return new Response(JSON.stringify({ message: "You have exceeded a secondary rate limit." }), {
+            status: 403,
+          });
+        },
+        delay: async (milliseconds) => {
+          throttledDelays.push(milliseconds);
+        },
+        retryDelaysMs: [1, 2, 3],
+        warn: () => {},
+      },
+    ),
+    /GitHub GET .* failed after 4 attempts: HTTP 403/,
+  );
+  assert.equal(attempts, 4);
+  assert.deepEqual(throttledDelays, [30_000, 60_000, 120_000]);
 });
