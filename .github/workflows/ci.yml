@@ -9,8 +9,7 @@ jobs:
     name: smarty-ci
     runs-on: ubuntu-latest
     steps:
-      # Full history: check:changesets compares the working tree against the
-      # merge base with origin/main, which a shallow clone cannot resolve.
+      # Full history: check:changesets compares against the merge base.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -21,4 +20,20 @@ jobs:
         with:
           bun-version: 1.3.14
       - run: bun install --frozen-lockfile
-      - run: bun run check
+      - run: bun run check:json
+      - run: bun run check:package-config
+      - run: bun run check:boundaries
+      - run: bun run check:shared-deps
+      - run: bun run check:tests
+      # No check:versions here: npm's latest belongs to upstream, not this fork.
+      # Upstream releasing a newer version must not fail fork PRs (smarty-dev#755).
+      - run: bun run check:changesets
+      - run: bun run check:capabilities
+      - run: bun run lint
+      - run: bun run typecheck
+      - run: bun run test
+      - run: bun run test:release
+      - run: bun run test:config
+      - run: bun run smoke:pi
+      - run: bun run pack:check
+      - run: bun run secret-scan
