@@ -1,5 +1,11 @@
 # @signalridge/pi-goal
 
+## 1.4.4
+### Patch Changes
+
+- ef0158d: Persist goal wait reasons and deadlines, restore scheduled wakes, and resume recorded waits on real input without an extra prompt. Keep deliberate pauses stopped and cancel stale wait timers.
+- 4d300c7: Wake waiting goals only after real input is accepted, exclude unrelated usage from their budgets, preserve cumulative usage across compaction and session-tree navigation, and restore deadline timers across pause, resume, and queue transitions. Recheck overdue waits without overriding restrictive tool policies, reset safety only for delivered input, and reduce repeated goal-binding context.
+
 ## 1.4.3
 ### Patch Changes
 

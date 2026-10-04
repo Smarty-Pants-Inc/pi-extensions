@@ -147,7 +147,7 @@
     },
     "packages/pi-goal": {
       "name": "@signalridge/pi-goal",
-      "version": "1.4.3",
+      "version": "1.4.4",
       "dependencies": {
         "@narumitw/pi-tui-kit": "^0.54.0",
         "@signalridge/pi-ui": "^1.3.2",
