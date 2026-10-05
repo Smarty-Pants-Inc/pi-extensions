@@ -756,6 +756,7 @@ export class GoalRuntime {
     this.pendingNonGoalInputs = [];
     this.ambiguousNonGoalInput = false;
     this.pendingIdleInputs = [];
+    this.startedPromptBoundary = false;
   }
 
   async sendOwnedGoalPrompt(
