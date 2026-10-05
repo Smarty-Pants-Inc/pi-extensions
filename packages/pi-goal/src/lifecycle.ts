@@ -312,7 +312,12 @@ export function registerGoalLifecycle(
     const ownedPrompt = runtime.consumeOwnedGoalPrompt(prompt);
     if (ownedPrompt) runtime.confirmWaitResume(ctx, ownedPrompt.goalId);
     const ownedPromptBoundary = runtime.hasOwnedPromptBoundary(prompt);
-    const queuedNonGoalInput = runtime.consumeQueuedNonGoalInput(prompt, !ownedPromptBoundary);
+    // A normal prompt already acknowledged at before_agent_start is not a
+    // second queued delivery; its user message cannot retire unrelated inputs.
+    const startedPromptBoundary = runtime.consumeStartedPromptBoundary();
+    const queuedNonGoalInput = startedPromptBoundary
+      ? undefined
+      : runtime.consumeQueuedNonGoalInput(prompt, !ownedPromptBoundary);
     if (!ownedPrompt) {
       if (queuedNonGoalInput?.behavior === "followUp" || queuedNonGoalInput?.resetSafetyEpoch) {
         beginNonGoalFollowUp(ctx, queuedNonGoalInput.resetSafetyEpoch);
@@ -423,6 +428,7 @@ export function registerGoalLifecycle(
   pi.on("before_agent_start", (event, ctx) => {
     runtime.inputWakeGoalId = undefined;
     runtime.clearAgentRun();
+    runtime.noteStartedPromptBoundary();
     if (runtime.queueFrozen) return;
     // Pi-owned retries emit agent_start directly. Reaching a normal prompt
     // boundary means cleanup no longer owns the next run, so the hard-cap guard
@@ -434,18 +440,17 @@ export function registerGoalLifecycle(
     const continuationGoalId = goalPromptGoalId ? undefined : runtime.markContinuationStarted(event.prompt);
     const ownedPromptGoalId = goalPromptGoalId ?? continuationGoalId;
     const ownedPromptBoundary = runtime.hasOwnedPromptBoundary(event.prompt);
-    if (!ownedPromptGoalId && !ownedPromptBoundary) {
-      const idleInput = runtime.consumeIdleNonGoalInput(event.prompt);
-      if (idleInput?.resetSafetyEpoch) beginNonGoalFollowUp(ctx, true);
-    }
+    const idleInput =
+      !ownedPromptGoalId && !ownedPromptBoundary ? runtime.consumeIdleNonGoalInput(event.prompt) : undefined;
+    if (idleInput?.resetSafetyEpoch) beginNonGoalFollowUp(ctx, true);
     const activeBudgetWrapUp = runtime.hasActiveBudgetWrapUp();
     const activeGoalRecovery = runtime.hasActiveGoalRecovery();
-    const queuedNonGoalInput = activeBudgetWrapUp
-      ? undefined
-      : runtime.consumeQueuedNonGoalInput(
-          event.prompt,
-          !activeGoalRecovery && ownedPromptGoalId === undefined && !ownedPromptBoundary,
-        );
+    // An idle acknowledgement owns only its idle attempt. Queue FIFO/expansion
+    // association is reserved for native queued user delivery, not this boundary.
+    const queuedNonGoalInput =
+      idleInput || activeBudgetWrapUp || activeGoalRecovery || ownedPromptGoalId !== undefined || ownedPromptBoundary
+        ? undefined
+        : runtime.consumeQueuedNonGoalInputAtIdleBoundary(event.prompt);
     if (queuedNonGoalInput?.behavior === "followUp" || queuedNonGoalInput?.resetSafetyEpoch) {
       beginNonGoalFollowUp(ctx, queuedNonGoalInput.resetSafetyEpoch);
     }
