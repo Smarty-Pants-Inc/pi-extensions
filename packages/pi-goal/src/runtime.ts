@@ -244,6 +244,7 @@ export class GoalRuntime {
   /** True when native input hooks overlapped without an enqueue acknowledgement. */
   ambiguousNonGoalInput = false;
   private pendingIdleInputs: { fingerprint: string; resetSafetyEpoch: boolean; goalId?: string }[] = [];
+  private startedPromptBoundary = false;
   menuGeneration = 0;
   menuController = new AbortController();
 
@@ -715,6 +716,7 @@ export class GoalRuntime {
 
   clearSettledSafetyTracking() {
     this.guardAbortGoalId = undefined;
+    this.startedPromptBoundary = false;
     // Settlement closes a model run, not sibling input hooks still awaiting
     // enqueue. Retain outstanding observations without granting authority.
     for (const pending of this.pendingNonGoalInputs) pending.resetSafetyEpoch = false;
@@ -955,6 +957,28 @@ export class GoalRuntime {
     }
   }
 
+  noteStartedPromptBoundary() {
+    this.startedPromptBoundary = true;
+  }
+
+  consumeStartedPromptBoundary() {
+    const started = this.startedPromptBoundary;
+    this.startedPromptBoundary = false;
+    return started;
+  }
+
+  consumeQueuedNonGoalInputAtIdleBoundary(prompt: string) {
+    // An async queued input can become idle before enqueue. Public boundaries
+    // expose text, not item identity: accept only an exact, unique association
+    // with no outstanding idle attempt (including transformed/duplicate inputs).
+    if (this.pendingIdleInputs.length > 0) return undefined;
+    const fingerprint = inputFingerprint(prompt);
+    if (this.pendingNonGoalInputs.filter((pending) => pending.fingerprint === fingerprint).length !== 1) {
+      return undefined;
+    }
+    return this.consumeQueuedNonGoalInput(prompt, false);
+  }
+
   consumeQueuedNonGoalInput(prompt: string, allowDeliveryFallback = true) {
     if (typeof prompt !== "string") return undefined;
     // Native delivery drains steers before follow-ups, FIFO within each mode.
@@ -980,7 +1004,8 @@ export class GoalRuntime {
     if (this.pendingNonGoalInputs.some((pending) => pending.behavior === "steer")) return false;
     const index = this.pendingNonGoalInputs.findIndex((pending) => pending.behavior === "followUp");
     if (index < 0) return false;
-    this.pendingNonGoalInputs.splice(index, 1);
+    // agent_start has neither text nor queue-item identity. It can defer the
+    // cleanup guard, but cannot acknowledge or retire an outstanding input.
     return true;
   }
 
