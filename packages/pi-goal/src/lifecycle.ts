@@ -262,7 +262,8 @@ export function registerGoalLifecycle(
     // With existing pending work, a later handler's handled disposition cannot
     // be distinguished from another accepted queue item. Fail closed for this
     // ambiguous segment, including earlier retained real-input authority.
-    const canResetQueuedSafety = !ctx.hasPendingMessages() && !runtime.ambiguousNonGoalInput;
+    const canResetQueuedSafety =
+      !ctx.hasPendingMessages() && !runtime.ambiguousNonGoalInput && !runtime.nonGoalInputOverflow;
     if (event.streamingBehavior && !canResetQueuedSafety) {
       for (const pending of runtime.pendingNonGoalInputs) pending.resetSafetyEpoch = false;
     }

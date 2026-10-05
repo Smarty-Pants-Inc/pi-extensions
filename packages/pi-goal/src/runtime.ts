@@ -243,6 +243,13 @@ export class GoalRuntime {
   pendingNonGoalInputs: PendingNonGoalInput[] = [];
   /** True when native input hooks overlapped without an enqueue acknowledgement. */
   ambiguousNonGoalInput = false;
+  /**
+   * Eviction loses the identity of an input hook that may still deliver. Public
+   * native boundaries cannot prove its settlement, even after the retained
+   * array drains or a session changes. Latch uncertainty for this runtime's
+   * lifetime: text, queue emptiness and unrelated boundaries are not proof.
+   */
+  nonGoalInputOverflow = false;
   private pendingIdleInputs: { fingerprint: string; resetSafetyEpoch: boolean; goalId?: string }[] = [];
   private startedPromptBoundary = false;
   menuGeneration = 0;
@@ -721,7 +728,7 @@ export class GoalRuntime {
     // enqueue. Retain outstanding observations without granting authority.
     for (const pending of this.pendingNonGoalInputs) pending.resetSafetyEpoch = false;
     for (const pending of this.pendingIdleInputs) pending.resetSafetyEpoch = false;
-    this.ambiguousNonGoalInput = this.pendingNonGoalInputs.length > 0;
+    this.ambiguousNonGoalInput = this.nonGoalInputOverflow || this.pendingNonGoalInputs.length > 0;
     this.claimedGoalPromptMarkers.clear();
     this.claimedContinuationMarkers.clear();
     this.clearAgentRun();
@@ -754,7 +761,7 @@ export class GoalRuntime {
     this.pendingGoalPromptMarkers.clear();
     this.claimedGoalPromptMarkers.clear();
     this.pendingNonGoalInputs = [];
-    this.ambiguousNonGoalInput = false;
+    this.ambiguousNonGoalInput = this.nonGoalInputOverflow;
     this.pendingIdleInputs = [];
     this.startedPromptBoundary = false;
   }
@@ -900,6 +907,7 @@ export class GoalRuntime {
   }
 
   noteIdleNonGoalInput(prompt: string, resetSafetyEpoch = false) {
+    if (this.nonGoalInputOverflow) resetSafetyEpoch = false;
     if (this.pendingNonGoalInputs.length > 0) {
       this.ambiguousNonGoalInput = true;
       for (const pending of this.pendingNonGoalInputs) pending.resetSafetyEpoch = false;
@@ -939,6 +947,7 @@ export class GoalRuntime {
   }
 
   noteQueuedNonGoalInput(prompt: string, behavior: "steer" | "followUp", resetSafetyEpoch = false) {
+    if (this.nonGoalInputOverflow) resetSafetyEpoch = false;
     if (this.pendingIdleInputs.length > 0) {
       this.ambiguousNonGoalInput = true;
       for (const pending of this.pendingNonGoalInputs) pending.resetSafetyEpoch = false;
@@ -953,6 +962,7 @@ export class GoalRuntime {
     });
     if (this.pendingNonGoalInputs.length > MAX_PENDING_NON_GOAL_INPUTS) {
       this.pendingNonGoalInputs.shift();
+      this.nonGoalInputOverflow = true;
       this.ambiguousNonGoalInput = true;
       for (const pending of this.pendingNonGoalInputs) pending.resetSafetyEpoch = false;
     }
@@ -995,7 +1005,8 @@ export class GoalRuntime {
     }
     const consumed = this.pendingNonGoalInputs.splice(index, 1)[0];
     if (consumed.goalId !== this.activeGoal?.id) consumed.resetSafetyEpoch = false;
-    if (this.pendingNonGoalInputs.length === 0) this.ambiguousNonGoalInput = false;
+    if (this.nonGoalInputOverflow) consumed.resetSafetyEpoch = false;
+    if (this.pendingNonGoalInputs.length === 0) this.ambiguousNonGoalInput = this.nonGoalInputOverflow;
     return consumed;
   }
 
