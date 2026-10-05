@@ -231,10 +231,20 @@ describe("goal_wait lifecycle", () => {
     assert.match(original.statuses.get("goal") ?? "", /waiting.*Unlimited/);
     vi.advanceTimersByTime(20_000);
     const restored = restoreWait(original);
+    const beforeAcknowledgement = requireLastGoal(restored.mock);
     await vi.advanceTimersByTimeAsync(39_999);
     assert.equal(restored.mock.sentUserMessages.length, 0);
     await vi.advanceTimersByTimeAsync(1);
     assert.equal(restored.mock.sentUserMessages.length, 1);
+    assert.deepEqual(
+      requireLastGoal(restored.mock),
+      beforeAcknowledgement,
+      "dispatch alone cannot consume a recorded wait",
+    );
+    await restored.mock.events.get("before_agent_start")?.[0]?.(
+      { prompt: restored.mock.sentUserMessages[0]?.text, systemPrompt: "base" },
+      restored.ctx,
+    );
     const resumed = requireLastGoal(restored.mock);
     assert.equal(resumed.status, "active");
     assert.equal(resumed.wait, undefined);
@@ -256,7 +266,13 @@ describe("goal_wait lifecycle", () => {
     const restored = restoreWait(original);
     assert.equal(requireLastGoal(restored.mock).status, "paused");
     assert.equal(restored.mock.sentUserMessages.length, 0);
+    const saved = requireLastGoal(restored.mock);
     await vi.advanceTimersByTimeAsync(0);
+    assert.deepEqual(requireLastGoal(restored.mock), saved, "overdue dispatch still awaits native acceptance");
+    await restored.mock.events.get("before_agent_start")?.[0]?.(
+      { prompt: restored.mock.sentUserMessages[0]?.text, systemPrompt: "base" },
+      restored.ctx,
+    );
     assert.equal(requireLastGoal(restored.mock).status, "active");
     assert.equal(restored.mock.sentUserMessages.length, 1);
   });
@@ -387,7 +403,10 @@ describe("goal_wait lifecycle", () => {
     await vi.advanceTimersByTimeAsync(86_400_000);
     assert.deepEqual(requireLastGoal(fixture.mock).wait, { reason: "review result" });
     assert.equal(fixture.mock.sentUserMessages.length, 0);
+    const saved = requireLastGoal(fixture.mock);
     await fixture.mock.events.get("input")?.[0]?.({ source: "interactive", text: "Ready" }, fixture.ctx);
+    assert.deepEqual(requireLastGoal(fixture.mock), saved, "input observation is not native acceptance");
+    await fixture.mock.events.get("before_agent_start")?.[0]?.({ prompt: "Ready", systemPrompt: "base" }, fixture.ctx);
     assert.equal(requireLastGoal(fixture.mock).status, "active");
   });
 
@@ -435,8 +454,18 @@ describe("goal_wait lifecycle", () => {
     saved.timeUsedSeconds = 17;
     const fixture = restoreStoredGoalForTest(saved, branch, "always", {}, UNLIMITED_SETTINGS_PATH);
     original.mock.events.get("session_shutdown")?.[0]?.({}, original.ctx);
+    const beforeAcknowledgement = requireLastGoal(fixture.mock);
     await fixture.mock.events.get("input")?.[0]?.(
       { source: "interactive", text: "Review passed", streamingBehavior: "steer" },
+      fixture.ctx,
+    );
+    assert.deepEqual(
+      requireLastGoal(fixture.mock),
+      beforeAcknowledgement,
+      "steering observation retains identity, wait and accounting",
+    );
+    await fixture.mock.events.get("message_start")?.[0]?.(
+      { message: { role: "user", content: [{ type: "text", text: "Review passed" }] } },
       fixture.ctx,
     );
     const resumed = requireLastGoal(fixture.mock);

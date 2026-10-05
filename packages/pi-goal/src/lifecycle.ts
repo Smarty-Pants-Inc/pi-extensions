@@ -228,6 +228,11 @@ export function registerGoalLifecycle(
   });
 
   pi.on("input", (event, ctx) => {
+    // Input hooks run before native enqueue and a later handler may consume
+    // the attempt. An empty native queue disproves all retained queue markers;
+    // discard them before recording this attempt, not at message_start (where
+    // the native queue may already have drained its accepted item).
+    if (!ctx.hasPendingMessages()) runtime.pendingNonGoalInputs = [];
     if (event.source === "extension") {
       // A later extension input cannot inherit a real input rejected at preflight.
       if (runtime.pendingWaitResume?.input) runtime.pendingWaitResume = undefined;
@@ -247,12 +252,20 @@ export function registerGoalLifecycle(
     }
     if (runtime.queueFrozen) return;
     if (/^\/goal(?:\s|$)/u.test(event.text.trimStart())) return;
+    // Public Pi input hooks do not acknowledge enqueue or expose item identity.
+    // With existing pending work, a later handler's handled disposition cannot
+    // be distinguished from another accepted queue item. Fail closed for this
+    // ambiguous segment, including earlier retained real-input authority.
+    const canResetQueuedSafety = !ctx.hasPendingMessages();
+    if (event.streamingBehavior && !canResetQueuedSafety) {
+      for (const pending of runtime.pendingNonGoalInputs) pending.resetSafetyEpoch = false;
+    }
     if (event.streamingBehavior === "followUp") {
-      runtime.noteQueuedNonGoalInput(event.text, "followUp", true);
+      runtime.noteQueuedNonGoalInput(event.text, "followUp", canResetQueuedSafety);
       return;
     }
     if (event.streamingBehavior === "steer") {
-      runtime.noteQueuedNonGoalInput(event.text, "steer", true);
+      runtime.noteQueuedNonGoalInput(event.text, "steer", canResetQueuedSafety);
       return;
     }
     commands.resumeWaitingGoalOnInput(ctx);
@@ -273,6 +286,9 @@ export function registerGoalLifecycle(
       return;
     }
     if (message.role === "custom") {
+      // Custom queue items bypass input hooks. They cannot acknowledge any
+      // retained real attempt; discard its authority before later user delivery.
+      for (const pending of runtime.pendingNonGoalInputs) pending.resetSafetyEpoch = false;
       if (runtime.isActiveBudgetWrapUpMessage(message)) return;
       if (runtime.guardAbortGoalId === runtime.activeGoal?.id) {
         runtime.guardAbortGoalId = undefined;

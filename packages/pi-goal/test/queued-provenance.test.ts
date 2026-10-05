@@ -22,12 +22,15 @@ test("expanded real follow-up wakes once with the current Goal ID and no extra p
     toolFreeRepeatCount: 2,
     wait: { reason: "awaiting result" },
   };
+  let pending = false;
   const { ctx } = createMockContext({
+    hasPendingMessages: () => pending,
     sessionManager: { getBranch: () => [{ type: "custom", customType: "goal-state", data: { goal: saved } }] },
   });
   goal(mock.pi, { settingsPath: "/nonexistent-pi-goal-regression-settings.json" });
   await mock.events.get("session_start")?.[0]?.({}, ctx);
   await mock.events.get("input")?.[0]?.({ source: "rpc", text: "/notice green", streamingBehavior: "followUp" }, ctx);
+  pending = true; // Native enqueue follows input hooks and precedes the next input.
   await mock.events.get("input")?.[0]?.(
     { source: "extension", text: "Recorded outcome: green", streamingBehavior: "followUp" },
     ctx,
