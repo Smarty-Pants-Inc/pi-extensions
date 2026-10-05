@@ -578,7 +578,12 @@ export class GoalRuntime {
 
   recordAutomaticTurn(ctx: StatusContext, message: unknown) {
     const goal = this.activeGoal;
-    if (goal?.status !== "active" || !this.isAutomaticRunForGoal(goal.id)) return false;
+    if (
+      !goal ||
+      (goal.status !== "active" && !(goal.status === "paused" && goal.wait)) ||
+      !this.isAutomaticRunForGoal(goal.id)
+    )
+      return false;
     const candidate = message as { role?: unknown; stopReason?: unknown } | undefined;
     if (candidate?.role === "assistant" && candidate.stopReason === "aborted") return false;
     goal.automaticModelTurns = Math.min(Number.MAX_SAFE_INTEGER, goal.automaticModelTurns + 1);
@@ -607,7 +612,12 @@ export class GoalRuntime {
   enforceAutomaticTurnLimit(ctx: StatusContext, abortTurn: boolean) {
     const goal = this.activeGoal;
     const limit = this.settings.continuationLimits.automaticTurns;
-    if (goal?.status !== "active" || limit === null || goal.automaticModelTurns < limit) {
+    if (
+      !goal ||
+      (goal.status !== "active" && !(goal.status === "paused" && goal.wait)) ||
+      limit === null ||
+      goal.automaticModelTurns < limit
+    ) {
       return false;
     }
     return this.pauseGoalForSafety(ctx, "continuation_limit", abortTurn);
@@ -624,7 +634,8 @@ export class GoalRuntime {
 
   pauseGoalForSafety(ctx: StatusContext, cause: SafetyPauseCause, abortTurn: boolean) {
     const goal = this.activeGoal;
-    if (goal?.status !== "active") return false;
+    // goal_wait pauses during tool execution, before the owning turn_end.
+    if (!goal || (goal.status !== "active" && !(goal.status === "paused" && goal.wait))) return false;
     const automaticLimit = this.settings.continuationLimits.automaticTurns;
     const count =
       cause === "continuation_limit"

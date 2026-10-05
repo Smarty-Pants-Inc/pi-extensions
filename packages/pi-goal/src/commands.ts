@@ -421,7 +421,7 @@ export class GoalCommandController {
     }
   }
 
-  private prepareGoalResume(ctx: StatusContext, resetOnPrompt: boolean) {
+  private prepareGoalResume(ctx: StatusContext, resetOnPrompt: boolean, automatic = false) {
     if (!this.runtime.activeGoal) {
       notifyTerminal(ctx.ui, "No active goal.", "info");
       return;
@@ -454,7 +454,11 @@ export class GoalCommandController {
     this.runtime.clearBudgetWrapUp();
     this.runtime.clearStaleGoalToolCallBlock();
     const active = transitionGoal(nextGoalInstance(stoppedGoal), "active");
-    const resumedGoal = resetOnPrompt ? queueGoalSafetyReset(active) : resetGoalSafetyEpoch(active);
+    const resumedGoal = automatic
+      ? active
+      : resetOnPrompt
+        ? queueGoalSafetyReset(active)
+        : resetGoalSafetyEpoch(active);
     this.runtime.activeGoal = resumedGoal;
     this.runtime.persistGoal(resumedGoal);
     // Canonical state publication can synchronously pause or replace the goal.
@@ -463,15 +467,18 @@ export class GoalCommandController {
     return { stoppedGoal, resumedGoal, goalToolVisibilityBeforeActivation };
   }
 
-  async resumeGoal(ctx: StatusContext) {
-    const prepared = this.prepareGoalResume(ctx, true);
+  async resumeGoal(ctx: StatusContext, automatic = false) {
+    const prepared = this.prepareGoalResume(ctx, true, automatic);
     if (!prepared) return;
     const { stoppedGoal, resumedGoal, goalToolVisibilityBeforeActivation } = prepared;
     const stoppedStatus = stoppedGoal.status;
+    // A deadline is automatic work, not user permission for a new epoch.
+    if (automatic && this.runtime.enforceAutomaticTurnLimit(ctx, false)) return;
     const sent = await this.runtime.sendOwnedGoalPrompt(
       ctx,
       resumedGoal.id,
       buildResumePrompt(resumedGoal, stoppedStatus),
+      !automatic,
     );
     if (!sent) {
       if (this.runtime.activeGoal?.id === resumedGoal.id && this.runtime.activeGoal.status === "active") {
@@ -485,6 +492,7 @@ export class GoalCommandController {
       }
       return;
     }
+    if (automatic) return;
     const automaticLimit = this.runtime.settings.continuationLimits.automaticTurns;
     notifyTerminal(
       ctx.ui,

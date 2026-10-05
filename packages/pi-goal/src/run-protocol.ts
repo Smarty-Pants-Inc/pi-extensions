@@ -325,6 +325,14 @@ export class GoalRunController {
 
     run.closed = true;
     this.run = undefined;
+    const goal = this.runtime.activeGoal;
+    if (goal && goal.id === run.goalId && goal.wait) {
+      // A terminal receipt relinquishes ownership. Persist the cancellation
+      // before notifying the owner so neither the timer nor reload can wake it.
+      this.runtime.clearGoalWaitWake();
+      goal.wait = undefined;
+      this.runtime.persistGoal(goal);
+    }
     const generation = run.generation;
     // Active stays synchronous so a listener can cancel before kickoff. Terminal
     // publication waits until the transition finishes, preventing listener work

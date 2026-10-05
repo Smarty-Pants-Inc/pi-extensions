@@ -392,15 +392,19 @@ export function registerGoalTools(pi: ExtensionAPI, runtime: GoalRuntime) {
 
       const { requestedMs, effectiveMs } = resolveGoalWaitDelay(requestedResumeAfterMs);
       const clamped = requestedMs !== undefined && effectiveMs !== undefined && effectiveMs !== requestedMs;
-      const deadline =
-        effectiveMs === undefined
+      const deadline = !stoppedGoal.wait
+        ? "It will stay paused until explicitly resumed."
+        : effectiveMs === undefined
           ? "It will stay paused until you send it something or resume it."
           : `It will wake in ${Math.round(effectiveMs / 1000)}s${clamped ? ` (raised from ${requestedMs}ms)` : ""}.`;
       notifyTerminal(ctx.ui, `Goal waiting: ${truncateNotification(reason)}`, "info");
 
       return {
         content: toolContent(`Goal waiting: ${reason}. ${deadline}`),
-        details: { ...details(), ...(wait.resumeAt === undefined ? {} : { resume_at: wait.resumeAt }) },
+        details: {
+          ...details(),
+          ...(stoppedGoal.wait?.resumeAt === undefined ? {} : { resume_at: stoppedGoal.wait.resumeAt }),
+        },
         terminate: true,
       };
     },

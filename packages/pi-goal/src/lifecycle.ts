@@ -302,7 +302,7 @@ export function registerGoalLifecycle(
     if (runtime.agentRunGoalId !== undefined && runtime.agentRunGoalId !== ownedPrompt.goalId) {
       runtime.activeGoal.baselineTokens = Math.max(0, currentTokenTotal(ctx) - runtime.activeGoal.tokensUsed);
     }
-    runtime.beginAgentRun(ownedPrompt.goalId, "manual");
+    runtime.beginAgentRun(ownedPrompt.goalId, ownedPrompt.resetSafetyEpoch ? "manual" : "automatic");
     if (ownedPrompt.resetSafetyEpoch) {
       runtime.activeGoal = resetGoalSafetyEpoch(runtime.activeGoal);
     }
@@ -420,11 +420,12 @@ export function registerGoalLifecycle(
     if (queuedNonGoalInput?.behavior === "followUp") {
       beginNonGoalFollowUp(ctx, queuedNonGoalInput.resetSafetyEpoch);
     }
-    const runOrigin = continuationGoalId
-      ? "automatic"
-      : activeGoalRecovery && runtime.goalRecovery?.automaticOwner
+    const runOrigin =
+      continuationGoalId || (goalPrompt && !goalPrompt.resetSafetyEpoch)
         ? "automatic"
-        : "manual";
+        : activeGoalRecovery && runtime.goalRecovery?.automaticOwner
+          ? "automatic"
+          : "manual";
     if (runtime.pendingQueueAction?.kind === "prioritize" && !activeBudgetWrapUp && !activeGoalRecovery) {
       // A turn that starts after priority intent is committed belongs to neither
       // the displaced goal nor the not-yet-activated urgent goal. Persist the
