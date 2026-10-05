@@ -405,7 +405,7 @@ export class GoalCommandController {
     if (stoppedGoal) notifyTerminal(ctx.ui, `Goal paused: ${stoppedGoal.text}`, "info");
   }
 
-  resumeWaitingGoalOnInput(ctx: StatusContext) {
+  resumeWaitingGoalOnInput(ctx: StatusContext, delivered = false) {
     if (
       this.runtime.queueFrozen ||
       this.runtime.pendingQueueAction ||
@@ -415,7 +415,8 @@ export class GoalCommandController {
       return;
     // The incoming message already owns a turn; do not send a second prompt.
     const resumed = this.prepareGoalResume(ctx, false);
-    if (resumed) {
+    if (resumed && delivered) {
+      this.runtime.confirmWaitResume(ctx);
       this.runtime.inputWakeGoalId = resumed.resumedGoal.id;
       this.runtime.beginAgentRun(resumed.resumedGoal.id, "manual");
     }
@@ -449,7 +450,7 @@ export class GoalCommandController {
       return;
     }
     const stoppedGoal = this.runtime.activeGoal;
-    this.runtime.cancelContinuationWork();
+    this.runtime.cancelContinuationWork(Boolean(stoppedGoal.wait));
     this.runtime.clearGoalRecovery();
     this.runtime.clearBudgetWrapUp();
     this.runtime.clearStaleGoalToolCallBlock();
@@ -460,10 +461,18 @@ export class GoalCommandController {
         ? queueGoalSafetyReset(active)
         : resetGoalSafetyEpoch(active);
     this.runtime.activeGoal = resumedGoal;
-    this.runtime.persistGoal(resumedGoal);
+    if (stoppedGoal.wait) {
+      // Preflight can reject after input, and native sendUserMessage returns void.
+      // The exact owned run boundary, never the API return, commits this resume.
+      if (automatic && this.runtime.enforceAutomaticTurnLimit(ctx, false)) return;
+      this.runtime.activeGoal = stoppedGoal;
+      this.runtime.pendingWaitResume = { stopped: stoppedGoal, resumed: resumedGoal, input: !resetOnPrompt };
+    } else {
+      this.runtime.persistGoal(resumedGoal);
+    }
     // Canonical state publication can synchronously pause or replace the goal.
-    if (this.runtime.activeGoal !== resumedGoal || resumedGoal.status !== "active") return;
-    this.runtime.updateStatus(ctx, resumedGoal);
+    if (!stoppedGoal.wait && (this.runtime.activeGoal !== resumedGoal || resumedGoal.status !== "active")) return;
+    this.runtime.updateStatus(ctx, this.runtime.activeGoal);
     return { stoppedGoal, resumedGoal, goalToolVisibilityBeforeActivation };
   }
 
@@ -473,7 +482,7 @@ export class GoalCommandController {
     const { stoppedGoal, resumedGoal, goalToolVisibilityBeforeActivation } = prepared;
     const stoppedStatus = stoppedGoal.status;
     // A deadline is automatic work, not user permission for a new epoch.
-    if (automatic && this.runtime.enforceAutomaticTurnLimit(ctx, false)) return;
+    if (automatic && !stoppedGoal.wait && this.runtime.enforceAutomaticTurnLimit(ctx, false)) return;
     const sent = await this.runtime.sendOwnedGoalPrompt(
       ctx,
       resumedGoal.id,
@@ -481,7 +490,15 @@ export class GoalCommandController {
       !automatic,
     );
     if (!sent) {
-      if (this.runtime.activeGoal?.id === resumedGoal.id && this.runtime.activeGoal.status === "active") {
+      if (this.runtime.pendingWaitResume?.resumed === resumedGoal) {
+        this.runtime.pendingWaitResume = undefined;
+        this.runtime.toolPolicy.restore(goalToolVisibilityBeforeActivation);
+      }
+      if (
+        !stoppedGoal.wait &&
+        this.runtime.activeGoal?.id === resumedGoal.id &&
+        this.runtime.activeGoal.status === "active"
+      ) {
         this.runtime.activeGoal = stoppedGoal;
         this.runtime.persistGoal(this.runtime.activeGoal);
         this.runtime.updateStatus(ctx, this.runtime.activeGoal);

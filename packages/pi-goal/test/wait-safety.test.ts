@@ -100,12 +100,17 @@ for (const source of ["interactive", "resume"] as const) {
       await begin(restored);
     } else {
       await restored.mock.events.get("input")?.[0]?.({ source, text: "review ready" }, restored.ctx);
+      await restored.mock.events.get("before_agent_start")?.[0]?.(
+        { prompt: "review ready", systemPrompt: "base" },
+        restored.ctx,
+      );
     }
     assert.equal(last(restored).status, "active");
     assert.equal(last(restored).automaticModelTurns, 0);
     await wait(restored);
     assert.equal(last(restored).automaticModelTurns, 0, "real input remains manual");
     await vi.advanceTimersByTimeAsync(10_000);
+    await begin(restored);
     assert.equal(last(restored).status, "active", "new epoch can wake automatically");
     restored.mock.events.get("session_shutdown")?.[0]?.({}, restored.ctx);
   });

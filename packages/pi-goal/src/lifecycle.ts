@@ -229,6 +229,8 @@ export function registerGoalLifecycle(
 
   pi.on("input", (event, ctx) => {
     if (event.source === "extension") {
+      // A later extension input cannot inherit a real input rejected at preflight.
+      if (runtime.pendingWaitResume?.input) runtime.pendingWaitResume = undefined;
       if (runtime.consumeCancelledContinuationPrompt(event.text) || runtime.consumeStaleOwnedGoalPrompt(event.text)) {
         return { action: "handled" as const };
       }
@@ -250,7 +252,8 @@ export function registerGoalLifecycle(
       return;
     }
     if (event.streamingBehavior === "steer") {
-      runtime.noteQueuedNonGoalInput(event.text, "steer");
+      runtime.noteQueuedNonGoalInput(event.text, "steer", true);
+      return;
     }
     commands.resumeWaitingGoalOnInput(ctx);
     runtime.clearGoalRecovery();
@@ -288,15 +291,17 @@ export function registerGoalLifecycle(
         ? message.content
         : "";
     const ownedPrompt = runtime.consumeOwnedGoalPrompt(prompt);
+    if (ownedPrompt) runtime.confirmWaitResume(ctx, ownedPrompt.goalId);
     const ownedPromptBoundary = runtime.hasOwnedPromptBoundary(prompt);
     const queuedNonGoalInput = runtime.consumeQueuedNonGoalInput(prompt, !ownedPromptBoundary);
     if (!ownedPrompt) {
-      if (queuedNonGoalInput?.behavior === "followUp") {
+      if (queuedNonGoalInput?.behavior === "followUp" || queuedNonGoalInput?.resetSafetyEpoch) {
         beginNonGoalFollowUp(ctx, queuedNonGoalInput.resetSafetyEpoch);
       }
       return;
     }
     if (runtime.activeGoal?.id !== ownedPrompt.goalId || runtime.activeGoal.status !== "active") {
+      abortCurrentTurn(ctx);
       return;
     }
     if (runtime.agentRunGoalId !== undefined && runtime.agentRunGoalId !== ownedPrompt.goalId) {
@@ -405,10 +410,12 @@ export function registerGoalLifecycle(
     // must not abort it.
     if (runtime.guardAbortGoalId) runtime.guardAbortGoalId = undefined;
     const goalPrompt = runtime.consumeOwnedGoalPrompt(event.prompt);
+    if (goalPrompt) runtime.confirmWaitResume(ctx, goalPrompt.goalId);
     const goalPromptGoalId = goalPrompt?.goalId;
     const continuationGoalId = goalPromptGoalId ? undefined : runtime.markContinuationStarted(event.prompt);
     const ownedPromptGoalId = goalPromptGoalId ?? continuationGoalId;
     const ownedPromptBoundary = runtime.hasOwnedPromptBoundary(event.prompt);
+    if (!ownedPromptGoalId && !ownedPromptBoundary) runtime.confirmWaitResume(ctx);
     const activeBudgetWrapUp = runtime.hasActiveBudgetWrapUp();
     const activeGoalRecovery = runtime.hasActiveGoalRecovery();
     const queuedNonGoalInput = activeBudgetWrapUp
@@ -417,7 +424,7 @@ export function registerGoalLifecycle(
           event.prompt,
           !activeGoalRecovery && ownedPromptGoalId === undefined && !ownedPromptBoundary,
         );
-    if (queuedNonGoalInput?.behavior === "followUp") {
+    if (queuedNonGoalInput?.behavior === "followUp" || queuedNonGoalInput?.resetSafetyEpoch) {
       beginNonGoalFollowUp(ctx, queuedNonGoalInput.resetSafetyEpoch);
     }
     const runOrigin =
@@ -613,7 +620,7 @@ export function registerGoalLifecycle(
   });
 
   function beginNonGoalFollowUp(ctx: StatusContext, resetSafetyEpoch: boolean) {
-    if (resetSafetyEpoch) commands.resumeWaitingGoalOnInput(ctx);
+    if (resetSafetyEpoch) commands.resumeWaitingGoalOnInput(ctx, true);
     runtime.clearGoalRecovery();
     runtime.clearStaleGoalToolCallBlock();
     if (resetSafetyEpoch) runtime.clearBudgetWrapUp();

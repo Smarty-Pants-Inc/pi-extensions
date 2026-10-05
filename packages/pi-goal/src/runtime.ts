@@ -192,6 +192,25 @@ export class GoalRuntime {
   settings: GoalSettings = DEFAULT_GOAL_SETTINGS;
   settingsLoadIssue?: GoalSettingsLoadIssue;
   activeGoal?: ActiveGoal;
+  /** A waiting goal remains durable and live until its exact run boundary. */
+  pendingWaitResume?: { stopped: ActiveGoal; resumed: ActiveGoal; input: boolean };
+
+  confirmWaitResume(ctx: StatusContext, goalId?: string): boolean {
+    const pending = this.pendingWaitResume;
+    if (!pending || (goalId ? pending.resumed.id !== goalId : !pending.input)) return false;
+    if (this.activeGoal !== pending.stopped || this.queueFrozen || this.pendingQueueAction) {
+      this.pendingWaitResume = undefined;
+      return false;
+    }
+    this.pendingWaitResume = undefined;
+    this.clearGoalWaitWake();
+    pending.resumed.activeStartedAt = Date.now();
+    pending.resumed.updatedAt = Date.now();
+    this.activeGoal = pending.resumed;
+    this.persistGoal(pending.resumed);
+    this.updateStatus(ctx, pending.resumed);
+    return this.activeGoal === pending.resumed && pending.resumed.status === "active";
+  }
   /** The single `goal_wait` safety wake-up. Cancelled with continuation work. */
   private readonly goalWaitTimer = new GoalWaitTimer();
   /** Terminal details captured for the matching persisted-state snapshot. */
@@ -721,6 +740,7 @@ export class GoalRuntime {
   }
 
   clearPendingGoalPrompts() {
+    this.pendingWaitResume = undefined;
     this.pendingGoalPromptMarkers.clear();
     this.claimedGoalPromptMarkers.clear();
     this.pendingNonGoalInputs = [];
@@ -733,10 +753,13 @@ export class GoalRuntime {
     resetSafetyEpoch = true,
     isCurrent?: () => boolean,
   ) {
+    const waitingResume = this.pendingWaitResume?.resumed.id === goalId;
     const pending = this.rememberPendingGoalPrompt(goalId, prompt, resetSafetyEpoch);
     const sent = await sendPrompt(this.pi, ctx, pending.prompt, isCurrent);
     if (!sent || (isCurrent && !isCurrent())) {
-      this.pendingGoalPromptMarkers.delete(pending.marker);
+      // Keep rejected wait markers as stale-delivery guards. A late native
+      // delivery must not become an unrelated manual turn after a later wake.
+      if (!waitingResume) this.pendingGoalPromptMarkers.delete(pending.marker);
       return false;
     }
     return true;
@@ -792,8 +815,8 @@ export class GoalRuntime {
     this.goalWaitTimer.clear();
   }
 
-  cancelContinuationWork() {
-    this.clearGoalWaitWake();
+  cancelContinuationWork(preserveGoalWait = false) {
+    if (!preserveGoalWait) this.clearGoalWaitWake();
     this.clearContinuationDispatchTimer();
     if (this.continuationDelivery) {
       this.rememberCancelledContinuationMarker(this.continuationDelivery.marker);
@@ -854,8 +877,8 @@ export class GoalRuntime {
     if (
       !this.queueFrozen &&
       !this.pendingQueueAction &&
-      this.activeGoal?.id === pending.goalId &&
-      this.activeGoal.status === "active"
+      ((this.activeGoal?.id === pending.goalId && this.activeGoal.status === "active") ||
+        (this.pendingWaitResume?.resumed.id === pending.goalId && this.activeGoal === this.pendingWaitResume.stopped))
     ) {
       return false;
     }
@@ -1246,8 +1269,8 @@ function inputFingerprint(prompt: string) {
 
 async function sendPrompt(pi: ExtensionAPI, ctx: StatusContext, prompt: string, isCurrent?: () => boolean) {
   try {
-    await pi.sendUserMessage(prompt, { deliverAs: "followUp" });
-    return true;
+    const result: unknown = await pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+    return result !== false;
   } catch (error) {
     if (!isCurrent || isCurrent()) {
       notifyTerminal(ctx.ui, `Goal prompt failed: ${formatError(error)}`, "error");
