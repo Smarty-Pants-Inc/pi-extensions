@@ -876,31 +876,18 @@ export class GoalRuntime {
 
   consumeQueuedNonGoalInput(prompt: string, allowDeliveryFallback = true) {
     if (typeof prompt !== "string") return undefined;
-    const fingerprint = inputFingerprint(prompt);
-    // Pi delivers steers before follow-ups. Prefer a matching steer even when an
-    // identical follow-up was queued first so it cannot steal follow-up ownership.
-    const steerIndex = this.pendingNonGoalInputs.findIndex(
-      (pending) => pending.behavior === "steer" && pending.fingerprint === fingerprint,
-    );
-    const exactIndex =
-      steerIndex >= 0
-        ? steerIndex
-        : this.pendingNonGoalInputs.findIndex(
-            (pending) => pending.behavior === "followUp" && pending.fingerprint === fingerprint,
-          );
-    if (exactIndex >= 0) return this.pendingNonGoalInputs.splice(exactIndex, 1)[0];
-    if (!allowDeliveryFallback) return undefined;
-
-    // Skills, templates, and later input handlers can transform the raw text after
-    // pi-goal records it. Fall back to Pi's delivery priority as a bounded marker:
-    // steers drain before follow-ups, and settlement clears stale entries.
-    const fallbackSteerIndex = this.pendingNonGoalInputs.findIndex((pending) => pending.behavior === "steer");
-    const fallbackIndex =
-      fallbackSteerIndex >= 0
-        ? fallbackSteerIndex
-        : this.pendingNonGoalInputs.findIndex((pending) => pending.behavior === "followUp");
-    if (fallbackIndex < 0) return undefined;
-    return this.pendingNonGoalInputs.splice(fallbackIndex, 1)[0];
+    // Native delivery drains steers before follow-ups, FIFO within each mode.
+    // Expansion can change text after input, so only the next item by native
+    // priority owns the boundary. A later text match must never steal its
+    // real-input/extension provenance.
+    const steerIndex = this.pendingNonGoalInputs.findIndex((pending) => pending.behavior === "steer");
+    const index =
+      steerIndex >= 0 ? steerIndex : this.pendingNonGoalInputs.findIndex((pending) => pending.behavior === "followUp");
+    if (index < 0) return undefined;
+    if (!allowDeliveryFallback && this.pendingNonGoalInputs[index].fingerprint !== inputFingerprint(prompt)) {
+      return undefined;
+    }
+    return this.pendingNonGoalInputs.splice(index, 1)[0];
   }
 
   consumeQueuedNonGoalFollowUpForAgentStart() {
