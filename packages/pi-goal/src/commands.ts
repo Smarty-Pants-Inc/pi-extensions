@@ -416,7 +416,7 @@ export class GoalCommandController {
     // The incoming message already owns a turn; do not send a second prompt.
     const resumed = this.prepareGoalResume(ctx, false);
     if (resumed && delivered) {
-      this.runtime.confirmWaitResume(ctx);
+      this.runtime.confirmWaitResume(ctx, resumed.resumedGoal.id);
       this.runtime.inputWakeGoalId = resumed.resumedGoal.id;
       this.runtime.beginAgentRun(resumed.resumedGoal.id, "manual");
     }
@@ -466,7 +466,7 @@ export class GoalCommandController {
       // The exact owned run boundary, never the API return, commits this resume.
       if (automatic && this.runtime.enforceAutomaticTurnLimit(ctx, false)) return;
       this.runtime.activeGoal = stoppedGoal;
-      this.runtime.pendingWaitResume = { stopped: stoppedGoal, resumed: resumedGoal, input: !resetOnPrompt };
+      this.runtime.pendingWaitResume = { stopped: stoppedGoal, resumed: resumedGoal };
     } else {
       this.runtime.persistGoal(resumedGoal);
     }

@@ -228,14 +228,18 @@ export function registerGoalLifecycle(
   });
 
   pi.on("input", (event, ctx) => {
-    // Input hooks run before native enqueue and a later handler may consume
-    // the attempt. An empty native queue disproves all retained queue markers;
-    // discard them before recording this attempt, not at message_start (where
-    // the native queue may already have drained its accepted item).
-    if (!ctx.hasPendingMessages()) runtime.pendingNonGoalInputs = [];
+    // Input observations precede enqueue and may overlap async sibling hooks.
+    // Queue emptiness alone cannot disprove an outstanding observation.
+    if (!ctx.hasPendingMessages()) {
+      // An empty queue does not prove that an earlier async hook was rejected.
+      // Preserve the observations, but revoke all wake/reset authority until a
+      // native item identity or an unambiguous boundary is available.
+      if (runtime.pendingNonGoalInputs.length > 0) {
+        runtime.ambiguousNonGoalInput = true;
+        for (const pending of runtime.pendingNonGoalInputs) pending.resetSafetyEpoch = false;
+      }
+    }
     if (event.source === "extension") {
-      // A later extension input cannot inherit a real input rejected at preflight.
-      if (runtime.pendingWaitResume?.input) runtime.pendingWaitResume = undefined;
       if (runtime.consumeCancelledContinuationPrompt(event.text) || runtime.consumeStaleOwnedGoalPrompt(event.text)) {
         return { action: "handled" as const };
       }
@@ -246,6 +250,8 @@ export function registerGoalLifecycle(
       if (runtime.hasPendingOwnedGoalPrompt(event.text)) return;
       if (event.streamingBehavior === "steer" || event.streamingBehavior === "followUp") {
         runtime.noteQueuedNonGoalInput(event.text, event.streamingBehavior);
+      } else {
+        runtime.noteIdleNonGoalInput(event.text);
       }
       runtime.clearGoalRecovery();
       return;
@@ -256,7 +262,7 @@ export function registerGoalLifecycle(
     // With existing pending work, a later handler's handled disposition cannot
     // be distinguished from another accepted queue item. Fail closed for this
     // ambiguous segment, including earlier retained real-input authority.
-    const canResetQueuedSafety = !ctx.hasPendingMessages();
+    const canResetQueuedSafety = !ctx.hasPendingMessages() && !runtime.ambiguousNonGoalInput;
     if (event.streamingBehavior && !canResetQueuedSafety) {
       for (const pending of runtime.pendingNonGoalInputs) pending.resetSafetyEpoch = false;
     }
@@ -268,11 +274,8 @@ export function registerGoalLifecycle(
       runtime.noteQueuedNonGoalInput(event.text, "steer", canResetQueuedSafety);
       return;
     }
-    commands.resumeWaitingGoalOnInput(ctx);
-    runtime.clearGoalRecovery();
-    runtime.clearBudgetWrapUp();
-    runtime.clearStaleGoalToolCallBlock();
-    runtime.resetActiveSafetyEpoch(ctx);
+    // Prepare/reset only when this isolated attempt reaches its native boundary.
+    runtime.noteIdleNonGoalInput(event.text, canResetQueuedSafety);
   });
 
   pi.on("message_start", (event, ctx) => {
@@ -431,7 +434,10 @@ export function registerGoalLifecycle(
     const continuationGoalId = goalPromptGoalId ? undefined : runtime.markContinuationStarted(event.prompt);
     const ownedPromptGoalId = goalPromptGoalId ?? continuationGoalId;
     const ownedPromptBoundary = runtime.hasOwnedPromptBoundary(event.prompt);
-    if (!ownedPromptGoalId && !ownedPromptBoundary) runtime.confirmWaitResume(ctx);
+    if (!ownedPromptGoalId && !ownedPromptBoundary) {
+      const idleInput = runtime.consumeIdleNonGoalInput(event.prompt);
+      if (idleInput?.resetSafetyEpoch) beginNonGoalFollowUp(ctx, true);
+    }
     const activeBudgetWrapUp = runtime.hasActiveBudgetWrapUp();
     const activeGoalRecovery = runtime.hasActiveGoalRecovery();
     const queuedNonGoalInput = activeBudgetWrapUp

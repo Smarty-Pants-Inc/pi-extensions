@@ -167,6 +167,7 @@ interface PendingNonGoalInput {
   behavior: "steer" | "followUp";
   fingerprint: string;
   resetSafetyEpoch: boolean;
+  goalId?: string;
 }
 
 const MAX_CANCELLED_CONTINUATION_PROMPTS = 20;
@@ -193,11 +194,11 @@ export class GoalRuntime {
   settingsLoadIssue?: GoalSettingsLoadIssue;
   activeGoal?: ActiveGoal;
   /** A waiting goal remains durable and live until its exact run boundary. */
-  pendingWaitResume?: { stopped: ActiveGoal; resumed: ActiveGoal; input: boolean };
+  pendingWaitResume?: { stopped: ActiveGoal; resumed: ActiveGoal };
 
-  confirmWaitResume(ctx: StatusContext, goalId?: string): boolean {
+  confirmWaitResume(ctx: StatusContext, goalId: string): boolean {
     const pending = this.pendingWaitResume;
-    if (!pending || (goalId ? pending.resumed.id !== goalId : !pending.input)) return false;
+    if (!pending || pending.resumed.id !== goalId) return false;
     if (this.activeGoal !== pending.stopped || this.queueFrozen || this.pendingQueueAction) {
       this.pendingWaitResume = undefined;
       return false;
@@ -240,6 +241,9 @@ export class GoalRuntime {
   cancelledContinuationMarkers = new Set<string>();
   claimedContinuationMarkers = new Set<string>();
   pendingNonGoalInputs: PendingNonGoalInput[] = [];
+  /** True when native input hooks overlapped without an enqueue acknowledgement. */
+  ambiguousNonGoalInput = false;
+  private pendingIdleInputs: { fingerprint: string; resetSafetyEpoch: boolean; goalId?: string }[] = [];
   menuGeneration = 0;
   menuController = new AbortController();
 
@@ -711,7 +715,11 @@ export class GoalRuntime {
 
   clearSettledSafetyTracking() {
     this.guardAbortGoalId = undefined;
-    this.pendingNonGoalInputs = [];
+    // Settlement closes a model run, not sibling input hooks still awaiting
+    // enqueue. Retain outstanding observations without granting authority.
+    for (const pending of this.pendingNonGoalInputs) pending.resetSafetyEpoch = false;
+    for (const pending of this.pendingIdleInputs) pending.resetSafetyEpoch = false;
+    this.ambiguousNonGoalInput = this.pendingNonGoalInputs.length > 0;
     this.claimedGoalPromptMarkers.clear();
     this.claimedContinuationMarkers.clear();
     this.clearAgentRun();
@@ -744,6 +752,8 @@ export class GoalRuntime {
     this.pendingGoalPromptMarkers.clear();
     this.claimedGoalPromptMarkers.clear();
     this.pendingNonGoalInputs = [];
+    this.ambiguousNonGoalInput = false;
+    this.pendingIdleInputs = [];
   }
 
   async sendOwnedGoalPrompt(
@@ -886,14 +896,62 @@ export class GoalRuntime {
     return true;
   }
 
+  noteIdleNonGoalInput(prompt: string, resetSafetyEpoch = false) {
+    if (this.pendingNonGoalInputs.length > 0) {
+      this.ambiguousNonGoalInput = true;
+      for (const pending of this.pendingNonGoalInputs) pending.resetSafetyEpoch = false;
+      resetSafetyEpoch = false;
+    }
+    // Unlike a queued FIFO item, an idle prompt exposes its accepted text at
+    // before_agent_start. Retain extension observations too: they may still be
+    // inside an async sibling hook when a real attempt is subsequently handled.
+    if (!resetSafetyEpoch || this.pendingIdleInputs.some((pending) => !pending.resetSafetyEpoch)) {
+      for (const pending of this.pendingIdleInputs) pending.resetSafetyEpoch = false;
+      resetSafetyEpoch = false;
+    }
+    this.pendingIdleInputs.push({
+      fingerprint: inputFingerprint(prompt),
+      resetSafetyEpoch,
+      goalId: this.activeGoal?.id,
+    });
+    if (this.pendingIdleInputs.length > MAX_PENDING_NON_GOAL_INPUTS) {
+      this.pendingIdleInputs.shift();
+      for (const pending of this.pendingIdleInputs) pending.resetSafetyEpoch = false;
+    }
+  }
+
+  consumeIdleNonGoalInput(prompt: string) {
+    const fingerprint = inputFingerprint(prompt);
+    const matching = this.pendingIdleInputs.filter((pending) => pending.fingerprint === fingerprint);
+    // No FIFO fallback for idle prompts: expansion or equal-text overlapping
+    // hooks cannot establish which native attempt supplied the boundary.
+    const accepted = matching.length === 1 ? matching[0] : undefined;
+    if (!accepted) {
+      for (const pending of this.pendingIdleInputs) pending.resetSafetyEpoch = false;
+      return undefined;
+    }
+    this.pendingIdleInputs.splice(this.pendingIdleInputs.indexOf(accepted), 1);
+    if (accepted.goalId !== this.activeGoal?.id) accepted.resetSafetyEpoch = false;
+    return accepted;
+  }
+
   noteQueuedNonGoalInput(prompt: string, behavior: "steer" | "followUp", resetSafetyEpoch = false) {
+    if (this.pendingIdleInputs.length > 0) {
+      this.ambiguousNonGoalInput = true;
+      for (const pending of this.pendingNonGoalInputs) pending.resetSafetyEpoch = false;
+      for (const pending of this.pendingIdleInputs) pending.resetSafetyEpoch = false;
+      resetSafetyEpoch = false;
+    }
     this.pendingNonGoalInputs.push({
       behavior,
       fingerprint: inputFingerprint(prompt),
       resetSafetyEpoch,
+      goalId: this.activeGoal?.id,
     });
     if (this.pendingNonGoalInputs.length > MAX_PENDING_NON_GOAL_INPUTS) {
       this.pendingNonGoalInputs.shift();
+      this.ambiguousNonGoalInput = true;
+      for (const pending of this.pendingNonGoalInputs) pending.resetSafetyEpoch = false;
     }
   }
 
@@ -910,7 +968,10 @@ export class GoalRuntime {
     if (!allowDeliveryFallback && this.pendingNonGoalInputs[index].fingerprint !== inputFingerprint(prompt)) {
       return undefined;
     }
-    return this.pendingNonGoalInputs.splice(index, 1)[0];
+    const consumed = this.pendingNonGoalInputs.splice(index, 1)[0];
+    if (consumed.goalId !== this.activeGoal?.id) consumed.resetSafetyEpoch = false;
+    if (this.pendingNonGoalInputs.length === 0) this.ambiguousNonGoalInput = false;
+    return consumed;
   }
 
   consumeQueuedNonGoalFollowUpForAgentStart() {
