@@ -3,6 +3,13 @@ import { test } from "vitest";
 import { GoalRuntime } from "../src/runtime.js";
 import { createMockPi } from "./support.js";
 
+test("session invalidation clears the already-started prompt boundary", () => {
+  const runtime = new GoalRuntime(createMockPi().pi);
+  runtime.noteStartedPromptBoundary();
+  runtime.clearPendingGoalPrompts();
+  assert.equal(runtime.consumeStartedPromptBoundary(), false);
+});
+
 for (const resetSafetyEpoch of [false, true]) {
   test(`speculative agent start retains unacknowledged follow-up: reset=${resetSafetyEpoch}`, () => {
     const runtime = new GoalRuntime(createMockPi().pi);
