@@ -15,7 +15,10 @@ import {
 
 // ponytail: these internals are not in pi-coding-agent's exports map; load them from the installed
 // package's real dist path instead of a cross-package relative import (check:boundaries).
-const agentDist = join(realpathSync(resolve(import.meta.dirname, "../../../../node_modules/@earendil-works/pi-coding-agent")), "dist");
+const agentDist = join(
+  realpathSync(resolve(import.meta.dirname, "../../../../node_modules/@earendil-works/pi-coding-agent")),
+  "dist",
+);
 const { loadExtensionFromFactory } = await import(pathToFileURL(join(agentDist, "core/extensions/loader.js")).href);
 const { runRpcMode } = await import(pathToFileURL(join(agentDist, "modes/rpc/rpc-mode.js")).href);
 
