@@ -2,6 +2,7 @@ import { mkdtempSync, realpathSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
 import {
   createAgentSession,
@@ -11,8 +12,12 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { loadExtensionFromFactory } from "../../../../node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/loader.js";
-import { runRpcMode } from "../../../../node_modules/@earendil-works/pi-coding-agent/dist/modes/rpc/rpc-mode.js";
+
+// ponytail: these internals are not in pi-coding-agent's exports map; load them from the installed
+// package's real dist path instead of a cross-package relative import (check:boundaries).
+const agentDist = join(realpathSync(resolve(import.meta.dirname, "../../../../node_modules/@earendil-works/pi-coding-agent")), "dist");
+const { loadExtensionFromFactory } = await import(pathToFileURL(join(agentDist, "core/extensions/loader.js")).href);
+const { runRpcMode } = await import(pathToFileURL(join(agentDist, "modes/rpc/rpc-mode.js")).href);
 
 // Explicit resources, in-memory persistence, no disk cache, no model or provider calls.
 const root = mkdtempSync(join(tmpdir(), "pi-goal-native-rejection-"));

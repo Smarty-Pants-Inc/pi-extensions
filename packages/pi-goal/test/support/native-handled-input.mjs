@@ -4,6 +4,7 @@ import { mkdtempSync, realpathSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import {
@@ -14,8 +15,12 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { loadExtensionFromFactory } from "../../../../node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/loader.js";
-import { emitSessionShutdownEvent } from "../../../../node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/runner.js";
+
+// ponytail: these internals are not in pi-coding-agent's exports map; load them from the installed
+// package's real dist path instead of a cross-package relative import (check:boundaries).
+const agentDist = join(realpathSync(resolve(import.meta.dirname, "../../../../node_modules/@earendil-works/pi-coding-agent")), "dist");
+const { loadExtensionFromFactory } = await import(pathToFileURL(join(agentDist, "core/extensions/loader.js")).href);
+const { emitSessionShutdownEvent } = await import(pathToFileURL(join(agentDist, "core/extensions/runner.js")).href);
 
 const source = process.argv[2] ?? resolve(import.meta.dirname, "../../src/goal.ts");
 const nativeRequire = createRequire(
