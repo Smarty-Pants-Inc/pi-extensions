@@ -12,7 +12,7 @@
     "packages/*"
   ],
   "scripts": {
-    "check": "bun run check:json && bun run check:package-config && bun run check:boundaries && bun run check:shared-deps && bun run check:tests && bun run check:versions && bun run check:changesets && bun run check:capabilities && bun run lint && bun run typecheck && bun run test && bun run test:release && bun run test:config && bun run smoke:pi && bun run pack:check && bun run secret-scan",
+    "check": "bun run check:json && bun run check:package-config && bun run check:boundaries && bun run check:shared-deps && bun run check:tests && bun run check:versions && bun run check:changesets && bun run check:capabilities && bun run lint && bun run typecheck && bun run test && bun run test:integration && bun run test:release && bun run test:config && bun run smoke:pi && bun run pack:check && bun run secret-scan",
     "check:json": "node scripts/check-json.mjs",
     "check:package-config": "node scripts/check-package-config.mjs",
     "check:boundaries": "node scripts/check-extension-boundaries.mjs",
@@ -23,10 +23,12 @@
     "check:capabilities": "node scripts/check-capabilities.mjs",
     "format": "biome check --write scripts && node scripts/run-package-scripts.mjs format",
     "lint": "biome check --error-on-warnings scripts && node scripts/run-package-scripts.mjs lint --error-on-warnings --require-processed-files",
-    "typecheck": "node scripts/run-package-scripts.mjs typecheck",
+    "typecheck": "node scripts/run-package-scripts.mjs typecheck && bun run typecheck:integration",
+    "typecheck:integration": "tsc --noEmit -p tsconfig.integration.json",
     "test": "node scripts/run-package-scripts.mjs test",
+    "test:integration": "vitest run scripts/editor-composition.test.ts --config vitest.integration.config.ts",
     "test:release": "node --test scripts/publish-packages.test.mjs scripts/publish-changesets.test.mjs scripts/publish-with-token.test.mjs scripts/configure-npm-trusted-publishers.test.mjs scripts/publish-workflow.test.mjs",
-    "test:config": "node --test scripts/check-package-config.test.mjs",
+    "test:config": "node --test scripts/check-package-config.test.mjs scripts/smoke-pi-loaders.test.mjs",
     "smoke:pi": "node scripts/smoke-pi-loaders.mjs",
     "pack:check": "node scripts/pack-packages.mjs --dry-run --include-experimental",
     "changeset": "changeset",
@@ -44,17 +46,17 @@
   "devDependencies": {
     "@biomejs/biome": "^2.5.7",
     "@changesets/cli": "2.31.1",
-    "@earendil-works/pi-agent-core": "0.99.1",
-    "@earendil-works/pi-ai": "0.99.1",
-    "@earendil-works/pi-coding-agent": "0.99.1",
-    "@earendil-works/pi-tui": "0.99.1",
+    "@earendil-works/pi-agent-core": "1.0.4",
+    "@earendil-works/pi-ai": "1.0.4",
+    "@earendil-works/pi-coding-agent": "1.0.4",
+    "@earendil-works/pi-tui": "1.0.4",
     "@sinclair/typebox": "^0.34.49",
     "@types/node": "^24.10.0",
     "@types/proper-lockfile": "^4.1.4",
     "proper-lockfile": "^4.1.2",
     "semver": "^7.7.2",
-    "typebox": "1.3.11",
+    "typebox": "1.3.27",
     "typescript": "^6.0.0",
-    "vitest": "^4.0.18"
+    "vitest": "^4.1.11"
   }
 }

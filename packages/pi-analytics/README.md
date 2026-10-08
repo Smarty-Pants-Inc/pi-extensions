@@ -74,7 +74,9 @@ Use the menu to change the time range or browse Skills, Tools, Provider reliabil
 
 A **response cycle** starts when Pi begins agent work and ends at `agent_settled`. Automatic retries, overflow-compaction recovery, tool follow-ups, and queued continuations before settlement stay in that cycle.
 
-An **LLM call** is one logical provider generation. Providers may retry HTTP internally; Pi's provider hooks do not necessarily expose every attempt. The response and error counts reflect only the hook events the extension receives, not a complete network-attempt log.
+An **LLM call** is one logical assistant generation; idle and streaming cache-warming hooks are excluded. Successful finalized assistants establish physical model identity, which remains available throughout their tool batch. A router failure before dispatch records a terminal failure but no LLM call or physical provider/model identity. The selected router remains initial response-cycle metadata.
+
+Provider hooks normally precede `message_start`; analytics accepts them only in the turn's pre-stream window. Pi replays the same untagged hooks for cache warming and exposes no warming-completion or request-ownership ID. After a cache-warming decision or extension reload, analytics conservatively ignores further raw request/HTTP hooks until a non-reload session start. Pi can retain an in-flight warmer across reload whose delayed callbacks reach the fresh extension runner, so even a new analytics factory cannot establish their ownership. Normal startup and new-session defaults still accept unambiguous hooks. Successful assistant generations and tool/skill attribution still count; failures without unambiguous dispatch evidence remain unattributed and do not establish an LLM call. This can undercount HTTP observations and failed dispatched calls, rather than charge ambiguous warming to assistant reliability. Providers may retry HTTP internally; these counts are not a complete network-attempt log.
 
 ### Skills
 

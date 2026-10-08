@@ -28,7 +28,7 @@ pi -e ./packages/pi-input-history
 
 ### Persistent history
 
-On session start, your last 100 prompts across all sessions are loaded into the editor. Use **↑/↓** arrows to browse them as usual.
+On session start, your last 100 prompts across all sessions are loaded into the editor. Use **↑/↓** arrows to browse them as usual. If you submit a prompt or use history navigation before the background scan finishes, that editor is not seeded: your newer native history and browsing state take priority. The scanned prompts remain available through **Ctrl+R**, without replacing the editor or disturbing private paste contents.
 
 ### Fuzzy popup (Ctrl+R)
 

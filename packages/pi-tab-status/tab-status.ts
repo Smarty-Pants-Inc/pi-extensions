@@ -112,7 +112,6 @@ export default function (pi: ExtensionAPI) {
     running: false,
     sawCommit: false,
   };
-  const commitCandidates = new Set<string>();
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
   let finalStopReason: StopReason | undefined;
   let settlementTimer: ReturnType<typeof setTimeout> | undefined;
@@ -124,10 +123,33 @@ export default function (pi: ExtensionAPI) {
   };
   const nativeClearTimeout = globalThis.clearTimeout;
 
+  const retire = (): void => {
+    cancelSettlement();
+    clearTabTimeout();
+    status.running = false;
+    status.sawCommit = false;
+    finalStopReason = undefined;
+  };
+
+  const isTui = (ctx: ExtensionContext): boolean => {
+    try {
+      return ctx.mode === "tui";
+    } catch {
+      // SDK disposal invalidates contexts without emitting session_shutdown.
+      retire();
+      return false;
+    }
+  };
+
   const setTitle = (ctx: ExtensionContext, next: StatusState): void => {
     status.state = next;
-    if (!ctx.hasUI) return;
-    ctx.ui.setTitle(formatTabTitle(ctx.cwd, next));
+    if (!isTui(ctx)) return;
+    try {
+      ctx.ui.setTitle(formatTabTitle(ctx.cwd, next));
+    } catch {
+      // Timer callbacks must not access a retired context or throw into the host.
+      retire();
+    }
   };
 
   const clearTabTimeout = (): void => {
@@ -138,11 +160,16 @@ export default function (pi: ExtensionAPI) {
 
   const resetTimeout = (ctx: ExtensionContext): void => {
     clearTabTimeout();
-    timeoutId = setTimeout(() => {
+    if (!isTui(ctx) || !status.running) return;
+    const timer = setTimeout(() => {
+      if (timeoutId !== timer) return;
+      timeoutId = undefined;
       if (status.running && status.state === "running") {
         setTitle(ctx, "timeout");
       }
     }, INACTIVE_TIMEOUT_MS);
+    timeoutId = timer;
+    timer.unref?.();
   };
 
   const markActivity = (ctx: ExtensionContext): void => {
@@ -157,7 +184,6 @@ export default function (pi: ExtensionAPI) {
     cancelSettlement();
     status.running = false;
     finalStopReason = undefined;
-    commitCandidates.clear();
     status.sawCommit = false;
     clearTabTimeout();
     setTitle(ctx, next);
@@ -166,7 +192,6 @@ export default function (pi: ExtensionAPI) {
   const beginRun = (ctx: ExtensionContext): void => {
     cancelSettlement();
     if (!status.running) {
-      commitCandidates.clear();
       status.sawCommit = false;
     }
     finalStopReason = undefined;
@@ -197,17 +222,22 @@ export default function (pi: ExtensionAPI) {
   pi.on("turn_start", async (_event: TurnStartEvent, ctx) => {
     markActivity(ctx);
   });
-  pi.on("tool_call", async (event: ToolCallEvent, ctx) => {
-    if (event.toolName === "bash" || event.toolName === "powershell") {
-      const command = typeof event.input.command === "string" ? event.input.command : "";
-      if (command && GIT_COMMIT_RE.test(command)) commitCandidates.add(event.toolCallId);
-    }
+  pi.on("tool_call", async (_event: ToolCallEvent, ctx) => {
     markActivity(ctx);
   });
   pi.on("tool_result", async (event: ToolResultEvent, ctx) => {
-    if (commitCandidates.delete(event.toolCallId) && !event.isError) status.sawCommit = true;
+    // Later tool_call hooks may rewrite the command. Only the executed input
+    // and its successful result can establish that this run committed.
+    if (!event.isError && (event.toolName === "bash" || event.toolName === "powershell")) {
+      const command = typeof event.input.command === "string" ? event.input.command : "";
+      if (GIT_COMMIT_RE.test(command)) status.sawCommit = true;
+    }
     markActivity(ctx);
   });
+  pi.on("message_update", async (_event, ctx) => markActivity(ctx));
+  pi.on("tool_execution_update", async (_event, ctx) => markActivity(ctx));
+  pi.on("message_end", async (_event, ctx) => markActivity(ctx));
+  pi.on("session_info_changed", async (_event, ctx) => setTitle(ctx, status.state));
   pi.on("agent_end", async (event: AgentEndEvent) => {
     finalStopReason = getStopReason(event.messages);
   });
@@ -215,14 +245,20 @@ export default function (pi: ExtensionAPI) {
     if (owner !== generation) return;
     // A prior observer can start manual compaction, whose terminal hook runs
     // before isIdle flips and does not cause another agent_settled event.
-    if (!ctx.isIdle()) {
+    let idle: boolean;
+    try {
+      idle = ctx.isIdle();
+    } catch {
+      retire();
+      return;
+    }
+    if (!idle) {
       settlementTimer = setTimeout(() => settle(ctx, owner), 25);
       settlementTimer.unref?.();
       return;
     }
     settlementTimer = undefined;
     status.running = false;
-    commitCandidates.clear();
     clearTabTimeout();
     if (finalStopReason === "error") {
       setTitle(ctx, "timeout");
@@ -239,9 +275,12 @@ export default function (pi: ExtensionAPI) {
     status.running = false;
     status.sawCommit = false;
     finalStopReason = undefined;
-    commitCandidates.clear();
     clearTabTimeout();
-    if (!ctx.hasUI) return;
-    ctx.ui.setTitle(formatIdleTabTitle(ctx.cwd));
+    if (!isTui(ctx)) return;
+    try {
+      ctx.ui.setTitle(formatIdleTabTitle(ctx.cwd));
+    } catch {
+      retire();
+    }
   });
 }

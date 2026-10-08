@@ -57,6 +57,7 @@ function writeAgents(): void {
 
 function ctx() {
   return {
+    isProjectTrusted: () => true,
     hasUI: false,
     ui: { setStatus: vi.fn(), setWidget: vi.fn(), notify: vi.fn() },
     cwd,

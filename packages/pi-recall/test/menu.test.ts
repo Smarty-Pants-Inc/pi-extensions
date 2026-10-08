@@ -5,7 +5,7 @@ import { resolveMenuScreen, runMenu } from "@narumitw/pi-tui-kit";
 import { createRpcHarness, createTuiHarness } from "@narumitw/pi-tui-kit/testing";
 import { test } from "vitest";
 import { createRecallMenu, type RecallMenuSource, showRecallMenu } from "../src/menu.js";
-import type { MessageCandidate, RecallMessageRecord } from "../src/messages.js";
+import { formatRecallQuote, type MessageCandidate, type RecallMessageRecord } from "../src/messages.js";
 import { createMockContext } from "./support.js";
 
 function candidate(entryId: string): MessageCandidate {
@@ -467,9 +467,9 @@ test("direct delete reconciles a record already removed by another process", asy
   await choosing;
 });
 
-test("preview is exact, quote appends to the draft without sending, and delete requires review action", async () => {
+test("preview is exact, TUI quote appends without sending, and delete requires review action", async () => {
   const data = source();
-  const mock = createMockContext({ hasUI: true, mode: "rpc" });
+  const mock = createMockContext({ hasUI: true, mode: "tui" });
   let editorText = "Question: ";
   const quoteCtx = mock.ctx as unknown as {
     ui: { pasteToEditor(value: string): void };
@@ -505,6 +505,87 @@ test("preview is exact, quote appends to the draft without sending, and delete r
     itemId: "delete-confirm",
   });
   assert.equal(data.records.length, 0);
+});
+
+test("RPC quote labels and confirms client-draft replacement, with cancellation making no changes", async () => {
+  for (const confirmed of [false, true]) {
+    const data = source();
+    const controller = createRecallMenu(data, { mode: "rpc" });
+    controller.selectRecordForTest("saved-a");
+    const current = await state(controller);
+    const screen = resolveMenuScreen(controller.menu, "selected", current);
+    assert.equal(screen.kind, "actions");
+    if (screen.kind !== "actions") return;
+    assert.equal(screen.items.find(({ id }) => id === "quote")?.label, "Replace client draft with quote");
+    let clientDraft = "existing client draft";
+    let writes = 0;
+    let pastes = 0;
+    const confirmations: string[] = [];
+    const mock = createMockContext({
+      mode: "rpc",
+      hasUI: true,
+      confirm: async (title: string, message: string) => {
+        confirmations.push(`${title}\n${message}`);
+        return confirmed;
+      },
+    });
+    const ctx = mock.ctx as unknown as { ui: Record<string, unknown> };
+    Object.assign(ctx.ui, {
+      getEditorText: () => "",
+      setEditorText: (value: string) => {
+        clientDraft = value;
+        writes += 1;
+      },
+      // The real RPC paste API also replaces rather than appends.
+      pasteToEditor: (value: string) => {
+        clientDraft = value;
+        pastes += 1;
+      },
+    });
+    const result = await controller.menu.actions.quote({
+      ctx: ctx as never,
+      state: current,
+      signal: new AbortController().signal,
+      itemId: "quote",
+    });
+    assert.match(confirmations[0] ?? "", /replace the entire draft/i);
+    assert.match(confirmations[0] ?? "", /cannot read or append/i);
+    assert.equal(pastes, 0);
+    assert.equal(writes, confirmed ? 1 : 0);
+    assert.equal(
+      clientDraft,
+      confirmed ? formatRecallQuote(data.records[0] as RecallMessageRecord) : "existing client draft",
+    );
+    assert.deepEqual(result, { kind: confirmed ? "close" : "stay" });
+  }
+});
+
+test("RPC quote acceptance after session replacement does not touch the client draft", async () => {
+  let current = true;
+  let writes = 0;
+  const controller = createRecallMenu(source(), { mode: "rpc", isCurrent: () => current });
+  controller.selectRecordForTest("saved-a");
+  const mock = createMockContext({
+    mode: "rpc",
+    hasUI: true,
+    confirm: async () => {
+      current = false;
+      return true;
+    },
+  });
+  (mock.ctx as unknown as { ui: { setEditorText: (value: string) => void } }).ui.setEditorText = () => {
+    writes += 1;
+  };
+  assert.deepEqual(
+    await controller.menu.actions.quote({
+      ctx: mock.ctx,
+      state: await state(controller),
+      signal: new AbortController().signal,
+      itemId: "quote",
+    }),
+    { kind: "close" },
+  );
+  assert.equal(writes, 0);
 });
 
 test("invalid storage remains visible and disables mutation routes", async () => {

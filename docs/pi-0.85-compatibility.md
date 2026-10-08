@@ -1,6 +1,6 @@
 # Pi 0.85.1 compatibility audit
 
-Historical snapshot. For the current released host, see the [Pi 0.99.1 compatibility review](pi-0.99-compatibility.md); the [Pi 0.87.1 review](pi-0.87-compatibility.md) retains the intervening upstream comparison.
+Historical snapshot. For the current tested host, see the [Pi 1.0 compatibility review](pi-1.0-compatibility.md); the [Pi 0.99.1](pi-0.99-compatibility.md) and [Pi 0.87.1](pi-0.87-compatibility.md) reviews retain the intervening comparisons.
 
 ## Scope
 

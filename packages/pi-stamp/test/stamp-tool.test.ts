@@ -41,6 +41,62 @@ test("parallel tool stamps pair strictly by ID and append in source order after 
   ]);
 });
 
+test("final turn results override provisional execution outcomes in both directions without changing timings", async () => {
+  for (const provisionalError of [false, true]) {
+    const mock = createMockPi();
+    const times = [USER_TIMESTAMP, USER_TIMESTAMP + 1_234];
+    stamp(mock.pi, {
+      settingsRuntime: settingsRuntimeWithToolStamps(),
+      now: () => times.shift() ?? assert.fail("Unexpected clock read"),
+    });
+    const { ctx } = createMockContext({ mode: "tui" });
+    await emit(mock, "session_start", { reason: "startup" }, ctx);
+    await emit(mock, "tool_execution_start", { toolCallId: "rewritten", toolName: "read", args: {} }, ctx);
+    await emit(mock, "tool_execution_end", { toolCallId: "rewritten", isError: provisionalError, result: {} }, ctx);
+    await emit(
+      mock,
+      "turn_end",
+      {
+        message: assistantMessage(ASSISTANT_TIMESTAMP, "toolUse"),
+        toolResults: [toolResultMessage("rewritten", "read", !provisionalError)],
+      },
+      ctx,
+    );
+    assert.deepEqual(
+      mock.entries.filter((entry) => isToolStampData(entry.data)),
+      [
+        toolStampEntry(
+          "rewritten",
+          "read",
+          USER_TIMESTAMP,
+          USER_TIMESTAMP + 1_234,
+          provisionalError ? "success" : "error",
+        ),
+      ],
+    );
+  }
+});
+
+test("non-boolean final tool outcomes cannot fall back to provisional outcomes", async () => {
+  const mock = createMockPi();
+  let now = USER_TIMESTAMP;
+  stamp(mock.pi, { settingsRuntime: settingsRuntimeWithToolStamps(), now: () => now++ });
+  const { ctx } = createMockContext({ mode: "tui" });
+  await emit(mock, "session_start", { reason: "startup" }, ctx);
+  await emit(mock, "tool_execution_start", { toolCallId: "malformed", toolName: "read", args: {} }, ctx);
+  await emit(mock, "tool_execution_end", { toolCallId: "malformed", isError: false }, ctx);
+  await emit(
+    mock,
+    "turn_end",
+    {
+      message: assistantMessage(ASSISTANT_TIMESTAMP, "toolUse"),
+      toolResults: [{ toolCallId: "malformed", isError: "false" }],
+    },
+    ctx,
+  );
+  assert.equal(mock.entries.filter((entry) => isToolStampData(entry.data)).length, 0);
+});
+
 test("duplicate, malformed, and reversed tool events never create duplicate or fabricated stamps", async () => {
   const mock = createMockPi();
   const times = [USER_TIMESTAMP, USER_TIMESTAMP + 1_000];

@@ -113,7 +113,7 @@ project-level override.
 | Setting | Default | Accepted values | Behavior | Recommendation |
 | --- | ---: | --- | --- | --- |
 | `enabled` | `true` | Boolean | Attempt Remote V2 for a compatible model. | Keep enabled unless diagnosing provider behavior. |
-| `requestTimeoutMs` | `300000` | Integer from 30,000 to 600,000 ms | Bound one extension-owned remote request. | Keep five minutes; increase only for a consistently slow connection. |
+| `requestTimeoutMs` | `300000` | Integer from 30,000 to 600,000 ms | Bound the entire extension-owned operation, including retries and response-body inspection. | Keep five minutes; increase only for a consistently slow connection. |
 | `maxRetries` | `2` | Integer from 0 to 2 | Retry transient provider transport failures before Pi fallback. | Keep two; use zero when diagnosing the first failure. |
 | `replacementTokenBudget` | `64000` | Integer from 8,000 to 128,000 tokens | Bound approximate retained user-message text beside the opaque item. | Keep 64K; lower it to reduce session size or raise it only when recent user context is being lost. |
 | `notifyOnFallback` | `true` | Boolean | Warn when Remote V2 fails and Pi-native compaction takes over. | Keep enabled so silent fallback does not hide protocol or entitlement problems. |
@@ -200,6 +200,11 @@ ceilings are intentionally not configurable.
   compatibility fallback, exact pre-turn ordering, or exact mid-turn model-session ownership.
 - A live prompt or tool change that has not been written into Pi's transcript causes a native
   compaction fallback; an opaque checkpoint must match the system state Pi will persist.
+- `prepareLoadout` transformations, including codemode tool rewrites, can make the persisted
+  effective tool schemas differ from the raw `getAllTools()` declarations available to this
+  extension. Such combinations conservatively use native compaction until Pi exposes a public
+  effective-loadout snapshot. The extension does not weaken prompt/tool equality or stale-state
+  checks to enable Remote V2.
 - Pi invokes `session_before_compact` handlers in registration order. Another extension that mutates
   prompt, tools, or context **after this handler returns** can invalidate an already prepared opaque
   checkpoint before Pi appends it. Load such handlers before this extension or disable Remote V2 in

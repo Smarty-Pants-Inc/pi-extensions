@@ -124,7 +124,15 @@ export function createViewer(
     state.selectEnd = 0;
   }
 
+  function isSourceSelectionMode(): boolean {
+    return state.mode === "select" || state.mode === "comment";
+  }
+
   function setMode(mode: ViewerMode): void {
+    if (isSourceSelectionMode() && mode === "normal") {
+      // Selection content is a source snapshot, not the ordinary rendered rows.
+      state.lastRenderWidth = 0;
+    }
     if (mode !== state.mode) {
       searchInput.reset();
       commentInput.reset();
@@ -173,6 +181,12 @@ export function createViewer(
 
   function reloadContent(width: number): void {
     if (!state.file) return;
+    if (isSourceSelectionMode()) {
+      // Resizing must not replace the source snapshot or change its indices.
+      state.lastRenderWidth = width;
+      clampScroll();
+      return;
+    }
     refreshRawContent();
     const hasChanges = !!state.file.gitStatus;
     const result = loadFileContent(state.file.path, getRoot(), state.diffMode, hasChanges, width, state.renderMarkdown);
@@ -236,10 +250,10 @@ export function createViewer(
   }
 
   function buildCommentPayload(): CommentPayload | null {
-    if (!state.file) return null;
+    if (!state.file || state.diffMode || !isSourceSelectionMode()) return null;
 
-    const rawLines = state.rawContent.split("\n");
-    const selectedText = rawLines.slice(state.selectStart, state.selectEnd + 1).join("\n");
+    // These are the very same source lines displayed in the selection view.
+    const selectedText = state.content.slice(state.selectStart, state.selectEnd + 1).join("\n");
     const rel = relative(projectCwd, state.file.path);
     const relPath = !rel || rel.startsWith("..") ? state.file.path : rel;
     const lineRange =
@@ -272,7 +286,7 @@ export function createViewer(
       header += theme.fg("accent", state.renderMarkdown ? " [RENDERED]" : " [RAW]");
     }
     if (state.mode === "select" || state.mode === "comment") {
-      header += theme.fg("accent", ` [SELECT ${state.selectStart + 1}-${state.selectEnd + 1}]`);
+      header += theme.fg("accent", ` [SOURCE SELECT ${state.selectStart + 1}-${state.selectEnd + 1}]`);
     }
 
     if (state.file.diffStats) {
@@ -347,15 +361,20 @@ export function createViewer(
     if (state.mode === "comment") {
       help = theme.fg("dim", "Enter: newline  Ctrl+Enter/Ctrl+D: send  Esc: cancel");
     } else if (state.mode === "select") {
-      help = theme.fg("dim", "j/k: extend  c: comment  Esc: cancel");
+      help = theme.fg("dim", "Source lines (unwrapped, clipped)  j/k: extend  c: comment  Esc: cancel");
     } else if (state.mode === "search") {
       help = theme.fg("dim", "Type to search  Enter: confirm  Esc: cancel");
     } else {
       const isUntracked = state.file && isUntrackedStatus(state.file.gitStatus);
       const markdownHelp = isMarkdownFile() && !state.diffMode ? "m: raw/render  " : "";
+      if (state.diffMode) {
+        lines.push(
+          truncateToWidth(theme.fg("dim", "Selection/comments disabled in diff; press d for raw source."), width),
+        );
+      }
       help = theme.fg(
         "dim",
-        `j/k: scroll  /: search  n/N: next/prev match  ${markdownHelp}[]: files  ${state.file?.gitStatus && !isUntracked ? "d: diff  " : ""}q: back  ${pct}%`,
+        `j/k: scroll  ${state.diffMode ? "" : "v: source select  "}/: search  n/N: next/prev match  ${markdownHelp}[]: files  ${state.file?.gitStatus && !isUntracked ? "d: diff  " : ""}q: back  ${pct}%`,
       );
     }
     lines.push(truncateToWidth(help, width));
@@ -417,7 +436,8 @@ export function createViewer(
       for (let i = 0; i < state.height; i++) {
         if (i < visible.length) {
           const lineIdx = state.scroll + i;
-          let line = truncateToWidth(visible[i] || "", width);
+          const row = isSourceSelectionMode() ? `${String(lineIdx + 1).padStart(4)} │ ${visible[i]}` : visible[i];
+          let line = truncateToWidth(row || "", width);
           if (
             (state.mode === "select" || state.mode === "comment") &&
             lineIdx >= state.selectStart &&
@@ -510,6 +530,9 @@ export function createViewer(
       if (matchesKey(data, "j") || matchesKey(data, Key.down)) {
         if (state.mode === "select") {
           state.selectEnd = Math.min(state.content.length - 1, state.selectEnd + 1);
+          if (state.selectEnd >= state.scroll + state.height) {
+            state.scroll = state.selectEnd - state.height + 1;
+          }
         } else {
           state.scroll = Math.min(getMaxScroll(), state.scroll + 1);
         }
@@ -518,6 +541,7 @@ export function createViewer(
       if (matchesKey(data, "k") || matchesKey(data, Key.up)) {
         if (state.mode === "select") {
           state.selectEnd = Math.max(state.selectStart, state.selectEnd - 1);
+          if (state.selectEnd < state.scroll) state.scroll = state.selectEnd;
         } else {
           state.scroll = Math.max(0, state.scroll - 1);
         }
@@ -565,16 +589,21 @@ export function createViewer(
         return { type: "none" };
       }
       if (matchesKey(data, "v") && state.mode !== "select") {
-        if (switchMarkdownToRaw()) {
+        if (state.diffMode || switchMarkdownToRaw()) {
           return { type: "none" };
         }
-        state.mode = "select";
-        state.selectStart = state.scroll;
-        state.selectEnd = state.scroll;
+        refreshRawContent();
+        setMode("select");
+        state.content = state.rawContent.split("\n");
+        // Rendered rows (including bat continuations) cannot locate source lines.
+        // Start at the top rather than silently reinterpret the previous scroll.
+        state.scroll = 0;
+        state.selectStart = 0;
+        state.selectEnd = 0;
         return { type: "none" };
       }
-      if (matchesKey(data, "c") && state.mode === "select") {
-        state.mode = "comment";
+      if (matchesKey(data, "c") && state.mode === "select" && !state.diffMode) {
+        setMode("comment");
         state.commentText = "";
         return { type: "none" };
       }

@@ -19,7 +19,7 @@ import {
   type SessionEntry,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
-import { test } from "vitest";
+import { test, vi } from "vitest";
 import {
   checkpointMarker,
   createCheckpointDetails,
@@ -289,6 +289,243 @@ test("effective checkpoint selection recovers remote -> native -> remote and fai
   }
 });
 
+test("real Codex HTTP errors cannot echo credentials into fallback warnings or checkpoints", async () => {
+  const session = SessionManager.inMemory();
+  const keptId = session.appendMessage({ role: "user", content: "Task", timestamp: 1 });
+  const originalBranch = session.getBranch();
+  const apiKey = `x.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "test" } })).toString("base64")}.x`;
+  const providerToken = "secret-provider-token";
+  const envSecret = "secret-env-token";
+  const mock = createMockPi();
+  let attempts = 0;
+  let sentHeaders: Headers | undefined;
+  createCodexCompactExtension({
+    settingsRuntime: settingsRuntime({ maxRetries: 0, notifyOnFallback: true }),
+    fetch: async (_input, init) => {
+      attempts += 1;
+      const headers = new Headers(init?.headers);
+      sentHeaders = headers;
+      return new Response(
+        JSON.stringify({
+          error: { message: `${headers.get("Authorization")} ${headers.get("X-Provider-Token")} ${envSecret}` },
+        }),
+        { status: 400 },
+      );
+    },
+  })(mock.pi);
+  const { ctx, notifications, statuses } = createMockContext({
+    model,
+    hasUI: true,
+    getSystemPrompt: () => "",
+    sessionManager: session,
+    modelRegistry: {
+      getApiKeyAndHeaders: async () => ({
+        ok: true,
+        apiKey,
+        headers: { "X-Provider-Token": providerToken },
+        env: { CODEX_SECRET: envSecret },
+      }),
+      getProvider: () => openaiCodexProvider(),
+    },
+  });
+  const handler = mock.events.get("session_before_compact")?.[0];
+  assert.ok(handler);
+  const result = await handler(
+    {
+      ...event(),
+      branchEntries: originalBranch,
+      preparation: { ...event().preparation, firstKeptEntryId: keptId },
+    },
+    ctx,
+  );
+  assert.equal(attempts, 1);
+  assert.equal(sentHeaders?.get("Authorization"), `Bearer ${apiKey}`);
+  assert.equal(sentHeaders?.get("X-Provider-Token"), providerToken);
+  assert.equal(result, undefined, "failure must fall back to native compaction");
+  assert.deepEqual(notifications, [
+    { message: "Codex remote compaction failed; using Pi compaction.", level: "warning" },
+  ]);
+  for (const secret of [apiKey, `Bearer ${apiKey}`, providerToken, envSecret]) {
+    assert.equal(JSON.stringify(notifications).includes(secret), false);
+  }
+  assert.equal(statuses.has("codex-compact"), true);
+  assert.equal(statuses.get("codex-compact"), undefined);
+  assert.deepEqual(session.getBranch(), originalBranch);
+  assert.equal(
+    session.getBranch().some((entry) => entry.type === "compaction"),
+    false,
+  );
+  assert.deepEqual(mock.entries, []);
+});
+
+test("a real Codex stalled body reaches the extension deadline and uses native fallback", async () => {
+  const session = SessionManager.inMemory();
+  const keptId = session.appendMessage({ role: "user", content: "Task", timestamp: 1 });
+  const apiKey = `x.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "test" } })).toString("base64")}.x`;
+  const mock = createMockPi();
+  let attempts = 0;
+  let cancellations = 0;
+  createCodexCompactExtension({
+    // The fixture bypasses persisted settings validation to exercise a short deadline.
+    settingsRuntime: settingsRuntime({ requestTimeoutMs: 50, maxRetries: 0, notifyOnFallback: true }),
+    fetch: async () => {
+      attempts += 1;
+      return new Response(
+        new ReadableStream({
+          cancel() {
+            cancellations += 1;
+          },
+        }),
+      );
+    },
+  })(mock.pi);
+  const { ctx, notifications, statuses } = createMockContext({
+    model,
+    hasUI: true,
+    getSystemPrompt: () => "",
+    sessionManager: session,
+    modelRegistry: {
+      getApiKeyAndHeaders: async () => ({ ok: true, apiKey }),
+      getProvider: () => openaiCodexProvider(),
+    },
+  });
+  const started = Date.now();
+  const result = await mock.events.get("session_before_compact")?.[0](
+    {
+      ...event(),
+      branchEntries: session.getBranch(),
+      preparation: { ...event().preparation, firstKeptEntryId: keptId },
+    },
+    ctx,
+  );
+  assert.equal(result, undefined);
+  assert.ok(Date.now() - started < 1000);
+  assert.equal(attempts, 1);
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  assert.equal(cancellations, 1);
+  assert.deepEqual(notifications, [
+    { message: "Codex remote compaction failed; using Pi compaction.", level: "warning" },
+  ]);
+  assert.equal(statuses.get("codex-compact"), undefined);
+  assert.equal(
+    session.getBranch().some((entry) => entry.type === "compaction"),
+    false,
+  );
+}, 2000);
+
+for (const scenario of ["delayed success", "auth deadline", "cancel during auth", "combined deadline"] as const) {
+  test(`compaction operation bounds authentication: ${scenario}`, async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+    try {
+      const auth = Promise.withResolvers<{ ok: true; apiKey: string }>();
+      const response = Promise.withResolvers<Response>();
+      const controller = new AbortController();
+      const session = SessionManager.inMemory();
+      const keptId = session.appendMessage({ role: "user", content: "Task", timestamp: 1 });
+      const originalBranch = session.getBranch();
+      const mock = createMockPi();
+      let requests = 0;
+      let requestBudget: number | undefined;
+      let requestSignal: AbortSignal | undefined;
+      let persisted = false;
+      createCodexCompactExtension({
+        settingsRuntime: settingsRuntime({ requestTimeoutMs: 100, notifyOnFallback: true }),
+        fetch: async () => {
+          requests += 1;
+          return scenario === "combined deadline" ? response.promise : sseResponse();
+        },
+      })(mock.pi);
+      const { ctx, notifications, statuses } = createMockContext({
+        model,
+        hasUI: true,
+        getSystemPrompt: () => "",
+        sessionManager: session,
+        modelRegistry: {
+          getApiKeyAndHeaders: () =>
+            auth.promise.then((value) => {
+              // Host-owned refresh-token persistence must survive our cancelled wait.
+              persisted = true;
+              return value;
+            }),
+          getProvider: () =>
+            fakeProvider((options) => {
+              requestBudget = options.timeoutMs;
+              requestSignal = options.signal;
+            }),
+        },
+      });
+      let settled = false;
+      const pending = Promise.resolve(
+        mock.events.get("session_before_compact")?.[0](
+          {
+            ...event(controller.signal),
+            branchEntries: originalBranch,
+            preparation: { ...event().preparation, firstKeptEntryId: keptId },
+          },
+          ctx,
+        ),
+      ).then((value) => {
+        settled = true;
+        return value;
+      });
+      if (scenario === "cancel during auth") {
+        await vi.advanceTimersByTimeAsync(10);
+        controller.abort("secret-abort-reason");
+        assert.deepEqual(await pending, { cancel: true });
+        assert.equal(requests, 0);
+        assert.deepEqual(notifications, []);
+        assert.equal(persisted, false);
+        auth.resolve({ ok: true, apiKey: "secret-refreshed-token" });
+        await vi.advanceTimersByTimeAsync(0);
+        assert.equal(persisted, true);
+        assert.equal(requests, 0, "late authentication cannot dispatch after cancellation");
+      } else if (scenario === "auth deadline") {
+        await vi.advanceTimersByTimeAsync(99);
+        assert.equal(settled, false);
+        await vi.advanceTimersByTimeAsync(1);
+        assert.equal(settled, true, "the deadline includes unresolved authentication");
+        assert.equal(await pending, undefined);
+        assert.equal(requests, 0);
+        // Vitest fails on unhandled rejections: the abandoned auth must be observed.
+        auth.reject(new Error("Authorization: Bearer secret-late-test"));
+        await vi.advanceTimersByTimeAsync(0);
+      } else {
+        await vi.advanceTimersByTimeAsync(60);
+        assert.equal(settled, false);
+        auth.resolve({ ok: true, apiKey: "secret-refreshed-token" });
+        await vi.advanceTimersByTimeAsync(0);
+        assert.equal(requests, 1);
+        assert.equal(requestBudget, 40, "remote compaction receives only the remaining operation budget");
+        if (scenario === "delayed success") {
+          assert.ok(((await pending) as { compaction?: unknown })?.compaction);
+          assert.deepEqual(notifications, []);
+        } else {
+          await vi.advanceTimersByTimeAsync(39);
+          assert.equal(settled, false);
+          await vi.advanceTimersByTimeAsync(1);
+          assert.equal(settled, true, "authentication and request share one deadline");
+          assert.equal(await pending, undefined);
+          assert.equal(requestSignal?.aborted, true);
+          response.resolve(sseResponse());
+          await vi.advanceTimersByTimeAsync(0);
+        }
+      }
+      if (scenario === "auth deadline" || scenario === "combined deadline") {
+        assert.deepEqual(notifications, [
+          { message: "Codex remote compaction failed; using Pi compaction.", level: "warning" },
+        ]);
+      }
+      assert.doesNotMatch(JSON.stringify(notifications), /secret-/);
+      assert.equal(statuses.get("codex-compact"), undefined);
+      assert.deepEqual(session.getBranch(), originalBranch);
+      assert.deepEqual(mock.entries, []);
+      assert.equal(vi.getTimerCount(), 0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+}
+
 function sseResponse() {
   const item = { type: "compaction", encrypted_content: "opaque" };
   return new Response(
@@ -389,7 +626,7 @@ test("registers the settings command and returns a versioned Remote V2 compactio
   assert.match(JSON.stringify(rewritten.input.at(-1)), /later/);
 });
 
-test("overflow hook derives retry proof from the actual retained assistant, and model guards still apply", async () => {
+test("canonical overflow hooks keep full retained lineage, and model guards still apply", async () => {
   for (const stopReason of ["error", "length", "stop"] as const) {
     const session = SessionManager.inMemory();
     const keptId = session.appendMessage({ role: "user", content: "request", timestamp: 1 });
@@ -427,20 +664,138 @@ test("overflow hook derives retry proof from the actual retained assistant, and 
     )) as { compaction: { summary: string; details: unknown } };
     const details = parseCheckpointDetails(result.compaction.details);
     assert.ok(details);
-    assert.deepEqual(details.retryTrimmedTail, stopReason === "stop" ? undefined : tail);
+    assert.equal(details.retryTrimmedTail, undefined);
     session.appendCompaction(result.compaction.summary, keptId, 100, details, true);
     await mock.events.get("session_compact")?.[0](
       { willRetry: true, compactionEntry: session.getBranch().at(-1) },
       ctx,
     );
-    const runtime = session.buildSessionContext().messages.slice(0, -1);
+    const runtime = session.buildSessionContext().messages;
     const projected = await mock.events.get("context")?.[0]({ messages: runtime }, ctx);
-    if (stopReason === "stop") assert.equal(projected, undefined);
-    else {
-      assert.match(JSON.stringify(projected), /PI_CODEX_REMOTE_CHECKPOINT/);
-      const mismatched = createMockContext({ model: { ...model, id: "different" }, sessionManager: session }).ctx;
-      assert.equal(await mock.events.get("context")?.[0]({ messages: runtime }, mismatched), undefined);
-    }
+    assert.match(JSON.stringify(projected), /PI_CODEX_REMOTE_CHECKPOINT/);
+    assert.doesNotMatch(JSON.stringify(projected), /retry response/);
+    const mismatched = createMockContext({ model: { ...model, id: "different" }, sessionManager: session }).ctx;
+    assert.equal(await mock.events.get("context")?.[0]({ messages: runtime }, mismatched), undefined);
+    assert.equal(await mock.events.get("context")?.[0]({ messages: runtime.slice(0, -1) }, ctx), undefined);
+  }
+});
+
+test("canonical recovery omits B before compaction and absorbs retained error A once across reload and resume", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "pi-codex-compact-recovery-"));
+  try {
+    const session = SessionManager.create(directory, directory);
+    session.appendMessage({ role: "user", content: "request", timestamp: 1 });
+    const assistant = {
+      role: "assistant" as const,
+      content: [{ type: "text" as const, text: "retained error A" }],
+      api: model.api,
+      provider: model.provider,
+      model: model.id,
+      usage,
+      stopReason: "error" as const,
+      timestamp: 2,
+    };
+    const keptId = session.appendMessage(assistant);
+    const omittedId = session.appendMessage({
+      ...assistant,
+      content: [{ type: "text", text: "abandoned error B" }],
+      timestamp: 3,
+    });
+    // Pi 1.0.4 _omitRecoveryAttempt persists this edit before the compaction hook.
+    session.appendContextEdit(omittedId, null);
+    const actualProvider = openaiCodexProvider();
+    let sentPayload: unknown;
+    let sentContext: unknown;
+    const provider: Provider = {
+      ...actualProvider,
+      stream(requestModel, context, options) {
+        sentContext = context;
+        return actualProvider.stream(requestModel, context, {
+          ...options,
+          onPayload: async (payload, payloadModel) => {
+            const prepared = await options?.onPayload?.(payload, payloadModel);
+            sentPayload = prepared ?? payload;
+            return prepared;
+          },
+        });
+      },
+    };
+    const mock = createMockPi();
+    createCodexCompactExtension({ settingsRuntime: settingsRuntime(), fetch: async () => sseResponse() })(mock.pi);
+    const apiKey = `x.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "test" } })).toString("base64")}.x`;
+    const { ctx } = createMockContext({
+      model,
+      getSystemPrompt: () => "",
+      sessionManager: session,
+      modelRegistry: {
+        getApiKeyAndHeaders: async () => ({ ok: true, apiKey }),
+        getProvider: () => provider,
+      },
+    });
+    const result = (await mock.events.get("session_before_compact")?.[0](
+      {
+        ...event(),
+        reason: "overflow",
+        willRetry: true,
+        branchEntries: session.getBranch(),
+        preparation: { ...event().preparation, firstKeptEntryId: keptId },
+      },
+      ctx,
+    )) as { compaction: { summary: string; details: unknown } };
+    assert.ok(result);
+    assert.equal(JSON.stringify(sentContext).match(/retained error A/g)?.length, 1);
+    assert.doesNotMatch(JSON.stringify(sentContext), /abandoned error B/);
+    // The Codex provider can drop failed assistant attempts from its wire input.
+    assert.doesNotMatch(JSON.stringify(sentPayload), /abandoned error B/);
+    const details = parseCheckpointDetails(result.compaction.details);
+    assert.ok(details);
+    assert.deepEqual(details.keptMessageFingerprints, [fingerprintMessage(assistant)]);
+    assert.equal(details.retryTrimmedTail, undefined);
+    session.appendCompaction(result.compaction.summary, keptId, 100, details, true);
+    await mock.events.get("session_compact")?.[0](
+      { willRetry: true, compactionEntry: session.getBranch().at(-1) },
+      ctx,
+    );
+    const assertAbsorbed = async (
+      currentMock: ReturnType<typeof createMockPi>,
+      currentContext: typeof ctx,
+      currentSession: SessionManager,
+    ) => {
+      const projected = await currentMock.events.get("context")?.[0](
+        { messages: currentSession.buildSessionContext().messages },
+        currentContext,
+      );
+      assert.ok(projected);
+      const text = JSON.stringify(projected);
+      assert.equal(text.match(/PI_CODEX_REMOTE_CHECKPOINT/g)?.length, 1);
+      assert.doesNotMatch(text, /retained error A|abandoned error B/);
+      const replay = await currentMock.events.get("before_provider_request")?.[0](
+        {
+          payload: {
+            input: [{ role: "user", content: [{ type: "input_text", text: checkpointMarker(details.checkpointId) }] }],
+          },
+        },
+        currentContext,
+      );
+      assert.equal(JSON.stringify(replay).match(/encrypted_content/g)?.length, 1);
+      assert.doesNotMatch(JSON.stringify(replay), /retained error A|abandoned error B/);
+    };
+    await assertAbsorbed(mock, ctx, session);
+    await mock.events.get("session_shutdown")?.[0]({ reason: "reload" }, ctx);
+    const reloaded = createMockPi();
+    createCodexCompactExtension({ settingsRuntime: settingsRuntime() })(reloaded.pi);
+    await reloaded.events.get("session_start")?.[0]({ reason: "reload" }, ctx);
+    await assertAbsorbed(reloaded, ctx, session);
+    const sessionFile = session.getSessionFile();
+    assert.ok(sessionFile);
+    const resumedSession = SessionManager.open(sessionFile);
+    const resumed = createMockPi();
+    createCodexCompactExtension({ settingsRuntime: settingsRuntime() })(resumed.pi);
+    const resumedContext = createMockContext({ model, sessionManager: resumedSession }).ctx;
+    await resumed.events.get("session_start")?.[0]({ reason: "resume" }, resumedContext);
+    await assertAbsorbed(resumed, resumedContext, resumedSession);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
   }
 });
 
@@ -494,7 +849,7 @@ for (const edit of ["omit", "replace"] as const) {
       const details = parseCheckpointDetails(result.compaction.details);
       assert.ok(details);
       assert.deepEqual(details.keptMessageFingerprints, visibleKept.map(fingerprintMessage));
-      assert.deepEqual(details.retryTrimmedTail, edit === "omit" ? undefined : visibleKept[0]);
+      assert.equal(details.retryTrimmedTail, undefined);
       assert.doesNotMatch(JSON.stringify(details), /private abandoned attempt/);
 
       session.appendCompaction(result.compaction.summary, cutpointId, preparation.tokensBefore, details, true);
@@ -511,9 +866,9 @@ for (const edit of ["omit", "replace"] as const) {
         { willRetry: true, compactionEntry: session.getBranch().at(-1) },
         ctx,
       );
-      const runtime = edit === "replace" ? persisted.slice(0, -1) : persisted;
+      const runtime = persisted;
       const retried = await mock.events.get("context")?.[0]({ messages: runtime }, ctx);
-      assert.ok(retried, "retry context replays when Pi trims the edited error tail");
+      assert.ok(retried, "retry context replays full lineage after durable context edits");
       await mock.events.get("session_shutdown")?.[0]({ reason: "reload" }, ctx);
       const reloadedMock = createMockPi();
       createCodexCompactExtension({ settingsRuntime: settingsRuntime() })(reloadedMock.pi);
@@ -984,9 +1339,12 @@ test("disabled, unsupported, auth-failed, and aborted compaction paths remain sa
     ).result,
     undefined,
   );
-  const failed = await run({});
+  const failed = await run({ auth: { ok: false, error: "Authorization: Bearer secret-auth-token" } });
   assert.equal(failed.result, undefined);
-  assert.match(failed.notifications.at(-1)?.message ?? "", /using Pi compaction/);
+  assert.deepEqual(failed.notifications, [
+    { message: "Codex remote compaction failed; using Pi compaction.", level: "warning" },
+  ]);
+  assert.equal(JSON.stringify(failed.notifications).includes("secret-auth-token"), false);
   assert.equal(failed.statuses.get("codex-compact"), undefined);
   const controller = new AbortController();
   controller.abort();

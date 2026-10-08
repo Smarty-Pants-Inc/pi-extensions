@@ -198,6 +198,31 @@ test("validates canonical routing-policy fingerprints in protocol ping metadata"
   );
 });
 
+test("preserves prototype-named tiers across JSON and protocol validation", () => {
+  const specialPolicy: ManagedRoutingPolicy = {
+    ...policy,
+    defaultTier: "__proto__",
+    profiles: {
+      ["__proto__"]: { model: "provider/prototype", thinking: "high" },
+      constructor: { model: "inherit", thinking: "low" },
+      toString: { model: "provider/string", thinking: "medium" },
+    },
+  };
+  const serialized: unknown = JSON.parse(JSON.stringify(ping({ routingPolicy: snapshotOf(specialPolicy) })));
+  const parsed = parseProtocolPing(serialized).routingPolicy;
+  expect(parsed.policy).toEqual(specialPolicy);
+  expect(parsed.fingerprint).toBe(routingPolicyFingerprint(specialPolicy));
+  expect(Object.hasOwn(parsed.policy.profiles, "__proto__")).toBe(true);
+  expect(Object.getPrototypeOf(parsed.policy.profiles)).toBe(Object.prototype);
+  expect(agentTierPolicyIdentity(parsed.policy, "__proto__")).toEqual({
+    tier: "__proto__",
+    model: "provider/prototype",
+    thinking: "high",
+    blocked: false,
+  });
+  expect(JSON.parse(JSON.stringify(parsed.policy))).toEqual(specialPolicy);
+});
+
 test("holds every tier key in the policy to the same shape rule", () => {
   // `blockedProfiles` used to be validated with a helper that trims first, so
   // `" low"` became `"low"` there while the same value in `profiles` or

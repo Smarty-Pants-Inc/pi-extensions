@@ -1,0 +1,6 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "rootDir": "." },
+  "include": ["scripts/editor-composition.test.ts", "vitest.integration.config.ts"],
+  "exclude": []
+}

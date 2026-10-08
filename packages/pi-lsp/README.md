@@ -240,6 +240,8 @@ Use project formatters or shell commands for formatting workflows.
 
 ## Pi tools
 
+Tool output is capped at Pi's standard 2,000-line / 50 KiB limit, including multi-server diagnostic aggregates. Oversized output is saved in full to a unique private temporary file; the result includes its path and a truncation notice instead of duplicating large previews in details. These spill files remain available for subsequent reads until temporary storage is cleaned up.
+
 ### `lsp_diagnostics`
 
 Run diagnostics through configured servers.

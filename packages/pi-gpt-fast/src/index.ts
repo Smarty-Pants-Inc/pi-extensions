@@ -19,9 +19,8 @@
  * session_start restoration, which the npm package lacks.
  *
  * Off by default. State persists in ~/.pi/agent/settings.json under
- * `pi-gpt-fast.enabled`. If a dotfile manager owns that file, it must merge
- * rather than overwrite — a template that rewrites the whole file drops the
- * toggle on every apply.
+ * `pi-gpt-fast.enabled`. Any manager that owns that file must merge rather
+ * than overwrite, preserving settings owned by Pi and other extensions.
  */
 
 import { randomUUID } from "node:crypto";
@@ -29,6 +28,7 @@ import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node
 import { basename, dirname, join } from "node:path";
 
 import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
+import lockfile from "proper-lockfile";
 
 const STATUS_KEY = "gpt-fast";
 const SETTINGS_KEY = "pi-gpt-fast";
@@ -73,9 +73,25 @@ function settingsPath(): string {
   return join(getAgentDir(), "settings.json");
 }
 
+function readSettings(path: string): Record<string, unknown> {
+  let content: string;
+  try {
+    content = readFileSync(path, "utf8");
+  } catch (error) {
+    if (isRecord(error) && error.code === "ENOENT") return {};
+    throw error;
+  }
+  const settings: unknown = JSON.parse(content.replace(/^\uFEFF/, ""));
+  if (!isRecord(settings)) throw new Error("settings.json must contain an object");
+  if (SETTINGS_KEY in settings && !isRecord(settings[SETTINGS_KEY])) {
+    throw new Error(`${SETTINGS_KEY} must contain an object`);
+  }
+  return settings;
+}
+
 function readEnabled(): boolean {
   try {
-    const settings = JSON.parse(readFileSync(settingsPath(), "utf8"));
+    const settings = readSettings(settingsPath());
     const block = settings?.[SETTINGS_KEY];
     return isRecord(block) && block.enabled === true;
   } catch {
@@ -83,34 +99,38 @@ function readEnabled(): boolean {
   }
 }
 
+// Match Pi's settings lock path/options and bounded synchronous contention
+// retries. Never fall back to an unlocked write when another owner holds it.
+function acquireSettingsLock(path: string): () => void {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return lockfile.lockSync(path, { realpath: false });
+    } catch (error) {
+      if (!isRecord(error) || error.code !== "ELOCKED" || attempt === 10) throw error;
+      const start = Date.now();
+      while (Date.now() - start < 20) {
+        // Pi's settings storage also retries synchronously.
+      }
+    }
+  }
+}
+
 /**
- * Read-modify-write the whole settings file. pi rewrites this file too, so the
- * read happens at write time rather than from a cached copy — a stale snapshot
- * here would silently revert whatever pi changed in between.
- *
- * The write is atomic for the same reason. This is pi's own settings file,
- * shared with pi and every other extension, and it is rewritten on every toggle
- * of this feature. A torn write — crash, kill, disk full between truncate and
- * flush — would leave the user with no pi configuration at all, not just no
- * gpt-fast setting. Write a unique temp file in the same directory, then rename
- * over the target; rename is atomic on POSIX and Windows.
+ * Merge the latest settings while holding Pi's shared lock, then atomically
+ * rename a unique same-directory temp file. Malformed or unreadable settings
+ * must fail rather than replacing unrelated configuration with an empty object.
  */
 function writeEnabled(enabled: boolean): void {
   const path = settingsPath();
-  const raw = (() => {
-    try {
-      return JSON.parse(readFileSync(path, "utf8"));
-    } catch {
-      return {};
-    }
-  })();
-  const settings = isRecord(raw) ? raw : {};
-  const block = isRecord(settings[SETTINGS_KEY]) ? settings[SETTINGS_KEY] : {};
-  settings[SETTINGS_KEY] = { ...block, enabled };
-  const document = `${JSON.stringify(settings, null, 2)}\n`;
+  // realpath:false lets the shared lock cover creation of an absent file too.
+  mkdirSync(dirname(path), { recursive: true });
   const temporaryPath = join(dirname(path), `.${basename(path)}.${randomUUID()}.tmp`);
+  const release = acquireSettingsLock(path);
   try {
-    mkdirSync(dirname(path), { recursive: true });
+    const settings = readSettings(path);
+    const block = isRecord(settings[SETTINGS_KEY]) ? settings[SETTINGS_KEY] : {};
+    settings[SETTINGS_KEY] = { ...block, enabled };
+    const document = `${JSON.stringify(settings, null, 2)}\n`;
     writeFileSync(temporaryPath, document, { encoding: "utf8", flag: "wx" });
     renameSync(temporaryPath, path);
   } finally {
@@ -119,6 +139,7 @@ function writeEnabled(enabled: boolean): void {
     } catch {
       // Best-effort cleanup must not replace the write result.
     }
+    release();
   }
 }
 

@@ -1,6 +1,6 @@
 import { stripVTControlCharacters } from "node:util";
 import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
-import { Container } from "@earendil-works/pi-tui";
+import { Container, type SizeValue } from "@earendil-works/pi-tui";
 
 // Structural native mouse contract: older supported hosts do not export these types.
 interface TuiMouseEvent {
@@ -35,6 +35,7 @@ export interface BorderedComponent {
   dispose?(): void;
   waitForPending?(): Promise<void>;
   wantsKeyRelease?: boolean;
+  width?: SizeValue;
   focused?: boolean;
   readonly __piTuiKitScreen?: true;
 }
@@ -123,6 +124,7 @@ class BorderAdapter extends BorderContainer implements BorderedComponent {
   private addedBorders = false;
   private contentHeight = 0;
   private ownsMouseGesture = false;
+  handleInput?: (data: string) => void;
   handleMouse?: (event: TuiMouseEvent) => TuiMouseEventResult | undefined;
 
   constructor(inner: BorderedComponent, borderColor: (text: string) => string) {
@@ -133,6 +135,9 @@ class BorderAdapter extends BorderContainer implements BorderedComponent {
     Object.defineProperty(this, "handleMouse", { value: undefined, writable: true, configurable: true });
     this.inner = inner;
     this.borderColor = borderColor;
+    if (typeof inner.handleInput === "function") {
+      this.handleInput = (data) => this.inner.handleInput?.(data);
+    }
     // Keep keyboard-only components passive, including on older Pi versions.
     if (typeof inner.handleMouse === "function") {
       this.handleMouse = (event) => {
@@ -195,8 +200,8 @@ class BorderAdapter extends BorderContainer implements BorderedComponent {
     return [rule, ...lines, rule];
   }
 
-  handleInput(data: string): void {
-    this.inner.handleInput?.(data);
+  get width(): SizeValue | undefined {
+    return this.inner.width;
   }
 
   invalidate(): void {

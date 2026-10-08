@@ -165,6 +165,7 @@ import {
   streamToOutputFile,
   writeInitialEntry,
 } from "./output-file.js";
+import { captureProjectTrust, isProjectResource } from "./project-trust.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import {
@@ -582,16 +583,18 @@ export default function (pi: ExtensionAPI): void {
     if (inert) return;
     if (!rootRuntime) {
       try {
-        const startupSettings = loadSettings(ctx.cwd);
+        const trust = captureProjectTrust(ctx);
+        const startupSettings = loadSettings(trust.cwd, trust.trusted);
         const startupAgents = loadCustomAgents(
-          ctx.cwd,
+          trust.cwd,
           startupSettings.strictAgentFiles === true,
+          trust.trusted,
         );
         rootRuntime = activateRootRuntime(
           pi,
           startupSettings,
           startupAgents,
-          ctx.cwd,
+          ctx,
           unsubscribeRootContext,
         );
       } catch (error: unknown) {
@@ -611,10 +614,12 @@ function activateRootRuntime(
   pi: ExtensionAPI,
   startupSettings: SubagentsSettings,
   startupAgents: Map<string, AgentConfig>,
-  initialCwd: string,
+  initialContext: ExtensionContext,
   unsubscribeRootContext: () => void,
 ): RootRuntime {
-  let sessionCwd = initialCwd;
+  let configurationOwner = initialContext;
+  let activeTrust = captureProjectTrust(configurationOwner);
+  let sessionCwd = activeTrust.cwd;
   let strictAgentFiles = startupSettings.strictAgentFiles === true;
 
   // ---- Register custom notification renderer ----
@@ -668,7 +673,12 @@ function activateRootRuntime(
 
   /** Reload agents from project/global custom agent dirs and merge with defaults (called on init and each Agent invocation). */
   const reloadCustomAgents = (strict = false) => {
-    const userAgents = loadCustomAgents(sessionCwd, strict);
+    const trust = captureProjectTrust(configurationOwner);
+    const changed = trust.cwd !== activeTrust.cwd || trust.trusted !== activeTrust.trusted;
+    activeTrust = trust;
+    sessionCwd = trust.cwd;
+    if (changed) applyRuntimeSettings(loadSettings(trust.cwd, trust.trusted));
+    const userAgents = loadCustomAgents(trust.cwd, strict, trust.trusted);
     registerAgents(userAgents);
   };
 
@@ -1255,7 +1265,15 @@ function activateRootRuntime(
       manager.resetManagedSpawns();
     }
     sessionGeneration++;
-    sessionCwd = ctx.cwd;
+    const replacingConfiguration = currentCtx !== undefined;
+    configurationOwner = ctx;
+    const trust = captureProjectTrust(ctx);
+    sessionCwd = trust.cwd;
+    if (replacingConfiguration) {
+      activeTrust = trust;
+      applyRuntimeSettings(loadSettings(trust.cwd, trust.trusted));
+    }
+    reloadCustomAgents();
     boundSessionId = ctx.sessionManager?.getSessionId?.();
     currentCtx = ctx;
     await claimRpcRegistry(ctx, event.reason === "reload");
@@ -1386,6 +1404,8 @@ function activateRootRuntime(
     // even when subagents' session_tree handler runs first.
     pi.events.emit("subagents:session_tree_committed", { event });
     currentCtx = ctx;
+    configurationOwner = ctx;
+    reloadCustomAgents();
     scheduler.stop();
     manager.clearCompleted(true);
     manager.resetManagedSpawns();
@@ -1860,8 +1880,8 @@ function activateRootRuntime(
 
   // ---- Agent tool description mode ----
   // "full" (default) keeps the rich Claude Code-style description; "compact"
-  // swaps in a ~75% smaller one for small/local models (#91). Read once at
-  // tool registration — flipping it applies on the next pi session.
+  // swaps in a ~75% smaller one for small/local models (#91). The description
+  // getter rechecks configuration authority so replacements cannot retain denied text.
   let toolDescriptionMode: ToolDescriptionMode = "full";
   function getToolDescriptionMode(): ToolDescriptionMode {
     return toolDescriptionMode;
@@ -1961,40 +1981,47 @@ function activateRootRuntime(
 
   // Apply the already-validated session settings and emit the same lifecycle
   // event that the normal startup path exposes. Do not re-read process.cwd().
-  applySettings(startupSettings, {
-    setMaxConcurrent: (n) => manager.setMaxConcurrent(n),
-    setDefaultMaxTurns,
-    setGraceTurns,
-    setDefaultMaxTokens,
-    setDefaultMaxToolCalls,
-    setDefaultToolTimeout: (ms) => setDefaultToolTimeoutMs(ms),
-    setDefaultJoinMode,
-    setDefaultModel,
-    setSchedulingEnabled,
-    setScopeModels: setScopeModelsEnabled,
-    setStrictAgentFiles: (enabled) => {
-      strictAgentFiles = enabled;
-    },
-    setDisableDefaultAgents,
-    setToolDescriptionMode,
-    setFleetView: setFleetViewEnabled,
-    setOutputTranscript: setOutputTranscriptDefault,
-    setRememberAgents: (enabled) => manager.setRememberAgents(enabled),
-    setAgentMentions: (enabled) => {
-      agentMentionMode = enabled;
-    },
-    setSupervisorQuestions: (enabled) => {
-      supervisorQuestionsEnabled = enabled;
-      manager.setSupervisorQuestions(enabled);
-    },
-    setMaxSubagentDepth,
-    setMaxSubagentSpawnsPerBranch: (n) =>
-      manager.setMaxSubagentSpawnsPerBranch(n),
-    setFallbackSubagent,
-    setWorktreeIsolation: setWorktreeIsolationEnabled,
-    setAgentTiers: setAgentTiersSettings,
-  });
-  pi.events.emit("subagents:settings_loaded", { settings: startupSettings });
+  const baselineSettings: SubagentsSettings = { ...snapshotSettings(), strictAgentFiles: false, agentTiers: {} };
+  function applyRuntimeSettings(settings: SubagentsSettings): void {
+    // Clear optional policies as well: absence must not retain the old project's values.
+    setDefaultModel(settings.defaultModel ?? baselineSettings.defaultModel);
+    setFallbackSubagent(settings.fallbackSubagent ?? baselineSettings.fallbackSubagent);
+    applySettings({ ...baselineSettings, ...settings }, {
+      setMaxConcurrent: (n) => manager.setMaxConcurrent(n),
+      setDefaultMaxTurns,
+      setGraceTurns,
+      setDefaultMaxTokens,
+      setDefaultMaxToolCalls,
+      setDefaultToolTimeout: (ms) => setDefaultToolTimeoutMs(ms),
+      setDefaultJoinMode,
+      setDefaultModel,
+      setSchedulingEnabled,
+      setScopeModels: setScopeModelsEnabled,
+      setStrictAgentFiles: (enabled) => {
+        strictAgentFiles = enabled;
+      },
+      setDisableDefaultAgents,
+      setToolDescriptionMode,
+      setFleetView: setFleetViewEnabled,
+      setOutputTranscript: setOutputTranscriptDefault,
+      setRememberAgents: (enabled) => manager.setRememberAgents(enabled),
+      setAgentMentions: (enabled) => {
+        agentMentionMode = enabled;
+      },
+      setSupervisorQuestions: (enabled) => {
+        supervisorQuestionsEnabled = enabled;
+        manager.setSupervisorQuestions(enabled);
+      },
+      setMaxSubagentDepth,
+      setMaxSubagentSpawnsPerBranch: (n) =>
+        manager.setMaxSubagentSpawnsPerBranch(n),
+      setFallbackSubagent,
+      setWorktreeIsolation: setWorktreeIsolationEnabled,
+      setAgentTiers: setAgentTiersSettings,
+    });
+    pi.events.emit("subagents:settings_loaded", { settings });
+  }
+  applyRuntimeSettings(startupSettings);
 
   // A tier that nothing defines is a typo, and the resolver would only reach it
   // on the first spawn that needs it — possibly minutes in, mid-task. Report it
@@ -2201,7 +2228,7 @@ function activateRootRuntime(
     // In `model` mode an off-screen mention-only turn rewrites the typed task
     // without copying parent history or its request-local context hooks.
     // Nothing reaches the chat, and it starts an ordinary top-level agent.
-    const registeredAgentTool = agentToolRef;
+    const registeredAgentTool = agentToolRef ? freshAgentToolDefinition() : undefined;
     if (getAgentMentionMode() === "model" && registeredAgentTool) {
       // The hidden turn is itself a provider call. Refuse before saying
       // "Starting" or spending that call when its inherited parent model is
@@ -2294,15 +2321,13 @@ function activateRootRuntime(
   // The catalogue is injected into the description rather than left to a lookup
   // tool: the host has to pick a tier on its first call, and a tool it must
   // remember to call first is a tool it will skip.
-  const tierListText = buildAgentTierListText();
-  const compactTierListText = buildCompactAgentTierListText();
-  const tierSection = tierListText ? `\n\n${tierListText}` : "";
-  const compactTierSection = compactTierListText
-    ? `\n\n${compactTierListText}`
-    : "";
+  const tierSection = (compact = false): string => {
+    const text = compact ? buildCompactAgentTierListText() : buildAgentTierListText();
+    return text ? `\n\n${text}` : "";
+  };
 
-  const compactAgentToolDescription = `Launch an autonomous agent for complex, multi-step tasks. Agent types:
-${buildCompactTypeListText()}${compactTierSection}
+  const compactAgentToolDescription = () => `Launch an autonomous agent for complex, multi-step tasks. Agent types:
+${buildCompactTypeListText()}${tierSection(true)}
 
 Custom agents: .pi/agents/<name>.md (project) or ${getAgentDir()}/agents/<name>.md (global).
 
@@ -2314,12 +2339,12 @@ Notes:
 - isolation: "worktree" runs the agent in an isolated git worktree; changes land on a branch.
 - Raw inherit_context is unavailable; put only an explicitly sanitized summary in the task prompt.`;
 
-  const fullAgentToolDescription = `Launch a new agent to handle complex, multi-step tasks autonomously. Each agent type has specific capabilities and tools available to it.
+  const fullAgentToolDescription = () => `Launch a new agent to handle complex, multi-step tasks autonomously. Each agent type has specific capabilities and tools available to it.
 
 Available agent types and the tools they have access to:
 ${buildTypeListText()}
 
-Custom agents can be defined in .pi/agents/<name>.md (project) or ${getAgentDir()}/agents/<name>.md (global) — they are picked up automatically. Project-level agents override global ones. Creating a .md file with the same name as a default agent overrides it.${tierSection}
+Custom agents can be defined in .pi/agents/<name>.md (project) or ${getAgentDir()}/agents/<name>.md (global) — they are picked up automatically. Project-level agents override global ones. Creating a .md file with the same name as a default agent overrides it.${tierSection()}
 
 When using the Agent tool, specify a subagent_type parameter to select which agent type to use.
 
@@ -2367,8 +2392,8 @@ Terse command-style prompts produce shallow, generic work.
       // Both carry their own leading blank line, so a template that drops the
       // placeholder inline renders byte-identically to the built-in description
       // whether or not any tier is configured.
-      tierList: () => tierSection,
-      compactTierList: () => compactTierSection,
+      tierList: () => tierSection(),
+      compactTierList: () => tierSection(true),
       defaultTier: getDefaultAgentTierText,
       agentDir: getAgentDir,
       scheduleGuideline: () => scheduleGuideline,
@@ -2384,10 +2409,12 @@ Terse command-style prompts produce shallow, generic work.
   };
 
   const loadCustomToolDescription = (): string | undefined => {
+    const trust = captureProjectTrust(configurationOwner);
     for (const path of [
-      join(sessionCwd, ".pi", "agent-tool-description.md"),
+      ...(trust.trusted ? [join(trust.cwd, ".pi", "agent-tool-description.md")] : []),
       join(getAgentDir(), "agent-tool-description.md"),
     ]) {
+      if (!trust.trusted && isProjectResource(path, trust.cwd)) continue;
       try {
         if (!existsSync(path)) continue;
         const text = readFileSync(path, "utf-8").trim();
@@ -2402,9 +2429,11 @@ Terse command-style prompts produce shallow, generic work.
     return undefined;
   };
 
-  const agentToolDescription = (() => {
+  const agentToolDescription = () => {
+    const trust = captureProjectTrust(configurationOwner);
+    if (trust.cwd !== activeTrust.cwd || trust.trusted !== activeTrust.trusted) reloadCustomAgents();
     const mode = getToolDescriptionMode();
-    if (mode === "compact") return compactAgentToolDescription;
+    if (mode === "compact") return compactAgentToolDescription();
     if (mode === "custom") {
       const custom = loadCustomToolDescription();
       if (custom) return custom;
@@ -2412,16 +2441,18 @@ Terse command-style prompts produce shallow, generic work.
         '[pi-subagents] toolDescriptionMode is "custom" but no agent-tool-description.md found — using "full"',
       );
     }
-    return fullAgentToolDescription;
-  })();
+    return fullAgentToolDescription();
+  };
 
   // Captured so the mention clone can hand the copy the REAL registered tool:
   // its handler closes over this activation, which is what makes a clone-driven
   // spawn an ordinary top-level agent rather than something the fork owns.
+  const agentTypeParameterDescription = () =>
+    `The type of specialized agent to use. Available types: ${getAvailableTypes().join(", ")}. Custom agents from .pi/agents/*.md (project) or ${getAgentDir()}/agents/*.md (global) are also available.`;
   const agentTool = defineTool({
     name: SUBAGENT_TOOL_NAMES.AGENT,
     label: "Agent",
-    description: agentToolDescription,
+    get description() { return agentToolDescription(); },
     promptSnippet: "Launch autonomous sub-agents for complex multi-step tasks",
     promptGuidelines: [
       "Use Agent with specialized agents when the task matches an agent type's description. Subagents are valuable for parallelizing independent queries or for protecting the main context window from excessive results, but should not be used excessively when not needed. Importantly, avoid duplicating work that subagents are already doing — if you delegate research to a subagent, do not also perform the same searches yourself.",
@@ -2438,7 +2469,7 @@ Terse command-style prompts produce shallow, generic work.
           "A short (3-5 word) description of the task (shown in UI).",
       }),
       subagent_type: Type.String({
-        description: `The type of specialized agent to use. Available types: ${getAvailableTypes().join(", ")}. Custom agents from .pi/agents/*.md (project) or ${getAgentDir()}/agents/*.md (global) are also available.`,
+        description: agentTypeParameterDescription(),
       }),
       tier: Type.Optional(
         Type.String({
@@ -2720,7 +2751,8 @@ Terse command-style prompts produce shallow, generic work.
       if (!resolvedConfig.agentTierSelected) {
         const scopeVerdict = checkModelScope({
           model,
-          cwd: ctx.cwd,
+          cwd: activeTrust.cwd,
+          authority: activeTrust,
           modelRegistry: ctx.modelRegistry,
           callerSupplied: resolvedConfig.modelFromParams,
           agentLabel: customConfig?.displayName ?? subagentType,
@@ -3216,6 +3248,42 @@ Terse command-style prompts produce shallow, generic work.
   });
   pi.registerTool(agentTool);
   agentToolRef = agentTool;
+
+  // Pi snapshots description and parameters when wrapping a registered tool.
+  // Trust changes alone emit no host event. Re-register before each new prompt,
+  // ahead of Pi's effective loadout snapshot, using its public post-bind refresh.
+  // Turn end also covers provider continuations after tools revoke authority.
+  // Keep the same exposure/execution policy and retain the active set.
+  function freshAgentToolDefinition() {
+    reloadCustomAgents();
+    return {
+      ...agentTool,
+      description: agentToolDescription(),
+      parameters: {
+        ...agentTool.parameters,
+        properties: {
+          ...agentTool.parameters.properties,
+          subagent_type: { ...agentTool.parameters.properties.subagent_type, description: agentTypeParameterDescription() },
+          tier: { ...agentTool.parameters.properties.tier, description: buildAgentTierParameterDescription() },
+        },
+      },
+    };
+  }
+  const refreshAgentDeclaration = () => {
+    const refreshed = freshAgentToolDefinition();
+    const activeTools = pi.getActiveTools();
+    pi.registerTool(refreshed);
+    // Pi's explicit --tools/SDK tools selector can re-activate every matching
+    // name during registry refresh. A metadata refresh must not undo a later
+    // activation/exposure decision by the host or another extension.
+    const refreshedActive = pi.getActiveTools();
+    if (activeTools.length !== refreshedActive.length || activeTools.some((name, i) => name !== refreshedActive[i])) {
+      pi.setActiveTools(activeTools);
+    }
+    agentToolRef = refreshed;
+  };
+  pi.on("before_agent_start", refreshAgentDeclaration);
+  pi.on("turn_end", refreshAgentDeclaration);
 
   // ---- get_subagent_result tool ----
 
@@ -4834,7 +4902,7 @@ Do not wrap the response in a markdown code fence. Return only the file contents
     //    scoped set would fail the scope check at spawn time.
     if (isScopeModelsEnabled()) {
       const enabled = resolveEnabledModels(
-        readEnabledModels(sessionCwd),
+        readEnabledModels(sessionCwd, captureProjectTrust(configurationOwner)),
         ctx.modelRegistry,
         sessionCwd,
       );

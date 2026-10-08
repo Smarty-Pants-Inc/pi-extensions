@@ -8,6 +8,7 @@ import { getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { isValidAgentTierKey } from "./agent-tiers.js";
 import { BUILTIN_TOOL_NAMES } from "./agent-types.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
+import { isProjectResource } from "./project-trust.js";
 import type { AgentConfig, MemoryScope } from "./types.js";
 import { sanitizeDisplayText } from "./ui/safe-text.js";
 
@@ -129,7 +130,8 @@ function createWarningSink(root: string): WarningSink {
   };
 }
 
-export function loadCustomAgents(cwd: string, strict = false): Map<string, AgentConfig> {
+/** Standalone callers retain discovery defaults; runtime callers must pass captured trust. */
+export function loadCustomAgents(cwd: string, strict = false, projectTrusted = true, deniedRoots: readonly string[] = []): Map<string, AgentConfig> {
   const discoveryRoot = normalizeDiscoveryRoot(cwd);
   const warningRoot = warningIdentity(cwd);
   const globalDir = join(getAgentDir(), "agents");
@@ -140,9 +142,12 @@ export function loadCustomAgents(cwd: string, strict = false): Map<string, Agent
   const agents = new Map<string, AgentConfig>();
   const priorities = new Map<string, number>();
   const skipped: SkippedAgent[] = [];
-  loadFromDir(globalDir, agents, "global", strict, warn, 0, priorities, skipped);            // lowest priority
-  loadFromDir(workspaceProjectDir, agents, "project", strict, warn, 1, priorities, skipped); // shared workspace
-  loadFromDir(projectDir, agents, "project", strict, warn, 2, priorities, skipped);          // highest priority (overwrites)
+  const denied = projectTrusted ? deniedRoots : [...deniedRoots, discoveryRoot];
+  loadFromDir(globalDir, agents, "global", strict, warn, 0, priorities, skipped, denied);
+  if (projectTrusted) {
+    loadFromDir(workspaceProjectDir, agents, "project", strict, warn, 1, priorities, skipped, denied);
+    loadFromDir(projectDir, agents, "project", strict, warn, 2, priorities, skipped, denied);
+  }
 
   // Only report a fallback when the skipped file was higher priority than the
   // definition that survived the complete discovery pass. A valid higher
@@ -164,7 +169,9 @@ function loadFromDir(
   priority: number,
   priorities: Map<string, number>,
   skipped: SkippedAgent[],
+  deniedRoots: readonly string[],
 ): void {
+  if (deniedRoots.some(root => isProjectResource(dir, root))) return;
   if (!existsSync(dir)) return;
 
   let files: string[];
@@ -184,6 +191,7 @@ function loadFromDir(
     const filenameType = basename(file, ".md");
 
     const path = join(dir, file);
+    if (deniedRoots.some(root => isProjectResource(path, root))) continue;
 
     const parsed = readAgentFile(path, strict, warn);
     if (!parsed) {

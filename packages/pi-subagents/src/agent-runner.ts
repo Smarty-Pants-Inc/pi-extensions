@@ -40,6 +40,7 @@ import { type ModelRegistry, resolveModel, shortModelLabel } from "./model-resol
 import { parentModelSessionOptions } from "./model-runtime-bridge.js";
 import { checkModelScope } from "./model-scope.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
+import { captureProjectTrust, childProjectTrust, configurationMcpFactory, isProjectResource } from "./project-trust.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
 import { shutdownAndDisposeSession } from "./session-lifecycle.js";
 import { preloadSkills } from "./skill-loader.js";
@@ -331,8 +332,10 @@ export function installExtensionToolScope(session: AgentSession, inScope: () => 
  * the agent's whole result down with it.
  */
 async function runConfiguredGate(command: string, cwd: string, pi: ExtensionAPI): Promise<string> {
-  const exec: GateExec = (file, args, execOptions) =>
-    pi.exec(file, args, execOptions as Parameters<ExtensionAPI["exec"]>[2]);
+  const exec: GateExec = async (file, args, execOptions) => {
+    const result = await pi.exec(file, args, execOptions);
+    return { stdout: result.stdout, stderr: result.stderr, exitCode: result.killed ? 1 : result.code };
+  };
   try {
     const fingerprint = await workspaceFingerprint(cwd, exec);
     const verdict = await runGate({ command, cwd, exec, ...(fingerprint ? { fingerprint } : {}) });
@@ -622,9 +625,9 @@ export interface RunOptions {
    *
    * WARNING for future callers: if you pass `cwd` pointing at a directory the
    * user didn't open, you almost certainly must pass `configCwd` too —
-   * omitting it makes the target's `.pi` extensions execute in this process.
-   * (Worktree isolation is the one intentional exception: its copy IS the
-   * parent's repo, so config resolving inside it is correct.)
+   * a different configuration root does not inherit the parent's trust.
+   * Worktree execution with configCwd pointing at the parent retains trust;
+   * configuration discovered inside a new worktree is not implicitly trusted.
    */
   configCwd?: string;
   /** Called on tool start/end with activity info. */
@@ -898,8 +901,33 @@ export async function runAgent(
   // an already-cancelled caller. This matters for tool-call signals: the
   // caller may be cancelled before this async function gets its first turn.
   throwIfAborted(options.signal);
+  const parentProjectTrust = captureProjectTrust(ctx);
+  // Configuration provenance is established synchronously, before definition
+  // admission, model setup, callbacks, or any await. Execution cwd is not trust.
+  const effectiveCwd = options.cwd ?? ctx.cwd;
+  const configCwd = options.configCwd ?? effectiveCwd;
+  const projectTrust = childProjectTrust(parentProjectTrust, configCwd);
+  const projectTrusted = projectTrust.trusted;
+  const deniedProjectResource = (path: string): boolean =>
+    projectTrust.deniedRoots.some(root => isProjectResource(path, root));
+  const agentDir = getAgentDir();
+  // Native global configuration is resolved before resource-path filtering.
+  // Reject aliases into denied roots before the SDK parses their declarations;
+  // do not copy or reinterpret the host's settings/MCP schemas here.
+  for (const filename of ["settings.json", "mcp.json"]) {
+    if (deniedProjectResource(join(agentDir, filename))) {
+      throw new Error(`Project trust denied for global configuration source "${filename}".`);
+    }
+  }
 
   const loadedConfig = getConfig(type);
+  // The request's provenance matters, not just the requested extension path:
+  // a denied definition can request packages anywhere (including npm caches).
+  // getConfig carries the actual fallback definition's provenance as well.
+  if ((!parentProjectTrust.trusted && loadedConfig.source === "project") ||
+    (loadedConfig.sourcePath && deniedProjectResource(loadedConfig.sourcePath))) {
+    throw new Error(`Project trust denied for agent definition "${type}".`);
+  }
   const internalOverride = options[INTERNAL_AGENT_CONFIG_OVERRIDE];
   const loadedAgentConfig = getAgentConfig(type);
   const config = internalOverride
@@ -982,12 +1010,6 @@ export async function runAgent(
     options.onAgentTierResolved?.(agentTierSnapshot, tierModelLabel);
   }
 
-  // Resolve working directory: worktree override > parent cwd
-  const effectiveCwd = options.cwd ?? ctx.cwd;
-  // Filesystem work happens in effectiveCwd; config discovery in configCwd.
-  // They differ only for SpawnOptions.cwd spawns (config stays with the parent).
-  const configCwd = options.configCwd ?? effectiveCwd;
-
   const env = await detectEnv(options.pi, effectiveCwd);
   throwIfAborted(options.signal);
 
@@ -1010,7 +1032,7 @@ export async function runAgent(
 
   // Skill preloading: when skills is string[], preload their content into prompt
   if (Array.isArray(skills)) {
-    const loaded = preloadSkills(skills, configCwd);
+    const loaded = preloadSkills(skills, configCwd, { projectTrusted, deniedResource: deniedProjectResource });
     if (loaded.length > 0) {
       extras.skillBlocks = loaded;
     }
@@ -1060,7 +1082,7 @@ export async function runAgent(
   // skills later, so the loader override must enforce this policy on every update.
   const noSkills = skills === false || Array.isArray(skills);
 
-  const agentDir = getAgentDir();
+  const settingsManager = SettingsManager.create(configCwd, agentDir, { projectTrusted });
 
   // Extension loading:
   // - true  → all default-discovered extensions
@@ -1089,11 +1111,11 @@ export async function runAgent(
     : undefined;
   const keepNames = extensionsSpec?.names ?? new Set<string>();
   // `exclude_extensions:` is a denylist applied AFTER the include set — exclude wins.
-  // Plain canonical names only (case-insensitive). On older hosts filtering is
-  // post-factory; this is not a sandbox for extensions that already loaded.
+  // Plain canonical names only (case-insensitive). Without preselection,
+  // filtering is post-factory, not a sandbox for extensions that already loaded.
   const excludeNames = new Set((excludeExtensions ?? []).map((n) => n.toLowerCase()));
   const hasExcludes = excludeNames.size > 0;
-  // The override filters on older hosts, validates preselection on new hosts,
+  // The override filters without preselection, validates preselection when used,
   // and ALWAYS puts our tool policy first. Pi passes one mutable
   // tool_call event through handlers in extension order; if an earlier extension
   // changes event.toolName, a later gate would inspect a different name from the
@@ -1177,9 +1199,9 @@ export async function runAgent(
       });
     },
   }];
-  // Pi 0.99 exposes these as public SDK factories. Earlier supported hosts do
-  // not export them, so capability-check the namespace instead of importing a
-  // missing named export (which would prevent the whole extension from loading).
+  // Public SDK factories are verified on Pi 1.0.4. Capability-check the
+  // namespace rather than importing a potentially missing named export; this
+  // retained fallback does not establish support for older host versions.
   if ("createCodemodeExtension" in PiCodingAgent && typeof PiCodingAgent.createCodemodeExtension === "function") {
     extensionFactories.push({ name: "codemode", builtin: true, replaceable: true, factory: PiCodingAgent.createCodemodeExtension() });
   }
@@ -1187,21 +1209,26 @@ export async function runAgent(
     extensionFactories.push({ name: "tool-search", builtin: true, replaceable: true, factory: PiCodingAgent.createToolSearchExtension() });
   }
   if ("createMcpExtension" in PiCodingAgent && typeof PiCodingAgent.createMcpExtension === "function") {
-    extensionFactories.push({ name: "mcp", builtin: true, replaceable: true, factory: PiCodingAgent.createMcpExtension() });
+    extensionFactories.push({ name: "mcp", builtin: true, replaceable: true,
+      factory: configurationMcpFactory(PiCodingAgent.createMcpExtension(), configCwd, settingsManager) });
   }
 
-  const settingsManager = SettingsManager.create(configCwd, agentDir);
+  for (const path of extensionsSpec?.paths ?? []) {
+    if (deniedProjectResource(path)) {
+      throw new Error(`Project extension source "${path}" requested by agent "${type}" is not trusted.`);
+    }
+  }
   let additionalExtensionPaths = extensionsSpec?.paths.length ? extensionsSpec.paths : undefined;
   let settingsBeforeLoad: string | undefined;
   // Pi 0.99 resolves replacement conflicts BEFORE extensionsOverride. A rogue
   // discovered extension can register /mcp, replace builtin:mcp, and only then
   // get filtered out by our allowlist. Resolve configured resources through the
   // public package API first and feed only the selected paths into a loader with
-  // discovery off. Older Pi hosts have no replaceable built-ins; keep their
-  // existing post-load filter instead of relying on new host behavior.
+  // discovery off. Without the built-in factory capability, retain the
+  // post-load filtering fallback rather than assuming replacement behavior.
   const builtinNames = extensionFactories.filter((factory) => typeof factory !== "function" && factory.builtin)
     .map((factory) => factory.name);
-  const prefilter = !noExtensions && (!loadAll || hasExcludes) && builtinNames.length > 0;
+  const prefilter = !noExtensions && (!loadAll || hasExcludes || !projectTrusted) && builtinNames.length > 0;
   if (prefilter) {
     await settingsManager.reload();
     throwIfAborted(options.signal);
@@ -1219,8 +1246,13 @@ export async function runAgent(
       }
     }
     settingsBeforeLoad = JSON.stringify([settingsManager.getGlobalSettings(), settingsManager.getProjectSettings()]);
-    const enabledConfigured = configured.extensions.filter((resource) => resource.enabled).map((resource) => resource.path);
+    const enabledConfigured = configured.extensions.filter((resource) => resource.enabled && !deniedProjectResource(resource.path)).map((resource) => resource.path);
     const enabledExplicit = explicit.extensions.filter((resource) => resource.enabled);
+    for (const resource of enabledExplicit) {
+      if (deniedProjectResource(resource.path)) {
+        throw new Error(`Project extension "${resource.path}" requested by agent "${type}" is not trusted.`);
+      }
+    }
     discoveredNames = new Set([...enabledConfigured, ...enabledExplicit.map((resource) => resource.path)].flatMap(extensionCanonicalNames));
     const selectedExplicit = enabledExplicit.filter((resource) =>
       !extensionCanonicalNames(resource.path).some((name) => excludeNames.has(name)));
@@ -1258,7 +1290,11 @@ export async function runAgent(
     extensionsOverride,
     extensionFactories,
     noSkills,
-    skillsOverride: noSkills ? () => ({ skills: [], diagnostics: [] }) : undefined,
+    skillsOverride: noSkills
+      ? () => ({ skills: [], diagnostics: [] })
+      : !projectTrusted
+        ? (base) => ({ ...base, skills: base.skills.filter((skill) => !deniedProjectResource(skill.filePath)) })
+        : undefined,
     noPromptTemplates: true,
     noThemes: true,
     noContextFiles: true,
@@ -1305,7 +1341,7 @@ export async function runAgent(
   // already raised above instead of silently losing a requested capability.
   // Two remaining misconfigurations to catch:
   //   - `extensions: [foo]` but no extension named foo was discovered (typo;
-  //     on older hosts path entries also fold their canonical name into
+  //     without preselection path entries also fold their canonical name into
   //     `keepNames`, so a failed path load is warned here).
   //   - `tools: ext:foo` but foo isn't in the loaded set (because `extensions:`
   //     didn't include it). Since v0.9, `ext:` no longer pulls extensions in;
@@ -1372,7 +1408,8 @@ export async function runAgent(
     const { configuredModel, source } = agentTierSnapshot;
     const scopeVerdict = checkModelScope({
       model,
-      cwd: ctx.cwd,
+      cwd: projectTrust.cwd,
+      authority: projectTrust,
       modelRegistry: ctx.modelRegistry,
       // scopeModels polices a tier chosen per dispatch, by the host model or by
       // a workflow script alike; a tier from the agent file or the configured
@@ -1411,6 +1448,7 @@ export async function runAgent(
         maxSubagentDepth: effectiveMaxDepth,
         allowedSubagents: agentConfig.allowedSubagents,
         configCwd,
+        projectTrust,
       })
     : [];
   // `contact_supervisor` is injected separately from the nested tools and under

@@ -18,6 +18,7 @@ async function runLifecycle(style: TabStatusStyle, cwd = "/tmp/demo"): Promise<s
       cwd,
       isIdle: () => true,
       hasUI: true,
+      mode: "tui",
       ui: { setTitle: (title: string) => titles.push(title) },
     };
     tabStatus({
@@ -36,7 +37,15 @@ async function runLifecycle(style: TabStatusStyle, cwd = "/tmp/demo"): Promise<s
       } as never,
       ctx as never,
     );
-    await handlers.get("tool_result")?.({ toolCallId: "commit", isError: false } as never, ctx as never);
+    await handlers.get("tool_result")?.(
+      {
+        toolName: "bash",
+        toolCallId: "commit",
+        input: { command: "git add . && git commit -m done" },
+        isError: false,
+      } as never,
+      ctx as never,
+    );
     await handlers.get("agent_end")?.({ messages: [{ role: "assistant", stopReason: "stop" }] } as never, ctx as never);
     await handlers.get("agent_settled")?.({} as never, ctx as never);
     await handlers.get("session_shutdown")?.({} as never, ctx as never);

@@ -50,12 +50,14 @@ Examples:
 
 ## Actions
 
-- Copy: puts the snippet on your clipboard
-- Insert: inserts the snippet into the input editor
+- Copy: puts the snippet on your clipboard using a private temporary file that is removed afterward
+- Insert: appends the snippet to the TUI input editor. RPC cannot read or append to the client draft, so insertion requires confirmation before replacing the entire draft
 - Run: executes the snippet in your shell (asks for confirmation)
 
 ## Notes
 
+- Pending dialogs and clipboard utilities are cancelled on pre-switch, pre-fork, pre-tree, session start, committed tree, and shutdown events. A pre-navigation event cancels the interaction even if navigation is later vetoed; this does not provide an atomic post-veto transition.
+- At pre-navigation boundaries, custom TUI panes close synchronously, restoring their captured draft before navigation can write a new one.
 - Only assistant messages are scanned.
 - Inline code uses single backticks. Code blocks use triple backticks.
 - Inline snippets are filtered to path-like content: `~/...`, `./...`, paths with 2+ slashes, or files with extensions. Use `blocks` to show only code blocks.

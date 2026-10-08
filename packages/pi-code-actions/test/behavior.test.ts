@@ -7,15 +7,19 @@ function commandFixture() {
   const editor: { value: string } = { value: "existing" };
   const notifications: string[] = [];
   const pi = {
+    on: () => () => {},
     registerCommand: (_name: string, definition: { handler: (args: string, ctx: never) => Promise<void> }) => {
       command = definition.handler;
     },
     exec: async () => ({ stdout: "", stderr: "", code: 0 }),
   };
   const ctx = {
+    mode: "tui",
     hasUI: true,
     cwd: "/tmp",
     sessionManager: {
+      getSessionId: () => "session",
+      getLeafId: () => "assistant-1",
       getBranch: () => [
         {
           type: "message",

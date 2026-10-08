@@ -1,6 +1,7 @@
 import { type FSWatcher, readFileSync, watch } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import type { ExecResult, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { executableAvailable } from "./executable.js";
 
 export type ReviewDecision = "APPROVED" | "CHANGES_REQUESTED" | "REVIEW_REQUIRED" | "UNKNOWN";
 export type CheckState = "pass" | "fail" | "pending" | "none";
@@ -85,8 +86,21 @@ export default function githubPr(pi: ExtensionAPI, options: GithubPrOptions = {}
     throw new RangeError("refreshIntervalMs must be a positive finite number");
   }
   const branchWatch: BranchWatchState = { generation: 0, request: 0, session: 0, retryCount: 0 };
-  const ownsSession = (session: number, ctx: ExtensionContext) =>
-    session === branchWatch.session && ctx.sessionManager === branchWatch.sessionManager && ctx.cwd === branchWatch.cwd;
+  const ownsSession = (session: number, ctx: ExtensionContext): boolean => {
+    if (session !== branchWatch.session) return false;
+    try {
+      return ctx.sessionManager === branchWatch.sessionManager && ctx.cwd === branchWatch.cwd;
+    } catch {
+      // SDK disposal invalidates context getters without emitting session_shutdown.
+      // Retire only this owner; a late callback cannot close a replacement watcher.
+      branchWatch.session += 1;
+      branchWatch.generation += 1;
+      branchWatch.sessionManager = undefined;
+      branchWatch.cwd = undefined;
+      closeBranchWatcher();
+      return false;
+    }
+  };
   const refreshStatus = async (ctx: ExtensionContext, signal: AbortSignal, generation: number, session: number) => {
     const request = ++branchWatch.request;
     branchWatch.requestHead = readCurrentHead(ctx.cwd, branchWatch.headPath);
@@ -109,7 +123,7 @@ export default function githubPr(pi: ExtensionAPI, options: GithubPrOptions = {}
     // A late abort says nothing about data already in hand. An obsolete request,
     // however, cannot repaint a replacement session or branch.
     if (ownsSession(session, ctx) && generation === branchWatch.generation && request === branchWatch.request) {
-      renderStatus(ctx, status, branchWatch, generation);
+      renderStatus(ctx, status, branchWatch, generation, () => ownsSession(session, ctx));
       branchWatch.lastRenderedRequest = request;
     }
     return request;
@@ -210,8 +224,13 @@ export default function githubPr(pi: ExtensionAPI, options: GithubPrOptions = {}
     branchWatch.timer = undefined;
     cancelRefresh(branchWatch);
     clearExpiryTimer(branchWatch);
-    branchWatch.watcher?.close();
+    const watcher = branchWatch.watcher;
     branchWatch.watcher = undefined;
+    try {
+      watcher?.close();
+    } catch {
+      // Retirement must remain safe even if the watcher has already failed.
+    }
     branchWatch.headPath = undefined;
     branchWatch.requestHead = undefined;
     branchWatch.retryCount = 0;
@@ -580,6 +599,7 @@ function renderStatus(
   status: PullRequestStatus,
   branchWatch: BranchWatchState,
   generation: number,
+  ownsSession: () => boolean,
 ) {
   clearExpiryTimer(branchWatch);
   const now = Date.now();
@@ -591,10 +611,18 @@ function renderStatus(
 
   ctx.ui.setStatus(STATUS_KEY, formatLinkedStatus(status));
   if (expiresAt === undefined) return;
-  branchWatch.expiryTimer = setTimeout(() => {
+  const timer = setTimeout(() => {
+    if (branchWatch.expiryTimer !== timer) return;
     branchWatch.expiryTimer = undefined;
-    if (generation === branchWatch.generation) clearStatus(ctx);
+    if (generation !== branchWatch.generation || !ownsSession()) return;
+    try {
+      clearStatus(ctx);
+    } catch {
+      // Ambient expiry must not throw from a synchronous timer callback.
+    }
   }, expiresAt - now);
+  branchWatch.expiryTimer = timer;
+  timer.unref?.();
 }
 
 export function isPullRequestVisible(status: PullRequestStatus, now = Date.now()): boolean {
@@ -755,8 +783,9 @@ async function execGh(
   signal: AbortSignal | undefined,
   command: string,
 ): Promise<ExecResult> {
+  let result: ExecResult;
   try {
-    return await pi.exec(executable, args, { cwd, signal, timeout: GH_TIMEOUT_MS });
+    result = await pi.exec(executable, args, { cwd, signal, timeout: GH_TIMEOUT_MS });
   } catch (error) {
     const message = formatError(error);
     if (isGhExecutableMissingMessage(message.toLowerCase())) {
@@ -764,6 +793,20 @@ async function execGh(
     }
     throw new Error(`${command} could not start: ${message}`);
   }
+  // Pi can flatten spawn ENOENT into code 1 with no output. An empty failure
+  // alone is not evidence: check the effective PATH, including GH_HOST launchers.
+  if (
+    result.code === 1 &&
+    !result.killed &&
+    !signal?.aborted &&
+    !result.stdout.trim() &&
+    !result.stderr.trim() &&
+    (await executableAvailable("gh", cwd)) === false &&
+    (executable === "gh" || (await executableAvailable(executable, cwd)) === true)
+  ) {
+    throw new Error("GitHub CLI not found. Install gh and run: gh auth login.");
+  }
+  return result;
 }
 
 function formatGhFailure(command: string, result: ExecResult): string {

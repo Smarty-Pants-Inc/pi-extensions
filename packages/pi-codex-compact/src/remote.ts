@@ -68,19 +68,61 @@ function abortError(): DOMException {
 }
 
 export async function requestRemoteCompaction(request: RemoteCompactionRequest): Promise<RemoteCompactionResponse> {
+  const controller = new AbortController();
+  const onRequestAbort = () => controller.abort();
+  let onOperationAbort = () => {};
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    if (request.signal.aborted) throw abortError();
+    request.signal.addEventListener("abort", onRequestAbort, { once: true });
+    const interrupted = new Promise<never>((_resolve, reject) => {
+      onOperationAbort = () => reject(abortError());
+      controller.signal.addEventListener("abort", onOperationAbort, { once: true });
+    });
+    // Provider timeouts can stop at response headers. Own the deadline through
+    // body inspection and provider completion, even for an injected transport.
+    timeout = setTimeout(() => controller.abort(), request.requestTimeoutMs ?? 5 * 60 * 1000);
+    return await Promise.race([performRemoteCompaction({ ...request, signal: controller.signal }), interrupted]);
+  } catch {
+    // Provider and transport errors can echo credentials. Keep all failures at
+    // this public boundary opaque, including inspection errors and abort reasons.
+    if (request.signal.aborted) throw abortError();
+    throw new Error("OpenAI Codex compaction request failed");
+  } finally {
+    clearTimeout(timeout);
+    request.signal.removeEventListener("abort", onRequestAbort);
+    controller.signal.removeEventListener("abort", onOperationAbort);
+    controller.abort();
+  }
+}
+
+async function performRemoteCompaction(request: RemoteCompactionRequest): Promise<RemoteCompactionResponse> {
   if (request.signal.aborted) throw abortError();
   let sentInput: JsonObject[] | undefined;
   const inspections: Promise<{ ok: true; value: CollectedCompaction } | { ok: false; error: unknown }>[] = [];
   const baseFetch = request.fetch ?? globalThis.fetch;
   const inspectedFetch: typeof globalThis.fetch = async (input, init) => {
-    const response = await baseFetch(input, init);
-    if (!response.ok || !response.body) return response;
-    const [providerBody, inspectionBody] = response.body.tee();
-    const inspection = collectCompactionSse(inspectionBody, { signal: request.signal }).then(
-      (value) => ({ ok: true as const, value }),
-      (error: unknown) => ({ ok: false as const, error }),
-    );
-    inspections.push(inspection);
+    const signal = init?.signal ? AbortSignal.any([request.signal, init.signal]) : request.signal;
+    const response = await baseFetch(input, { ...init, signal });
+    if (signal.aborted) {
+      void response.body?.cancel().catch(() => undefined);
+      throw abortError();
+    }
+    if (!response.body) return response;
+    // Abort the body independently of fetch: injected fetch implementations
+    // need not honor signals, and a native fetch may only time out headers.
+    const bridge = new TransformStream<Uint8Array, Uint8Array>();
+    void response.body.pipeTo(bridge.writable, { signal }).catch(() => undefined);
+    let providerBody = bridge.readable;
+    if (response.ok) {
+      const [providerBranch, inspectionBody] = providerBody.tee();
+      providerBody = providerBranch;
+      const inspection = collectCompactionSse(inspectionBody, { signal: request.signal }).then(
+        (value) => ({ ok: true as const, value }),
+        (error: unknown) => ({ ok: false as const, error }),
+      );
+      inspections.push(inspection);
+    }
     return new Response(providerBody, {
       status: response.status,
       statusText: response.statusText,
@@ -116,7 +158,7 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
   for await (const event of stream) {
     if (request.signal.aborted) throw abortError();
     if (event.type === "error") {
-      throw new Error(event.error.errorMessage ?? "OpenAI Codex compaction request failed");
+      throw new Error("OpenAI Codex compaction request failed");
     }
     if (event.type === "done") usage = event.message.usage;
   }

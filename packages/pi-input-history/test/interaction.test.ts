@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { type ExtensionContext, SessionManager } from "@earendil-works/pi-coding-agent";
 import type { TUI } from "@earendil-works/pi-tui";
-import { test, vi } from "vitest";
+import { afterEach, test, vi } from "vitest";
 import history, { HistoryPopupComponent } from "../src/index.js";
 
 function setupShortcut() {
@@ -81,6 +84,11 @@ test("cancelling reverse search keeps the draft and does not request an extra re
   assert.equal(renderedEditorText.length, rendersAfterClose);
 });
 
+const sessionDirectories: string[] = [];
+afterEach(() => {
+  for (const dir of sessionDirectories.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
 type SessionList = Awaited<ReturnType<typeof SessionManager.list>>;
 
 function deferred<T>() {
@@ -109,12 +117,8 @@ function setupSessionScans() {
   const oldScan = deferred<SessionList>();
   const newScan = deferred<SessionList>();
   vi.spyOn(SessionManager, "list").mockImplementation((cwd) => (cwd === "/old" ? oldScan.promise : newScan.promise));
-  vi.spyOn(SessionManager, "open").mockImplementation(
-    (path) =>
-      ({
-        getEntries: () => [{ type: "message", message: { role: "user", content: path } }],
-      }) as never,
-  );
+  const sessionDir = mkdtempSync(join(tmpdir(), "history-scan-"));
+  sessionDirectories.push(sessionDir);
 
   let cwd = "/old";
   let branch = ["old branch"];
@@ -136,6 +140,7 @@ function setupSessionScans() {
     },
     sessionManager: {
       getBranch: () => branch.map((text) => ({ type: "message", message: { role: "user", content: text } })),
+      getSessionDir: () => sessionDir,
     },
     ui: {
       getEditorComponent: () => inheritedFactory,
@@ -191,7 +196,9 @@ function setupSessionScans() {
     return shortcut(context);
   };
   const finishScan = (scan: typeof oldScan, text: string) => {
-    scan.resolve([{ path: text, modified: new Date("2026-01-01") }] as SessionList);
+    const path = join(sessionDir, `${text}.jsonl`);
+    writeFileSync(path, JSON.stringify({ type: "message", message: { role: "user", content: text } }));
+    scan.resolve([{ path, modified: new Date("2026-01-01") }] as SessionList);
   };
 
   return {
@@ -221,6 +228,24 @@ function setupSessionScans() {
     renderedEditorText,
   };
 }
+
+test("a live native history addition during a scan prevents deferred seeding but keeps the search cache", async () => {
+  const fixture = setupSessionScans();
+  fixture.start();
+  const editor = fixture.getEditorFactory()?.({} as never, {} as never, {} as never);
+  assert.ok(editor);
+  editor.addToHistory?.("fresh submission");
+  fixture.setBranch(["fresh submission"]);
+  const searching = fixture.trigger();
+  await fixture.trigger(); // Select the cached prompt, behind the live branch prompt.
+  fixture.finishScan(fixture.oldScan, "cached prompt");
+  await vi.waitFor(() => assert.equal(fixture.popups.length, 1));
+  assert.deepEqual(fixture.inheritedHistory, ["fresh submission"]);
+  assert.ok(fixture.popups[0]);
+  fixture.popups[0].handleInput("\r");
+  await searching;
+  assert.equal(fixture.getEditorText(), "cached prompt");
+});
 
 test("Ctrl+R repeats during a scan select older entries in one popup", async () => {
   const fixture = setupSessionScans();
@@ -358,7 +383,7 @@ test("switching during a scan discards the old shortcut and preserves the new sc
   await oldShortcut;
   assert.equal(fixture.popups.length, 0);
   assert.equal(fixture.getEditorText(), "draft");
-  assert.equal(fixture.getEditorFactory(), undefined);
+  assert.equal(typeof fixture.getEditorFactory(), "function");
 
   const duplicate = fixture.trigger();
   await duplicate;

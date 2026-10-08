@@ -302,11 +302,15 @@ export function getConfig(type: string): {
   excludeExtensions?: string[];
   skills: true | string[] | false;
   promptMode: "replace" | "append";
+  source?: AgentConfig["source"];
+  sourcePath?: string;
 } {
   const key = resolveKey(type);
   const config = key ? agents.get(key) : undefined;
   if (config && config.enabled !== false) {
     return {
+      source: config.source,
+      sourcePath: config.sourcePath,
       displayName: config.displayName ?? config.name,
       color: config.color,
       description: config.description,
@@ -322,6 +326,8 @@ export function getConfig(type: string): {
   const gp = agents.get("general-purpose");
   if (gp && gp.enabled !== false) {
     return {
+      source: gp.source,
+      sourcePath: gp.sourcePath,
       displayName: gp.displayName ?? gp.name,
       color: gp.color,
       description: gp.description,

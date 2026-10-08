@@ -38,7 +38,7 @@ Goal mode uses Codex-like persistence instructions and sends guarded continuatio
 
 ## Install
 
-The declared Pi peer range covers `0.84.x`–`0.87.x` and `0.99.1+` within the 0.99 minor; the current development host is `0.99.1`. See the [compatibility review](https://github.com/signalridge/pi-extensions/blob/main/docs/pi-0.99-compatibility.md) for verification details. The `agent_settled` lifecycle event this extension depends on landed in `0.80.6`.
+The current tested host is Pi `1.0.4`. Host-provided dependencies use `"*"` peers to identify module ownership, not to guarantee compatibility with every Pi version. See the [compatibility review](https://github.com/signalridge/pi-extensions/blob/main/docs/pi-1.0-compatibility.md) for verification details. The `agent_settled` lifecycle event this extension depends on landed in `0.80.6`.
 
 ```bash
 pi install npm:@signalridge/pi-goal
@@ -210,6 +210,8 @@ The default 25-response automatic-work limit is a response-count boundary, not a
 Elapsed time is accumulated only while status is `active`. Pause, blocked, usage-limited, budget-limited, shutdown, and offline periods do not increase it. Legacy session entries are migrated by preserving their accumulated seconds and starting a fresh active clock when loaded.
 
 ## How completion works
+
+All three terminal tools use `model-only` exposure: they remain direct model declarations with codemode `on` or `only`, but scripts and nested `ctx.executeTool()` calls cannot invoke them. Nested execution does not propagate `terminate`, so allowing it could change Goal state without ending the enclosing run. Call terminal tools directly and alone.
 
 While a goal is active, `pi-goal` injects persistence rules, a `<goal_id>` stale-turn guard, and exposes `goal_complete`. Kickoff, resume, edited-objective, system, and automatic-continuation prompts all place a trust boundary before the escaped objective, identifying it as user-provided task data; they preserve its full scope across turns and require the agent to derive concrete requirements from the objective and referenced artifacts. They treat the current worktree, command output, tests, runtime behavior, PR state, rendered artifacts, and external state as authoritative; previous conversation and plans are context rather than proof.
 

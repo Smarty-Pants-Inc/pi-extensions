@@ -379,6 +379,21 @@ export function createReporter(pi: PiApi, transport: RequestTransport = sendRequ
     }
   }
 
+  // Allocate long-lived resources only once an active TUI session exists.
+  function startPoll(): void {
+    if (poll) return;
+    let pollTicks = 0;
+    poll = setInterval(() => {
+      pollTicks += 1;
+      if (pollTicks % 5 === 0) {
+        log(`poll-tick active=${active} working=${working} isIdle=${safeIdle(lastCtx)}`);
+      }
+      if (!active || disposed) return;
+      if (pollTicks % 2 === 0) publish(true);
+    }, pollMs);
+    poll.unref?.();
+  }
+
   pi.on("session_start", (rawEvent: unknown, rawCtx: unknown) => {
     if (disposed) return;
     const event = toRecord(rawEvent);
@@ -389,13 +404,11 @@ export function createReporter(pi: PiApi, transport: RequestTransport = sendRequ
     active = ctx.mode === "tui";
     log(`EVT session_start reason=${String(event.reason)} mode=${String(ctx.mode)} isIdle=${safeIdle(rawCtx)}`);
     if (!active) {
-      if (idleTimer) {
-        clearTimeout(idleTimer);
-        idleTimer = undefined;
-      }
+      clearTimers();
       log("session_start", event.reason, "mode is not tui -> inactive");
       return;
     }
+    startPoll();
 
     // This request is enqueued before publish(true), so it always reaches Herdr
     // before the first state report for this session.
@@ -420,16 +433,10 @@ export function createReporter(pi: PiApi, transport: RequestTransport = sendRequ
     }
   });
 
-  // These are public Pi 0.84 lifecycle events. The extra per-turn signals keep
-  // the local reporter responsive after a session rebind; agent_settled closes
-  // the whole run after automatic retries/compaction have finished.
-  for (const eventName of [
-    "turn_start",
-    "before_provider_request",
-    "agent_start",
-    "tool_execution_start",
-    "message_start",
-  ]) {
+  // Actual agent activity only: before_provider_request also fires for idle
+  // cache warming, which has no agent_settled event to clear a working state.
+  // agent_settled closes the run after automatic retries/compaction finish.
+  for (const eventName of ["turn_start", "agent_start", "tool_execution_start", "message_start"]) {
     pi.on(eventName, (_event: unknown, ctx: unknown) => {
       log("EVT", eventName, `active=${active}`, `isIdle=${safeIdle(ctx)}`);
       if (!active) return;
@@ -466,8 +473,10 @@ export function createReporter(pi: PiApi, transport: RequestTransport = sendRequ
 
   // Blocked (e.g. permission/interview prompts) via the shared herdr event bus.
   pi.events?.on?.("herdr:blocked", (rawData: unknown) => {
-    if (!active) return;
+    if (!active || disposed) return;
+    if (typeof rawData !== "object" || rawData === null || Array.isArray(rawData)) return;
     const data = toRecord(rawData);
+    if (typeof data.active !== "boolean" || (data.label !== undefined && typeof data.label !== "string")) return;
     if (!data.active) {
       blockedCount = Math.max(0, blockedCount - 1);
       if (blockedCount === 0) blockedMessage = undefined;
@@ -501,19 +510,6 @@ export function createReporter(pi: PiApi, transport: RequestTransport = sendRequ
       disposed = true;
     }
   });
-
-  // Reconciliation poll: re-assert event-driven state so a session switch or
-  // delayed Herdr reset cannot leave the pane permanently stale.
-  let pollTicks = 0;
-  poll = setInterval(() => {
-    pollTicks += 1;
-    if (pollTicks % 5 === 0) {
-      log(`poll-tick active=${active} working=${working} isIdle=${safeIdle(lastCtx)}`);
-    }
-    if (!active || disposed) return;
-    if (pollTicks % 2 === 0) publish(true);
-  }, pollMs);
-  poll.unref?.();
 
   log(`loaded pane=${paneId}`);
 }

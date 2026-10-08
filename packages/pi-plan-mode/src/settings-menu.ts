@@ -126,7 +126,7 @@ export async function showPlanModeSettings(
                 {
                   id: "toggleShortcut",
                   label: "Plan mode shortcut",
-                  description: "Set the global shortcut used to toggle Plan mode.",
+                  description: "Set the global shortcut used to toggle Plan mode; /reload is required.",
                   currentValue: configuredPlanModeToggleShortcut(state.settings) ?? "none",
                   action: "open-shortcut",
                 },
@@ -176,6 +176,7 @@ export async function showPlanModeSettings(
           "Use Pi key identifiers.",
           "Submit an empty value to clear the shortcut.",
           "When unset, Plan mode has no global shortcut.",
+          "Run /reload after changes to refresh Pi's editor shortcuts.",
         ],
         placeholder: configuredPlanModeToggleShortcut(state.settings) ?? "",
         action: "set-shortcut",
@@ -234,8 +235,8 @@ export async function showPlanModeSettings(
           { toggleShortcut },
           signal,
           toggleShortcut
-            ? `Plan mode shortcut: ${safeTerminalText(toggleShortcut)}.`
-            : "Plan mode shortcut cleared (no global shortcut).",
+            ? `Plan mode shortcut: ${safeTerminalText(toggleShortcut)}. Run /reload to activate the new key.`
+            : "Plan mode shortcut cleared. Run /reload to refresh editor shortcuts.",
         );
         return result.kind === "stay" ? { kind: "to", screen: "settings" } : result;
       },

@@ -1,9 +1,11 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import * as piHost from "@earendil-works/pi-coding-agent";
 import { collectSupportedFiles, resolveRoot, resolveSupportedFile } from "./files.js";
 import { LspClient } from "./lsp-client.js";
+import { beginStatus } from "./status.js";
 import { applyTextEdits, collectWorkspaceEdits, hasOverlappingTextEdits } from "./text-edits.js";
 import type { CodeAction, DiagnosticEntry, LspServerAdapter, LspTextEdit, StatusContext } from "./types.js";
 
@@ -16,6 +18,7 @@ export async function runDiagnostics(
   signal: AbortSignal | undefined,
   ctx: StatusContext,
   statusKey: string,
+  boundOutput = true,
 ) {
   const root = resolveRoot(params.root);
   const command = adapter.defaultCommand;
@@ -34,8 +37,9 @@ export async function runDiagnostics(
   throwIfAborted(signal, adapter);
   signal?.addEventListener("abort", abort, { once: true });
 
+  let finishStatus: (() => void) | undefined;
   try {
-    ctx.ui.setStatus(statusKey, `${adapter.name} diagnostics`);
+    finishStatus = beginStatus(ctx, statusKey, `${adapter.name} diagnostics`);
     throwIfAborted(signal, adapter);
     await client.start();
     await client.initialize(root);
@@ -57,19 +61,21 @@ export async function runDiagnostics(
           diagnostics: await client.diagnostics(uri),
         })),
       );
-      return textResult(formatDiagnostics(adapter, entries), {
-        root,
-        command,
-        files: entries,
-        summary: summarize(entries),
-      });
+      return textResult(
+        formatDiagnostics(adapter, entries),
+        { root, command, files: entries, summary: summarize(entries) },
+        boundOutput,
+      );
     } finally {
       for (const { uri } of openedFiles) client.didClose(uri);
     }
   } finally {
-    ctx.ui.setStatus(statusKey, undefined);
     signal?.removeEventListener("abort", abort);
-    await client.shutdown();
+    try {
+      await client.shutdown();
+    } finally {
+      finishStatus?.();
+    }
   }
 }
 
@@ -108,8 +114,9 @@ async function runFixWindow(
   throwIfAborted(signal, adapter);
   signal?.addEventListener("abort", abort, { once: true });
 
+  let finishStatus: (() => void) | undefined;
   try {
-    ctx.ui.setStatus(statusKey, `${adapter.name} fix`);
+    finishStatus = beginStatus(ctx, statusKey, `${adapter.name} fix`);
     throwIfAborted(signal, adapter);
     await client.start();
     await client.initialize(root);
@@ -148,16 +155,20 @@ async function runFixWindow(
       uri,
       changed,
       write: params.write ?? false,
+      outcome: changed ? (params.write ? "updated" : "preview") : "unchanged",
       kind: actionKind,
       actions: resolvedActions.map(({ title, kind }) => ({ title, kind })),
       appliedActions: selectedActions.map(({ title, kind }) => ({ title, kind })),
       edits,
-      text: params.write ? undefined : newText,
+      text: !params.write && changed ? newText : undefined,
     });
   } finally {
-    ctx.ui.setStatus(statusKey, undefined);
     signal?.removeEventListener("abort", abort);
-    await client.shutdown();
+    try {
+      await client.shutdown();
+    } finally {
+      finishStatus?.();
+    }
   }
 }
 
@@ -222,9 +233,59 @@ function throwIfAborted(signal: AbortSignal | undefined, adapter: LspServerAdapt
   if (signal?.aborted) throw new Error(`${adapter.name} LSP request aborted.`);
 }
 
-export function textResult(text: string, details: unknown) {
+export function textResult(text: string, details: unknown, boundOutput = true) {
+  // Unbounded sections are internal only; the complete diagnostics aggregate is bounded once.
+  if (!boundOutput) return { content: [{ type: "text" as const, text }], details };
+  const truncation = piHost.truncateHead(text);
+  const serializedDetails = JSON.stringify(details);
+  const oversizedDetails =
+    serializedDetails !== undefined && Buffer.byteLength(serializedDetails) > piHost.DEFAULT_MAX_BYTES;
+  if (!truncation.truncated && !oversizedDetails) {
+    return { content: [{ type: "text" as const, text }], details };
+  }
+
+  const directory = mkdtempSync(path.join(tmpdir(), "pi-lsp-output-"));
+  const outputPath = path.join(directory, "output.txt");
+  const detailsPath = oversizedDetails ? path.join(directory, "details.json") : undefined;
+  try {
+    chmodSync(directory, 0o700);
+    writeFileSync(outputPath, text, { encoding: "utf8", flag: "wx", mode: 0o600 });
+    if (detailsPath && serializedDetails !== undefined) {
+      writeFileSync(detailsPath, serializedDetails, { encoding: "utf8", flag: "wx", mode: 0o600 });
+    }
+  } catch (error) {
+    rmSync(directory, { recursive: true, force: true });
+    throw error;
+  }
+  const notice = [
+    truncation.truncated
+      ? `[Output truncated at the ${piHost.DEFAULT_MAX_LINES}-line / 50 KiB limit. Full output: ${outputPath}]`
+      : `[Full output: ${outputPath}]`,
+    ...(detailsPath ? [`[Details exceeded the 50 KiB limit. Full details: ${detailsPath}]`] : []),
+  ].join("\n");
+  // Budget both notices too, including when one huge line cannot fit in the preview.
+  const preview = piHost.truncateHead(text, {
+    maxBytes: piHost.DEFAULT_MAX_BYTES - Buffer.byteLength(notice) - 2,
+    maxLines: piHost.DEFAULT_MAX_LINES - notice.split("\n").length - 2,
+  });
   return {
-    content: [{ type: "text" as const, text }],
-    details,
+    content: [{ type: "text" as const, text: `${preview.content}\n\n${notice}` }],
+    // Session persistence gets only compact metadata, never the bulky text/edits/messages.
+    details: { ...compactDetails(details), outputPath, detailsPath, truncation: { ...preview, content: undefined } },
   };
+}
+
+function compactDetails(details: unknown): Record<string, unknown> {
+  if (!details || typeof details !== "object") return {};
+  const source = details as Record<string, unknown>;
+  const compact: Record<string, unknown> = {};
+  for (const key of ["outcome", "path", "uri", "changed", "write", "kind", "root"]) {
+    const value = source[key];
+    if (typeof value === "string") {
+      compact[key] = piHost.truncateHead(value, { maxBytes: 1024, maxLines: 4 }).content;
+    } else if (typeof value === "boolean" || typeof value === "number") {
+      compact[key] = value;
+    }
+  }
+  return compact;
 }

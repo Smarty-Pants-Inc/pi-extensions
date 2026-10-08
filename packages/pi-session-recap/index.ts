@@ -633,6 +633,7 @@ export default function (pi: ExtensionAPI) {
   let resumeTimer: NodeJS.Timeout | undefined;
   let activeController: AbortController | undefined;
   let agentActive = false;
+  let terminalInputCleanup: (() => void) | undefined;
   let focusListener: ((chunk: Buffer) => void) | undefined;
   let focusEnabled = false;
   let isBlurred = false;
@@ -901,14 +902,41 @@ export default function (pi: ExtensionAPI) {
     cancelActive();
   });
 
-  pi.on("input", (_event, ctx) => {
+  const handleUserActivity = (ctx: ExtensionContext) => {
     if (!ownsSession(ctx)) return;
     clearIdleTimer();
     clearPostSettleTimer();
     clearAwayTimer();
+    clearResumeTimer();
     cancelActive();
     clearRecap(ctx);
-  });
+  };
+
+  // The input event is submission, not typing. Observe terminal keyboard/paste
+  // activity too, without consuming it or treating terminal replies as typing.
+  const detachTerminalInput = () => {
+    const cleanup = terminalInputCleanup;
+    terminalInputCleanup = undefined;
+    cleanup?.();
+  };
+  const attachTerminalInput = (ctx: ExtensionContext) => {
+    if (!hasInteractiveUi(ctx)) return;
+    terminalInputCleanup = ctx.ui.onTerminalInput?.((data) => {
+      const userInput = data.includes("\x1b[200~")
+        ? data
+        : data
+            // biome-ignore lint/suspicious/noControlCharactersInRegex: DEC focus reports are terminal control sequences.
+            .replace(/\x1b\[[IO]/gu, "")
+            // biome-ignore lint/suspicious/noControlCharactersInRegex: Device, status, cursor and keyboard protocol replies are not keys.
+            .replace(/\x1b\[[?>=]?[\d;:]*(?:c|n|t|\$y)|\x1b\[\d+;\d+R|\x1b\[\?[\d;]+u/gu, "")
+            // biome-ignore lint/suspicious/noControlCharactersInRegex: OSC/DCS replies end with BEL or ST.
+            .replace(/\x1b\][^\x07]*?(?:\x07|\x1b\\)|\x1bP.*?\x1b\\/gsu, "");
+      if (userInput) handleUserActivity(ctx);
+      return undefined;
+    });
+  };
+
+  pi.on("input", (_event, ctx) => handleUserActivity(ctx));
 
   pi.on("agent_start", (_event, ctx) => {
     if (!ownsSession(ctx)) return;
@@ -977,6 +1005,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_shutdown", (_event, ctx) => {
     if (!resetSessionState(ctx)) return;
     sessionIdentityBound = true;
+    detachTerminalInput();
     detachFocusReporting();
     activeSessionManager = undefined;
   });
@@ -990,6 +1019,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", (event, ctx) => {
     // A new context supersedes any late callbacks from the previous session.
+    detachTerminalInput();
     detachFocusReporting();
     sessionIdentityBound = true;
     activeSessionManager = ctx.sessionManager;
@@ -997,6 +1027,7 @@ export default function (pi: ExtensionAPI) {
     focusEventsSeen = false;
     isBlurred = false;
     attachFocusReporting(ctx);
+    attachTerminalInput(ctx);
     if (!automaticEnabled() || !hasRecapUi(ctx)) return;
     if (event.reason === "resume" || event.reason === "fork") {
       const generation = sessionGeneration;

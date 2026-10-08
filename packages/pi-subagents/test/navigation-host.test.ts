@@ -95,7 +95,7 @@ function fixture(cwd: string) {
 
 const settle = async () => { await new Promise((resolve) => setImmediate(resolve)); };
 
-describe.skipIf(!VERSION.startsWith("0.99."))("Pi 0.99 navigation commit boundary", () => {
+describe.skipIf(!VERSION.startsWith("0.99.") && VERSION !== "1.0.4")("Pi navigation commit boundary", () => {
   let cwd = "";
   let oldCwd = "";
   let oldAgentDir: string | undefined;

@@ -32,8 +32,8 @@ import subagentsExtension from "../src/index.js";
 
 vi.setConfig({ testTimeout: 30_000 });
 
-describe.skipIf(!VERSION.startsWith("0.99."))(
-  "Pi 0.99 SDK summary navigation",
+describe.skipIf(!VERSION.startsWith("0.99.") && VERSION !== "1.0.4")(
+  "Pi SDK summary navigation",
   () => {
     let cwd = "";
     let agentDir = "";

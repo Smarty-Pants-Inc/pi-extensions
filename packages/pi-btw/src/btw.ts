@@ -267,8 +267,11 @@ export default function btw(pi: ExtensionAPI, dependencies: BtwExtensionDependen
   let sessionGeneration = 0;
   let closeActiveMenu: (() => void) | undefined;
   const closeActiveFullscreens = new Set<() => void>();
+  const closeActiveLoaders = new Set<() => void>();
   const closeMenuBeforeBoundary = (ctx: { sessionManager: ExtensionCommandContext["sessionManager"] }) => {
-    if (activeSessionManager === ctx.sessionManager) closeActiveMenu?.();
+    if (activeSessionManager !== ctx.sessionManager) return;
+    closeActiveMenu?.();
+    for (const close of closeActiveLoaders) close();
   };
   const closeFullscreenOnCommit = (ctx: { sessionManager: ExtensionCommandContext["sessionManager"] }) => {
     if (activeSessionManager !== ctx.sessionManager) return;
@@ -379,7 +382,12 @@ export default function btw(pi: ExtensionAPI, dependencies: BtwExtensionDependen
       try {
         const settings = await loadSettings(ctx);
         if (!ownsCommandSession()) return;
-        const resolution = await resolveModel(settings, ctx);
+        const registerLoaderClose = (close: () => void) => {
+          if (!ownsCommandSession()) close();
+          else closeActiveLoaders.add(close);
+          return () => closeActiveLoaders.delete(close);
+        };
+        const resolution = await resolveModel(settings, ctx, ownsCommandSession, registerLoaderClose);
         if (!ownsCommandSession()) return;
         if (resolution.kind === "cancelled") {
           notifySafely(ctx, "Cancelled", "info");
@@ -488,37 +496,73 @@ type ModelResolutionOutcome =
 async function resolveBtwModelWithLoader(
   settings: BtwSettings,
   ctx: ExtensionCommandContext,
+  isSessionCurrent: () => boolean = () => true,
+  registerClose?: (close: () => void) => () => void,
 ): Promise<ModelResolutionOutcome> {
-  return wrapCustomUi(ctx.ui).custom<ModelResolutionOutcome>((tui, theme, _keybindings, done) => {
-    const loader = new BorderedLoader(tui, theme, "Resolving /btw model credentials...");
-    let settled = false;
-    loader.onAbort = () => {
-      if (settled) return;
-      settled = true;
-      done({ kind: "cancelled" });
-    };
+  let settled = false;
+  let complete: ((result: ModelResolutionOutcome) => void) | undefined;
+  let disposeLoader: (() => void) | undefined;
+  const finish = (result: ModelResolutionOutcome) => {
+    if (settled) return;
+    settled = true;
+    try {
+      disposeLoader?.();
+    } finally {
+      complete?.(result);
+    }
+  };
+  const cancel = () => finish({ kind: "cancelled" });
+  // Register before opening: Pi restores the captured editor synchronously in
+  // done(), so lifecycle cancellation must run before navigation takes ownership.
+  const unregister = registerClose?.(cancel);
+  try {
+    if (settled || !isSessionCurrent()) return { kind: "cancelled" };
+    return await wrapCustomUi(ctx.ui).custom<ModelResolutionOutcome>((tui, theme, _keybindings, done) => {
+      complete = done;
+      const loader = new BorderedLoader(tui, theme, "Resolving /btw model credentials...");
+      // Construction starts an interval. Pi may receive done() before mounting
+      // the component, in which case the host never disposes it. Own cleanup,
+      // including host disposal, with one idempotent function.
+      const rawDispose = loader.dispose.bind(loader);
+      let disposed = false;
+      disposeLoader = loader.dispose = () => {
+        if (disposed) return;
+        disposed = true;
+        rawDispose();
+      };
+      loader.onAbort = cancel;
+      if (settled || !isSessionCurrent()) {
+        disposeLoader();
+        if (settled) done({ kind: "cancelled" });
+        else cancel();
+        return loader;
+      }
 
-    resolveBtwModel({
-      settings,
-      currentModel: ctx.model,
-      modelRegistry: ctx.modelRegistry,
-      warn: (message) => {
-        if (!settled) notifySafely(ctx, message, "warning");
-      },
-    })
-      .then((selected) => {
-        if (settled) return;
-        settled = true;
-        done(selected ? { kind: "selected", selected } : { kind: "unavailable" });
+      resolveBtwModel({
+        settings,
+        currentModel: ctx.model,
+        modelRegistry: ctx.modelRegistry,
+        warn: (message) => {
+          if (!settled && isSessionCurrent()) notifySafely(ctx, message, "warning");
+        },
       })
-      .catch(() => {
-        if (settled) return;
-        settled = true;
-        done({ kind: "unavailable" });
-      });
+        .then((selected) => {
+          if (settled) return;
+          finish(isSessionCurrent() && selected ? { kind: "selected", selected } : { kind: "unavailable" });
+        })
+        .catch(() => finish({ kind: "unavailable" }));
 
-    return loader;
-  });
+      return loader;
+    });
+  } finally {
+    settled = true;
+    complete = undefined;
+    try {
+      disposeLoader?.();
+    } finally {
+      unregister?.();
+    }
+  }
 }
 
 interface RunBtwThreadDependencies {

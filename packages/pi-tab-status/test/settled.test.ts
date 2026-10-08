@@ -9,6 +9,7 @@ test("commit evidence survives retry and continuation until truly settled", asyn
   const ctx = {
     cwd: "/tmp/demo",
     hasUI: true,
+    mode: "tui",
     isIdle: () => idle,
     ui: { setTitle: (title: string) => titles.push(title) },
   };
@@ -21,7 +22,12 @@ test("commit evidence survives retry and continuation until truly settled", asyn
     await emit("session_start");
     await emit("agent_start");
     await emit("tool_call", { toolName: "bash", toolCallId: "commit", input: { command: "git commit -m done" } });
-    await emit("tool_result", { toolCallId: "commit", isError: false });
+    await emit("tool_result", {
+      toolName: "bash",
+      toolCallId: "commit",
+      input: { command: "git commit -m done" },
+      isError: false,
+    });
     // A cancelled session switch does not start a new run or erase evidence.
     await emit("session_before_switch", { reason: "new" });
     assert.equal(titles.at(-1), formatTabTitle(ctx.cwd, "running"));

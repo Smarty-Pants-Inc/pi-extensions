@@ -109,7 +109,7 @@ export async function collectCompactionSse(
   };
 
   try {
-    while (true) {
+    while (!completedResponse) {
       checkAbort();
       const { done, value } = await reader.read();
       if (done) break;
@@ -123,18 +123,21 @@ export async function collectCompactionSse(
         const rawLine = pending.slice(0, newline);
         pending = pending.slice(newline + 1);
         processLine(rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine);
+        if (completedResponse) break;
         newline = pending.indexOf("\n");
       }
     }
-    pending += decoder.decode();
-    if (pending.length > 0) processLine(pending.endsWith("\r") ? pending.slice(0, -1) : pending);
-    dispatch();
+    if (!completedResponse) {
+      pending += decoder.decode();
+      if (pending.length > 0) processLine(pending.endsWith("\r") ? pending.slice(0, -1) : pending);
+      dispatch();
+    }
     checkAbort();
-  } catch (error) {
-    await reader.cancel(error).catch(() => undefined);
-    throw error;
   } finally {
     options.signal?.removeEventListener("abort", onAbort);
+    // Tee cancellation waits for both consumers. Initiate this branch's cancel
+    // without awaiting it so the provider can finish cancelling its own branch.
+    void reader.cancel().catch(() => undefined);
     reader.releaseLock();
   }
 

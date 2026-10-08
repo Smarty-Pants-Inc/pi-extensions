@@ -114,8 +114,14 @@ export function isValidTimestamp(value: number): boolean {
   return value >= 0 && Number.isFinite(value) && !Number.isNaN(new Date(value).getTime());
 }
 
+// biome-ignore lint/suspicious/noControlCharactersInRegex: XML 1.0 forbids these characters, including the bracketed-paste ESC introducer.
+const forbiddenXmlControls = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\ud800-\udfff\ufffe\uffff]/gu;
+
 function escapeXml(value: string): string {
+  // Never let saved input terminate the host's synthetic bracketed paste.
+  // Keep XML-valid whitespace and multiline content; storage remains byte-for-byte raw.
   return value
+    .replace(forbiddenXmlControls, (character) => `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`)
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")

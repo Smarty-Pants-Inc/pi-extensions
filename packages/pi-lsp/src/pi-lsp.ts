@@ -5,6 +5,7 @@ import { commandExists, commandPathValue } from "./command.js";
 import { resolveRoot } from "./files.js";
 import { selectDiagnosticRoutes, selectFixRoute } from "./routes.js";
 import { DEFAULT_FILE_LIMIT, runDiagnostics, runFix, textResult } from "./runner.js";
+import { resetStatus } from "./status.js";
 
 const STATUS_KEY = "lsp";
 
@@ -70,6 +71,7 @@ const lspDiagnosticsTool = defineTool({
         signal,
         ctx,
         STATUS_KEY,
+        false, // Bound the complete aggregate once, not each server section.
       );
       results.push({ route, result });
     }
@@ -153,7 +155,7 @@ export default function lsp(pi: ExtensionAPI) {
   });
 
   pi.on("session_start", (_event, ctx) => {
-    ctx.ui.setStatus(STATUS_KEY, undefined);
+    resetStatus(ctx, STATUS_KEY);
     try {
       loadRuntime(ctx.cwd, { projectTrusted: ctx.isProjectTrusted() });
       const notice = consumeLspConfigNotice();
@@ -164,7 +166,7 @@ export default function lsp(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
-    ctx.ui.setStatus(STATUS_KEY, undefined);
+    resetStatus(ctx, STATUS_KEY);
   });
 }
 

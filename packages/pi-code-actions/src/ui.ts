@@ -1,6 +1,7 @@
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
-import { Container, matchesKey, type SelectItem, SelectList, Text } from "@earendil-works/pi-tui";
+import { Container, decodeKittyPrintable, matchesKey, type SelectItem, SelectList, Text } from "@earendil-works/pi-tui";
+import { type ActionOwnership, ownedCustom } from "./owned-custom.js";
 import { buildSearchIndex, rankedFilterItems } from "./search.js";
 import type { Snippet } from "./snippets.js";
 import { getSnippetPreview, truncatePreview } from "./snippets.js";
@@ -21,7 +22,11 @@ export type PickResult = {
   action?: "copy" | "insert";
 };
 
-export async function pickSnippet(ctx: ExtensionCommandContext, snippets: Snippet[]): Promise<PickResult | undefined> {
+export async function pickSnippet(
+  ctx: ExtensionCommandContext,
+  snippets: Snippet[],
+  ownership: ActionOwnership,
+): Promise<PickResult | undefined> {
   const indexWidth = String(snippets.length).length;
   const timeWidth = Math.max(...snippets.map((snippet) => snippet.sourceLabel.length));
   const items: SelectItem[] = snippets.map((snippet, idx) => ({
@@ -31,7 +36,7 @@ export async function pickSnippet(ctx: ExtensionCommandContext, snippets: Snippe
   }));
   const searchIndex = buildSearchIndex(snippets, items);
 
-  const selectedIndex = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
+  const selectedIndex = await ownedCustom<string | null>(ctx, ownership, (tui, theme, _kb, done) => {
     const container = new Container();
 
     container.addChild(new DynamicBorder((s: string) => theme.fg("borderAccent", s)));
@@ -90,8 +95,9 @@ export async function pickSnippet(ctx: ExtensionCommandContext, snippets: Snippe
           return;
         }
 
-        if (data.length === 1 && data >= " " && data <= "~") {
-          updateFilter(filter + data);
+        const printable = decodeKittyPrintable(data) ?? data;
+        if (printable.length === 1 && printable >= " " && printable <= "~") {
+          updateFilter(filter + printable);
           return;
         }
 
@@ -113,8 +119,12 @@ export async function pickSnippet(ctx: ExtensionCommandContext, snippets: Snippe
   return { snippet };
 }
 
-export async function pickAction(ctx: ExtensionCommandContext): Promise<"copy" | "insert" | "run" | undefined> {
-  const action = await ctx.ui.select("Action", ["Copy", "Insert", "Run"]);
-  if (!action) return undefined;
+export async function pickAction(
+  ctx: ExtensionCommandContext,
+  ownership: ActionOwnership,
+): Promise<"copy" | "insert" | "run" | undefined> {
+  if (!ownership.isCurrent() || ownership.signal.aborted) return undefined;
+  const action = await ctx.ui.select("Action", ["Copy", "Insert", "Run"], { signal: ownership.signal });
+  if (!ownership.isCurrent() || ownership.signal.aborted || !action) return undefined;
   return action.toLowerCase() as "copy" | "insert" | "run";
 }

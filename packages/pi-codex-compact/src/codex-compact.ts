@@ -191,14 +191,42 @@ function projectedCurrentMessages(
   return { messages: projected, transcript: session.messages, prior };
 }
 
-function notifyFailure(ctx: ExtensionContext, error: unknown, settings: CodexCompactSettings): void {
+function notifyFailure(ctx: ExtensionContext, settings: CodexCompactSettings): void {
   if (!ctx.hasUI || !settings.notifyOnFallback) return;
-  const message = error instanceof Error ? error.message : String(error);
-  ctx.ui.notify(`Codex remote compaction failed; using Pi compaction. ${message}`, "warning");
+  ctx.ui.notify("Codex remote compaction failed; using Pi compaction.", "warning");
 }
 
 function sessionStillOwned(ctx: ExtensionContext, sessionId: string, signal: AbortSignal): boolean {
   return !signal.aborted && ctx.sessionManager.getSessionId() === sessionId;
+}
+
+async function awaitCompactionAuth(
+  ctx: ExtensionContext,
+  model: Model<"openai-codex-responses">,
+  signal: AbortSignal,
+  deadline: number,
+) {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  let onAbort = () => {};
+  try {
+    if (signal.aborted) throw new DOMException("Compaction aborted", "AbortError");
+    const remainingMs = deadline - performance.now();
+    if (remainingMs <= 0) throw new Error("OpenAI Codex compaction deadline exceeded");
+    const interrupted = new Promise<never>((_resolve, reject) => {
+      onAbort = () => reject(new DOMException("Compaction aborted", "AbortError"));
+      signal.addEventListener("abort", onAbort, { once: true });
+      timeout = setTimeout(() => reject(new Error("OpenAI Codex compaction deadline exceeded")), remainingMs);
+    });
+    // Race only our wait. Pi owns token refresh and persistence, which must be
+    // allowed to finish after cancellation. Promise.race observes late rejection.
+    return await Promise.race([ctx.modelRegistry.getApiKeyAndHeaders(model), interrupted]);
+  } catch {
+    // Authentication errors and abort reasons can contain credentials.
+    throw new Error("OpenAI Codex authentication failed");
+  } finally {
+    clearTimeout(timeout);
+    signal.removeEventListener("abort", onAbort);
+  }
 }
 
 async function compactRemotely(
@@ -210,13 +238,14 @@ async function compactRemotely(
 ) {
   const model = ctx.model;
   if (!settings.enabled || !isSupportedModel(model)) return undefined;
+  const deadline = performance.now() + settings.requestTimeoutMs;
   const sessionId = ctx.sessionManager.getSessionId();
   ctx.ui.setStatus(STATUS_KEY, "Codex remote compaction…");
   try {
-    const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+    const auth = await awaitCompactionAuth(ctx, model, event.signal, deadline);
     if (!sessionStillOwned(ctx, sessionId, event.signal)) return { cancel: true };
     if (!auth.ok || !auth.apiKey) {
-      throw new Error(auth.ok ? "OpenAI Codex OAuth token is unavailable" : auth.error);
+      throw new Error("OpenAI Codex OAuth token is unavailable");
     }
     const provider = ctx.modelRegistry.getProvider(model.provider);
     if (!provider) throw new Error("OpenAI Codex provider is unavailable");
@@ -230,6 +259,8 @@ async function compactRemotely(
       messages: convertToLlm(current.messages),
       tools: activeTools(pi),
     };
+    const remainingMs = deadline - performance.now();
+    if (remainingMs <= 0) throw new Error("OpenAI Codex compaction deadline exceeded");
     const response = await requestRemoteCompaction({
       provider,
       model,
@@ -244,7 +275,7 @@ async function compactRemotely(
             replacementHistory: current.prior.replacementHistory,
           }
         : undefined,
-      requestTimeoutMs: settings.requestTimeoutMs,
+      requestTimeoutMs: remainingMs,
       maxRetries: settings.maxRetries,
       fetch,
     });
@@ -261,7 +292,9 @@ async function compactRemotely(
       modelId: model.id,
       replacementHistory,
       keptMessages: keptMessages(event),
-      willRetry: event.willRetry,
+      // Canonical hosts persist recovery omissions before this hook. Retained
+      // projected messages are full lineage, never a tail to remove afterward.
+      willRetry: !piCodingAgentCompat.buildSessionProjection && event.willRetry,
     });
     return {
       compaction: {
@@ -272,11 +305,11 @@ async function compactRemotely(
         details,
       },
     };
-  } catch (error) {
+  } catch {
     if (event.signal.aborted || ctx.sessionManager.getSessionId() !== sessionId) {
       return { cancel: true };
     }
-    notifyFailure(ctx, error, settings);
+    notifyFailure(ctx, settings);
     return undefined;
   } finally {
     if (ctx.sessionManager.getSessionId() === sessionId) ctx.ui.setStatus(STATUS_KEY, undefined);
@@ -348,18 +381,18 @@ export function createCodexCompactExtension(
       compactRemotely(pi, event, ctx, settingsRuntime.get().settings, options.fetch),
     );
 
-    // Post-compaction continuation (item 53): `session_before_compact` drives
-    // the remote request, but the replay window only opens after Pi finishes
-    // compaction. Observing `session_compact` keeps both sides of the
-    // lifecycle handled and lets the extension re-validate the checkpoint in
-    // the post-compaction context without mutating session state.
+    // Legacy hosts trim a recovery tail after compaction. Canonical hosts have
+    // already persisted context edits before the hook and keep full provenance.
     pi.on("session_compact", (event, ctx) => {
       if (!active) return;
       resetTailProvenance(ctx);
       const checkpoint = activeCheckpoint(ctx);
-      // Pi rebuilds persisted context before this event, then removes the eligible
-      // tail before retry. Only this event plus validated proof establishes omission.
-      if (event.willRetry && checkpoint?.entry.id === event.compactionEntry.id && checkpoint.details.retryTrimmedTail) {
+      if (
+        !piCodingAgentCompat.buildSessionProjection &&
+        event.willRetry &&
+        checkpoint?.entry.id === event.compactionEntry.id &&
+        checkpoint.details.retryTrimmedTail
+      ) {
         tailProvenance.set(ctx.sessionManager, {
           checkpointId: provenanceId(ctx, checkpoint.details.checkpointId),
           mode: "runtime-omitted",
@@ -376,8 +409,11 @@ export function createCodexCompactExtension(
       const checkpoint = activeCheckpoint(ctx);
       if (!checkpoint || !isCheckpointCompatible(checkpoint.details, ctx.model)) return undefined;
       const provenance = tailProvenance.get(ctx.sessionManager);
-      const mode =
-        provenance?.checkpointId === provenanceId(ctx, checkpoint.details.checkpointId) ? provenance.mode : undefined;
+      const mode = piCodingAgentCompat.buildSessionProjection
+        ? "full"
+        : provenance?.checkpointId === provenanceId(ctx, checkpoint.details.checkpointId)
+          ? provenance.mode
+          : undefined;
       const messages = projectCheckpointContext(event.messages, checkpoint.details, mode);
       return messages ? { messages } : undefined;
     });

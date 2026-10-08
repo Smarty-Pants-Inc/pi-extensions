@@ -128,6 +128,7 @@ function parseTool(value: unknown, index: number): ToolCallRecord {
     name: requiredString(item.name, `${prefix}.name`),
     ...optionalProperty("provider", optionalString(item.provider, `${prefix}.provider`)),
     ...optionalProperty("model", optionalString(item.model, `${prefix}.model`)),
+    ...optionalProperty("thinkingLevel", optionalString(item.thinkingLevel, `${prefix}.thinkingLevel`)),
     startedAtMs: timestampValue(item.startedAtMs, `${prefix}.startedAtMs`),
     ...optionalProperty("finishedAtMs", optionalTimestamp(item.finishedAtMs, `${prefix}.finishedAtMs`)),
     ...optionalProperty("durationMs", optionalDuration(item.durationMs, `${prefix}.durationMs`)),
@@ -150,6 +151,7 @@ function parseSkill(value: unknown, index: number): SkillActivationRecord {
     occurredAtMs: timestampValue(item.occurredAtMs, `${prefix}.occurredAtMs`),
     ...optionalProperty("provider", optionalString(item.provider, `${prefix}.provider`)),
     ...optionalProperty("model", optionalString(item.model, `${prefix}.model`)),
+    ...optionalProperty("thinkingLevel", optionalString(item.thinkingLevel, `${prefix}.thinkingLevel`)),
   };
 }
 
@@ -162,6 +164,7 @@ function parseProviderError(value: unknown, index: number): ProviderErrorRecord 
     occurredAtMs: timestampValue(item.occurredAtMs, `${prefix}.occurredAtMs`),
     ...optionalProperty("provider", optionalString(item.provider, `${prefix}.provider`)),
     ...optionalProperty("model", optionalString(item.model, `${prefix}.model`)),
+    ...optionalProperty("thinkingLevel", optionalString(item.thinkingLevel, `${prefix}.thinkingLevel`)),
     category: enumValue(item.category, ERROR_CATEGORIES, `${prefix}.category`) as ProviderErrorCategory,
     recovered: booleanValue(item.recovered, `${prefix}.recovered`),
     terminal: booleanValue(item.terminal, `${prefix}.terminal`),
