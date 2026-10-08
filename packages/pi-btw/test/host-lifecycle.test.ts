@@ -12,6 +12,7 @@ import {
   type ExtensionAPI,
   type ExtensionCommandContext,
   InteractiveMode,
+  initTheme,
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
@@ -20,6 +21,8 @@ import { test } from "vitest";
 import btw from "../src/btw.js";
 import { runBtwFullscreen } from "../src/fullscreen-ui.js";
 import { showBtwCommandMenu } from "../src/menu.js";
+
+initTheme("dark", false);
 
 // Call Pi's actual showExtensionCustom implementation on a minimal TUI shell.
 // In particular, its savedText/restoreEditor logic must not be simulated away.
@@ -91,7 +94,11 @@ function createPiEditorHost(initialText: string) {
 
 type Transition = "new" | "tree" | "cancelled-new" | "cancelled-tree";
 
-async function withRealPiMenu(transition: Transition) {
+async function withRealPiMenu(transition: Transition, deferredCredentials = false) {
+  let releaseCredentials!: () => void;
+  const credentials = new Promise<{ ok: true; apiKey: string }>((resolve) => {
+    releaseCredentials = () => resolve({ ok: true, apiKey: "test" });
+  });
   const cwd = await mkdtemp(join(tmpdir(), "pi-btw-host-boundary-"));
   const host = createPiEditorHost(transition.endsWith("tree") ? "" : "old draft");
   let runtime: AgentSessionRuntime | undefined;
@@ -116,10 +123,14 @@ async function withRealPiMenu(transition: Transition) {
                   registerClose,
                 }),
               loadSettings: async () => ({}),
-              resolveModel: async () => ({
-                kind: "selected",
-                selected: { model: { provider: "test", id: "test", reasoning: false } as Model<Api>, auth: {} },
-              }),
+              ...(deferredCredentials
+                ? {}
+                : {
+                    resolveModel: async () => ({
+                      kind: "selected" as const,
+                      selected: { model: { provider: "test", id: "test", reasoning: false } as Model<Api>, auth: {} },
+                    }),
+                  }),
               runFullscreen: async (ctx, run) => run(ctx),
               runThread: async () => {
                 threadStarts++;
@@ -190,7 +201,9 @@ async function withRealPiMenu(transition: Transition) {
     const command = oldSession.extensionRunner.getCommand("btw");
     assert.ok(command);
     // The registered command runs against Pi's own bound extension context.
-    const commandRunning = command.handler("", oldSession.extensionRunner.createCommandContext());
+    const commandContext = oldSession.extensionRunner.createCommandContext();
+    if (deferredCredentials) commandContext.modelRegistry.getApiKeyAndHeaders = () => credentials;
+    const commandRunning = command.handler(deferredCredentials ? "side question" : "", commandContext);
     await host.waitForOpen();
     assert.ok(host.openComponent);
     assert.equal(host.closeCount, 0);
@@ -208,7 +221,13 @@ async function withRealPiMenu(transition: Transition) {
       const result = await runtime.newSession({ withSession: async () => host.editor.setText("new session editor") });
       assert.equal(result.cancelled, transition === "cancelled-new");
     }
+    // The actual default credential loader must settle on navigation, before
+    // credentials arrive; late done() would restore the old editor over this draft.
     await commandRunning;
+    releaseCredentials();
+    await credentials;
+    await Promise.resolve();
+    await Promise.resolve();
     assert.equal(host.closeCount, 1);
     assert.equal(threadStarts, 0);
     assert.equal(
@@ -228,7 +247,13 @@ async function withRealPiMenu(transition: Transition) {
 
 test.each(["new", "tree", "cancelled-new", "cancelled-tree"] as const)(
   "real Pi %s transition closes pending BTW menu before editor restoration",
-  withRealPiMenu,
+  (transition) => withRealPiMenu(transition),
+);
+
+test.each(["new", "tree"] as const)(
+  "real Pi %s closes the default credential loader before late authentication",
+  (transition) => withRealPiMenu(transition, true),
+  10_000,
 );
 
 type WriterOrder = "writer-before-btw" | "btw-before-writer";

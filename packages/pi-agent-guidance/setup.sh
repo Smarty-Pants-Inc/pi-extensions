@@ -2,7 +2,11 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PI_AGENT_DIR="$HOME/.pi/agent"
+PI_AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
+case "$PI_AGENT_DIR" in
+    "~") PI_AGENT_DIR="$HOME" ;;
+    "~/"*) PI_AGENT_DIR="$HOME/${PI_AGENT_DIR:2}" ;;
+esac
 
 echo "Setting up agent-guidance..."
 mkdir -p "$PI_AGENT_DIR/extensions"

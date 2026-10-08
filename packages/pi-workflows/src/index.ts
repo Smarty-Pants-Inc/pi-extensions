@@ -118,9 +118,10 @@ function textResult(text: string, details: unknown = {}) {
  * Run one command for diff discovery. argv array, never a shell string — a
  * branch name or path reaches this from user input.
  */
-function runCommand(file: string, args: string[]): CommandResult {
+function runCommand(file: string, args: string[], cwd: string): CommandResult {
   try {
     const stdout = execFileSync(file, args, {
+      cwd,
       encoding: "utf8",
       maxBuffer: 32 * 1024 * 1024,
       stdio: ["ignore", "pipe", "ignore"],
@@ -1048,11 +1049,29 @@ export default function piWorkflows(pi: ExtensionAPI): void {
         }
       }
       const message = lastUserMessage;
-      if (lastUserIndex < 0 || !message || !("content" in message) || typeof message.content !== "string") return;
-      const deduplicatedText = deduplicateWorkflowDirective(message.content);
-      if (deduplicatedText === message.content) return;
+      if (lastUserIndex < 0 || !message || !("content" in message)) return;
+      let seen = false;
+      const deduplicate = (text: string): string =>
+        text.replaceAll(WORKFLOW_ARMED_DIRECTIVE, (directive) => {
+          if (seen) return "";
+          seen = true;
+          return directive;
+        });
+      const content =
+        typeof message.content === "string"
+          ? deduplicate(message.content)
+          : message.content.map((part) => {
+              if (part.type !== "text") return part;
+              const text = deduplicate(part.text);
+              return text === part.text ? part : { ...part, text };
+            });
+      if (
+        content === message.content ||
+        (Array.isArray(content) && content.every((part, index) => part === message.content[index]))
+      )
+        return;
       const messages = event.messages.slice();
-      messages[lastUserIndex] = { ...message, content: deduplicatedText };
+      messages[lastUserIndex] = { ...message, content };
       return { messages };
     });
 
@@ -1115,7 +1134,8 @@ export default function piWorkflows(pi: ExtensionAPI): void {
           // takes a diff rather than something typed, so it resolves one first.
           let scriptArgs: Record<string, unknown> | undefined;
           if (name === "code-review") {
-            const scope = resolveCodeReviewScope(text, runCommand);
+            const cwd = ctx.cwd;
+            const scope = resolveCodeReviewScope(text, (file, argv) => runCommand(file, argv, cwd));
             for (const notice of scope.notices) ctx.ui.notify(notice, "warning");
             if (!scope.diff.trim()) return;
             scriptArgs = { diff: scope.diff, diffSource: scope.diffSource };
@@ -1357,6 +1377,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
           }
         },
         awaitProtocol,
+        sessionCwd,
       );
       try {
         const entries =

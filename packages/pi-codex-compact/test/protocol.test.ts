@@ -38,6 +38,37 @@ test("collects one compaction from fragmented CRLF SSE and deduplicates complete
   assert.ok(result.completedResponse);
 });
 
+test("terminal response ends inspection and initiates cancellation without awaiting it", async () => {
+  let cancellations = 0;
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(encoder.encode(validSse()));
+      // Neither EOF nor the underlying cancellation promise ever arrives.
+    },
+    cancel() {
+      cancellations += 1;
+      return new Promise<void>(() => {});
+    },
+  });
+  const result = await collectCompactionSse(stream);
+  assert.equal(result.item.encrypted_content, "opaque");
+  assert.equal(cancellations, 1);
+}, 1000);
+
+test("terminal response validates item count even when the source stays open", async () => {
+  let cancellations = 0;
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(encoder.encode('data: {"type":"response.completed","response":{"output":[]}}\n\n'));
+    },
+    cancel() {
+      cancellations += 1;
+    },
+  });
+  await assert.rejects(collectCompactionSse(stream), /returned 0 distinct/);
+  assert.equal(cancellations, 1);
+}, 1000);
+
 test("joins multiline data fields and ignores unrelated events", async () => {
   const outputItem = JSON.stringify({
     type: "response.output_item.done",

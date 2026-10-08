@@ -388,11 +388,12 @@ function parseRoutingPolicy(raw: unknown): ManagedRoutingPolicy {
   if (Object.keys(profiles).length > MAX_AGENT_TIER_PROFILES) {
     throw new Error("routing policy has too many profiles");
   }
-  const normalizedProfiles: Record<string, ManagedAgentTierProfile> = {};
-  for (const [key, profile] of Object.entries(profiles)) {
-    if (!isManagedAgentTier(key)) throw new Error("routing policy profile key is invalid");
-    normalizedProfiles[key] = parseAgentTierProfile(profile, `Agent-tier profile ${key}`);
-  }
+  const normalizedProfiles: Record<string, ManagedAgentTierProfile> = Object.fromEntries(
+    Object.entries(profiles).map(([key, profile]) => {
+      if (!isManagedAgentTier(key)) throw new Error("routing policy profile key is invalid");
+      return [key, parseAgentTierProfile(profile, `Agent-tier profile ${key}`)] as const;
+    }),
+  );
   const blockedProfiles = parseTierKeyList(
     value.blockedProfiles,
     "routing policy.blockedProfiles",

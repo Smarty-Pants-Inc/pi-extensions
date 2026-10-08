@@ -1,6 +1,6 @@
 # pi-agent-guidance
 
-Loads provider-specific context files (CLAUDE.md, CODEX.md, GEMINI.md) based on current model, supplementing Pi's AGENTS.md loading.
+Loads provider-specific context files (CLAUDE.md, CODEX.md, GEMINI.md) based on the current model, supplementing Pi's selected context files.
 
 ## How it works
 
@@ -10,7 +10,7 @@ flowchart LR
     S2["project/"] --> B
     
     subgraph Core ["Pi Core"]
-        B["Load all AGENTS.md<br/><sub>(CLAUDE.md as fallback)</sub>"]
+        B["Select first readable context file<br/><sub>per directory</sub>"]
     end
     
     subgraph Ext ["agent-guidance extension"]
@@ -33,13 +33,21 @@ flowchart LR
 
 ### Pi Core behavior
 
-Pi Core loads `AGENTS.md` from `~/.pi/agent/` and project directories (walking up from cwd). Falls back to `CLAUDE.md` if no `AGENTS.md` exists.
+Pi Core selects the first readable regular file per directory in this order:
+`AGENTS.override.md`, `AGENTS.md`, `AGENTS.MD`, `CLAUDE.md`, `CLAUDE.MD`.
+It searches the agent directory and project ancestors (walking up from cwd).
+An override replaces only the context file in its own directory; unreadable
+files and directories are skipped.
 
 ### What this extension adds
 
-For each directory, loads the provider-specific file if:
-- `AGENTS.md` exists (so core didn't load the provider file as fallback)
-- Content differs from `AGENTS.md` (handles copy scenario)
+For each directory, loads a readable provider-specific regular file unless its
+resolved path or content already appears in the host's actual
+`before_agent_start.systemPromptOptions.contextFiles`. This includes custom host
+context selections. A `CLAUDE.md` alongside a different `AGENTS.override.md` is
+still Claude-specific guidance, and an unselected `AGENTS.md` cannot suppress a
+matching `CODEX.md`. On older hosts without structured prompt options, the
+fallback uses the same precedence and readability rules.
 
 ## Install
 
@@ -69,7 +77,10 @@ Then filter to just this extension in `~/.pi/agent/settings.json`:
 ./setup.sh
 ```
 
-Links the extension to `~/.pi/agent/extensions/` and helps you set up `AGENTS.md`.
+Links the extension to `<agent-dir>/extensions/` and helps you set up
+`<agent-dir>/AGENTS.md`. The agent directory defaults to `~/.pi/agent`; set
+`PI_CODING_AGENT_DIR` to use another profile. A leading `~` or `~/` is expanded
+as it is by Pi. Configuration and provider files belong in the same directory.
 
 ## Templates
 

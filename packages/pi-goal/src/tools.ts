@@ -59,6 +59,8 @@ const MAX_BLOCKER_EVIDENCE_LENGTH = 4_000;
 export function registerGoalTools(pi: ExtensionAPI, runtime: GoalRuntime) {
   const goalCompleteTool = defineTool({
     name: GOAL_COMPLETE_TOOL,
+    // Nested execution strips terminate; terminal transitions must be direct model calls.
+    exposure: "model-only",
     label: "Goal Complete",
     description:
       "Mark the active /goal as complete after all required work is done and verified, using the current goal_id stale-turn guard. Do not use for partial progress, blockers, failing, or unverified work.",
@@ -215,6 +217,7 @@ export function registerGoalTools(pi: ExtensionAPI, runtime: GoalRuntime) {
 
   const goalBlockedTool = defineTool({
     name: GOAL_BLOCKED_TOOL,
+    exposure: "model-only",
     label: "Goal Blocked",
     description:
       "Stop the active /goal only at a true impasse after the same blocker recurs for at least three consecutive goal turns, with the current goal_id and concrete evidence that user or external action is required. Do not use for ordinary clarification, uncertainty, or recoverable failures.",
@@ -304,6 +307,7 @@ export function registerGoalTools(pi: ExtensionAPI, runtime: GoalRuntime) {
 
   const goalWaitTool = defineTool({
     name: GOAL_WAIT_TOOL,
+    exposure: "model-only",
     label: "Goal Wait",
     description: `Keep the active /goal alive but quiet while something outside this session is expected — CI finishing, a review landing, a reply arriving. The goal pauses, stays resumable, and records why. Call it alone, after arranging whatever will wake it, or pass resume_after_ms as a safety deadline. Requests below ${MIN_GOAL_WAIT_DELAY_MS}ms are clamped to ${MIN_GOAL_WAIT_DELAY_MS}ms. Do not use it for ordinary unfinished work: if there is anything left you can do yourself, do it instead.`,
     promptSnippet: "Pause the active /goal while waiting on something outside this session",

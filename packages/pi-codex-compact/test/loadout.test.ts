@@ -3,7 +3,14 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { zstdDecompressSync } from "node:zlib";
-import { getCurrentTools, InMemoryCredentialStore, type Model, type Provider } from "@earendil-works/pi-ai";
+import {
+  getCurrentSystemPrompt,
+  getCurrentTools,
+  InMemoryCredentialStore,
+  type Model,
+  type Provider,
+  Type,
+} from "@earendil-works/pi-ai";
 import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
 import {
   type AgentSession,
@@ -13,6 +20,7 @@ import {
   ModelRuntime,
   SessionManager,
   SettingsManager,
+  type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { test, vi } from "vitest";
 import { parseCheckpointDetails } from "../src/checkpoint.js";
@@ -60,7 +68,7 @@ function sseResponse(compact: boolean): Response {
 }
 
 /** Real SDK and Codex serializer, isolated credentials, and a fully stubbed transport. */
-async function sdkFixture() {
+async function sdkFixture(mode: "on" | "only" = "on") {
   const directory = mkdtempSync(join(tmpdir(), "pi-codex-compact-loadout-"));
   vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("Unexpected live HTTP request"));
   vi.spyOn(globalThis, "WebSocket").mockImplementation(() => {
@@ -85,6 +93,20 @@ async function sdkFixture() {
       refreshOnCreate: false,
       allowModelNetwork: false,
     });
+    let cachedRequest: Parameters<ModelRuntime["streamSimple"]> | undefined;
+    const streamSimple = modelRuntime.streamSimple.bind(modelRuntime);
+    vi.spyOn(modelRuntime, "streamSimple").mockImplementation((...args) => {
+      cachedRequest = args;
+      return streamSimple(...args);
+    });
+    let registerTool: ((tool: ToolDefinition) => void) | undefined;
+    const editableTool: ToolDefinition = {
+      name: "inspect",
+      label: "Inspect",
+      description: "Inspect an offline path",
+      parameters: Type.Object({ path: Type.String() }),
+      execute: async () => ({ content: [{ type: "text", text: "Offline test" }], details: {} }),
+    };
     const actual = openaiCodexProvider();
     const provider: Provider = {
       ...actual,
@@ -98,7 +120,7 @@ async function sdkFixture() {
     modelRuntime.registerNativeProvider(provider);
     const open = async (manager: SessionManager) => {
       const settingsManager = SettingsManager.inMemory({
-        defaultTools: ["read", "codemode"],
+        defaultTools: ["read", "codemode", "inspect"],
         compaction: { enabled: false, reserveTokens: 16_384, keepRecentTokens: 6 },
         retry: { enabled: false },
       });
@@ -110,7 +132,11 @@ async function sdkFixture() {
         noPromptTemplates: true,
         noThemes: true,
         extensionFactories: [
-          createCodemodeExtension({ mode: "on" }),
+          createCodemodeExtension({ mode }),
+          (pi) => {
+            registerTool = (tool) => pi.registerTool(tool);
+            pi.registerTool(editableTool);
+          },
           createCodexCompactExtension({
             settingsRuntime: createCodexCompactSettingsRuntime(join(directory, "pi-codex-compact.json")),
             fetch,
@@ -137,7 +163,28 @@ async function sdkFixture() {
         throw error;
       }
     };
-    return { directory, requests, open, cleanup: () => rmSync(directory, { recursive: true, force: true }) };
+    return {
+      directory,
+      requests,
+      open,
+      replayCachedRequest: async () => {
+        assert.ok(cachedRequest);
+        const [cachedModel, cachedContext, options] = cachedRequest;
+        // CacheWarmer reuses the normal context and provider callbacks, but owns
+        // a fresh abort signal. Exercise that actual SDK callback path offline.
+        for await (const event of modelRuntime.streamSimple(cachedModel, cachedContext, {
+          ...options,
+          signal: new AbortController().signal,
+        })) {
+          assert.notEqual(event.type, "error", JSON.stringify(event));
+        }
+      },
+      changeDescription: () => {
+        assert.ok(registerTool);
+        registerTool({ ...editableTool, description: "A newly registered, unsent inspect description" });
+      },
+      cleanup: () => rmSync(directory, { recursive: true, force: true }),
+    };
   } catch (error) {
     rmSync(directory, { recursive: true, force: true });
     throw error;
@@ -204,3 +251,93 @@ test("SDK codemode request → remote compaction → persisted reload → opaque
     fixture.cleanup();
   }
 });
+
+test("SDK codemode-only hidden declarations use native compaction, never restore hidden tools remotely", async () => {
+  const fixture = await sdkFixture("only");
+  let session: AgentSession | undefined;
+  try {
+    const manager = SessionManager.create(fixture.directory, fixture.directory);
+    session = await fixture.open(manager);
+    await session.prompt(`First task. ${"Older conversation content. ".repeat(100)}`);
+    await session.prompt("Second task.");
+    const persisted = getCurrentTools(manager.buildSessionContext().messages);
+    assert.ok(persisted.some((tool) => tool.name === "read"));
+    assert.ok(Array.isArray(fixture.requests.at(-1)?.tools));
+    assert.equal(
+      fixture.requests.at(-1)?.tools.some((tool: JsonObject) => tool.name === "read"),
+      false,
+    );
+    const result = await session.compact();
+    assert.equal(parseCheckpointDetails(result.details), undefined);
+    assert.equal(
+      fixture.requests.some((request) => request.input.some((item: JsonObject) => item.type === "compaction_trigger")),
+      false,
+    );
+    assert.equal(session.getLastAssistantText(), "Done.");
+  } finally {
+    session?.dispose();
+    fixture.cleanup();
+  }
+});
+
+for (const change of ["registry description", "reload"] as const) {
+  test(`SDK cached provider callbacks cannot admit stale transformed tools after ${change}`, async () => {
+    const fixture = await sdkFixture();
+    let session: AgentSession | undefined;
+    try {
+      const manager = SessionManager.create(fixture.directory, fixture.directory);
+      session = await fixture.open(manager);
+      await session.prompt(`First task. ${"Older conversation content. ".repeat(100)}`);
+      await session.prompt("Second task.");
+      const recordedRead = getCurrentTools(manager.buildSessionContext().messages).find((tool) => tool.name === "read");
+      const rawRead = session.getAllTools().find((tool) => tool.name === "read");
+      assert.ok(recordedRead && rawRead);
+      assert.notEqual(recordedRead.description, rawRead.description);
+      if (change === "reload") {
+        await session.reload();
+      } else {
+        const recordedInspect = getCurrentTools(manager.buildSessionContext().messages).find(
+          (tool) => tool.name === "inspect",
+        );
+        assert.ok(recordedInspect);
+        fixture.changeDescription();
+        assert.equal(
+          session.getAllTools().find((tool) => tool.name === "inspect")?.description,
+          "A newly registered, unsent inspect description",
+        );
+        assert.equal(
+          getCurrentTools(manager.buildSessionContext().messages).find((tool) => tool.name === "inspect")?.description,
+          recordedInspect.description,
+        );
+        assert.equal(
+          getCurrentTools(manager.buildSessionContext().messages).find((tool) => tool.name === "read")?.description,
+          recordedRead.description,
+        );
+        assert.equal(
+          session.systemPrompt,
+          getCurrentSystemPrompt(manager.buildSessionContext().messages),
+          "preserve prompt contributions so the tool-state guard, not a prompt mismatch, must reject the edit",
+        );
+      }
+      await fixture.replayCachedRequest();
+      const result = await session.compact();
+      assert.equal(
+        parseCheckpointDetails(result.details),
+        undefined,
+        "cached callbacks must not establish fresh proof",
+      );
+      assert.equal(
+        fixture.requests.some((request) =>
+          request.input.some((item: JsonObject) => item.type === "compaction_trigger"),
+        ),
+        false,
+      );
+      await session.prompt("Fresh normal preparation establishes current declarations.");
+      const next = await session.compact();
+      assert.ok(parseCheckpointDetails(next.details), "a fresh unchanged normal request still supports Remote V2");
+    } finally {
+      session?.dispose();
+      fixture.cleanup();
+    }
+  });
+}

@@ -351,6 +351,7 @@ export class WorkflowEngine {
     private readonly journal: JournalWriter,
     private readonly readEntries: () => readonly SessionEntryLike[] = () => [],
     protocolGate?: () => Promise<ManagedProtocolCheck>,
+    private readonly cwd: string = process.cwd(),
   ) {
     this.protocolGate =
       protocolGate ??
@@ -1110,6 +1111,7 @@ export class WorkflowEngine {
 
     try {
       const result = await runWorkflow(script, {
+        cwd: this.cwd,
         args: options.args,
         agent: runner,
         mainModel: options.mainModel,

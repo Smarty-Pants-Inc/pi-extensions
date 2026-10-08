@@ -9,7 +9,13 @@
     "lifecycle": "stable"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.84.0 || ^0.85.0 || ^0.86.0 || ^0.87.0 || ^0.99.1"
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "dependencies": {
+    "proper-lockfile": "^4.1.2"
+  },
+  "devDependencies": {
+    "@types/proper-lockfile": "^4.1.4"
   },
   "pi": {
     "extensions": [

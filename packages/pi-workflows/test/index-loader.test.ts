@@ -1,3 +1,7 @@
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { ExtensionRunner } from "@earendil-works/pi-coding-agent";
 import {
   type ManagedRoutingPolicy,
@@ -9,6 +13,11 @@ import { describe, expect, it, vi } from "vitest";
 import { WORKFLOW_ARMED_DIRECTIVE } from "../src/arming.js";
 import { WorkflowEngine } from "../src/engine.js";
 import piWorkflows from "../src/index.js";
+
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return { ...actual, execFileSync: vi.fn(actual.execFileSync) };
+});
 
 // Deliberately none of the names the built-in workflows use: a host is free to
 // call its tiers whatever it likes, and a shipped command must still run.
@@ -151,6 +160,131 @@ function workflowTool(fixture: ReturnType<typeof createPi>): WorkflowTool {
 }
 
 describe("pi-workflows loader context isolation", () => {
+  it("binds every code-review git/gh discovery command to the command session cwd", async () => {
+    const root = mkdtempSync(join(tmpdir(), "workflows-review-cwd-"));
+    const a = join(root, "a");
+    const b = join(root, "b");
+    const originalCwd = process.cwd();
+    const { execFileSync: exec } = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+    const fixture = createPi(false);
+    try {
+      for (const cwd of [a, b]) {
+        mkdirSync(cwd);
+        exec("git", ["init", "--quiet"], { cwd });
+        writeFileSync(join(cwd, "review.txt"), "before\n");
+        exec("git", ["add", "."], { cwd });
+        exec("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "initial"], {
+          cwd,
+        });
+        writeFileSync(join(cwd, "review.txt"), cwd === a ? "process-only\n" : "session-only\n");
+      }
+      process.chdir(a);
+      const ctx = { ...fixture.ctx, cwd: b };
+      piWorkflows(fixture.pi as never);
+      await fixture.lifecycle.get("session_start")?.({}, ctx);
+      const start = vi.spyOn(WorkflowEngine.prototype, "start").mockResolvedValue({
+        runId: "scope-test",
+        status: "completed",
+        background: true,
+      });
+      const commands = vi.mocked(execFileSync).mockImplementation((file, args, options) => {
+        if (file === "gh") return "PR diff from session";
+        return exec(file, args, options);
+      });
+      const review = fixture.commandDefinitions.get("code-review") as {
+        handler: (args: string, ctx: unknown) => Promise<void>;
+      };
+      for (const scope of ["", "review.txt", "HEAD..HEAD", "123"]) await review.handler(scope, ctx);
+      // The empty range executes successfully but deliberately has no review to start.
+      expect(start.mock.calls.map(([, options]) => options?.args)).toEqual([
+        { diff: expect.stringContaining("session-only"), diffSource: "working tree vs HEAD" },
+        { diff: expect.stringContaining("session-only"), diffSource: "path review.txt" },
+        { diff: "PR diff from session", diffSource: "PR #123" },
+      ]);
+      expect(commands.mock.calls.map(([file]) => file)).toEqual(["git", "git", "git", "gh"]);
+      for (const [, , options] of commands.mock.calls) expect(options).toMatchObject({ cwd: b });
+      // An empty auto scope also invokes the unscoped fallback in the same cwd.
+      writeFileSync(join(b, "review.txt"), "before\n");
+      await review.handler("", ctx);
+      expect(commands.mock.calls.slice(-2).map(([, , options]) => options)).toEqual([
+        expect.objectContaining({ cwd: b }),
+        expect.objectContaining({ cwd: b }),
+      ]);
+    } finally {
+      await fixture.lifecycle.get("session_shutdown")?.({}, fixture.ctx);
+      process.chdir(originalCwd);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("captures script cwd at session start for initial, replay and nested executions", async () => {
+    const root = mkdtempSync(join(tmpdir(), "workflows-script-cwd-"));
+    const a = join(root, "a");
+    const b = join(root, "b");
+    mkdirSync(a);
+    mkdirSync(b);
+    const originalCwd = process.cwd();
+    const fixture = createPi(false);
+    try {
+      process.chdir(a);
+      const ctx = { ...fixture.ctx, cwd: b };
+      piWorkflows(fixture.pi as never);
+      await fixture.lifecycle.get("session_start")?.({}, ctx);
+      const child = 'export const meta = { name: "child-cwd", description: "test" }; return [cwd, process.cwd()];';
+      const script = `export const meta = { name: "session-cwd", description: "test" };
+return { local: [cwd, process.cwd()], nested: await workflow(${JSON.stringify(child)}) };`;
+      const first = await workflowTool(fixture).execute(
+        "initial",
+        { script, background: false },
+        undefined,
+        undefined,
+        ctx,
+      );
+      expect(first.details.status, JSON.stringify(first.content)).toBe("completed");
+      expect(JSON.parse(first.details.result ?? "null")).toEqual({ local: [b, b], nested: [b, b] });
+      const controller = new AbortController();
+      const dialog = vi.fn(() => new Promise<boolean>(() => {}));
+      const rpcCtx = { ...ctx, mode: "rpc", hasUI: true, ui: { ...ctx.ui, confirm: dialog } };
+      const pending = workflowTool(fixture).execute(
+        "retryable",
+        {
+          script: 'export const meta = { name: "retryable-cwd", description: "test" }; await checkpoint("wait");',
+          background: false,
+        },
+        controller.signal,
+        undefined,
+        rpcCtx,
+      );
+      await vi.waitFor(() => expect(dialog).toHaveBeenCalledOnce());
+      controller.abort();
+      const interrupted = await pending;
+      expect(interrupted.details.status).toBe("interrupted");
+      const resumed = await workflowTool(fixture).execute(
+        "replay",
+        {
+          script: script.replace(
+            "return { local:",
+            `const fresh = await workflow(${JSON.stringify(child)}); return { fresh, local:`,
+          ),
+          resumeFromRunId: interrupted.details.runId,
+          background: false,
+        },
+        undefined,
+        undefined,
+        ctx,
+      );
+      expect(resumed.details.status, JSON.stringify(resumed.content)).toBe("completed");
+      expect(fixture.entries.at(-1)).toMatchObject({
+        kind: "workflow_transition",
+        status: "completed",
+        finalResult: { fresh: [b, b], local: [b, b], nested: [b, b] },
+      });
+    } finally {
+      await fixture.lifecycle.get("session_shutdown")?.({}, fixture.ctx);
+      process.chdir(originalCwd);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
   for (const kind of ["confirm", "input", "select"] as const) {
     for (const action of ["tool-abort", "pause", "stop", "dispose", "fatal"] as const) {
       it(`${action} closes an unanswered ${kind} checkpoint and pairs Pi prompt lifecycle`, async () => {
@@ -410,6 +544,38 @@ describe("pi-workflows loader context isolation", () => {
 
     expect(result?.messages?.[0]?.content).toBe(`keep this\n\n${WORKFLOW_ARMED_DIRECTIVE}\nOther plugin guidance\n\n`);
     expect(result?.messages?.[1]?.content).toEqual([]);
+    await fixture.lifecycle.get("session_shutdown")?.({}, fixture.ctx);
+  });
+
+  it("deduplicates only its marker across text parts without joining or dropping images", async () => {
+    const fixture = createPi(false);
+    piWorkflows(fixture.pi as never);
+    await fixture.lifecycle.get("session_start")?.({}, fixture.ctx);
+    const image = { type: "image", mimeType: "image/png", data: "base64-image" };
+    const unrelated = "<system-reminder>Other plugin guidance</system-reminder>";
+    const parts = [
+      { type: "text", text: `first ${WORKFLOW_ARMED_DIRECTIVE} ${unrelated}` },
+      image,
+      { type: "text", text: `second ${WORKFLOW_ARMED_DIRECTIVE} ${unrelated} ${WORKFLOW_ARMED_DIRECTIVE}` },
+      { type: "text", text: WORKFLOW_ARMED_DIRECTIVE },
+    ];
+    const older = { role: "user", content: parts };
+    const result = (await fixture.lifecycle.get("context")?.(
+      { messages: [older, { role: "user", content: parts }] },
+      fixture.ctx,
+    )) as {
+      messages: Array<{ content: unknown }>;
+    };
+    expect(result.messages[0]).toBe(older);
+    expect(result.messages[1]?.content).toEqual([
+      parts[0],
+      image,
+      { type: "text", text: `second  ${unrelated} ` },
+      { type: "text", text: "" },
+    ]);
+    expect((result.messages[1]?.content as unknown[])?.[1]).toBe(image);
+    expect(parts[2]?.text).toContain(WORKFLOW_ARMED_DIRECTIVE);
+    expect(await fixture.lifecycle.get("context")?.({ messages: result.messages }, fixture.ctx)).toBeUndefined();
     await fixture.lifecycle.get("session_shutdown")?.({}, fixture.ctx);
   });
 

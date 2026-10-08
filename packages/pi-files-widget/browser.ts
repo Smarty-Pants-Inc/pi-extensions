@@ -29,6 +29,7 @@ export interface BrowserController {
   render(width: number): string[];
   handleInput(data: string): void;
   invalidate(): void;
+  dispose(): void;
 }
 
 interface BrowserStats {
@@ -139,9 +140,11 @@ function getPathInfoSync(path: string): { isDirectory: boolean; isSymlink: boole
 async function getPathInfo(
   path: string,
   isSymlink: boolean,
+  isCurrent: () => boolean,
 ): Promise<{ isDirectory: boolean; isSymlink: boolean; realPath?: string }> {
   try {
     const targetStat = await stat(path);
+    if (!isCurrent()) return { isDirectory: false, isSymlink };
     return {
       isDirectory: targetStat.isDirectory(),
       isSymlink,
@@ -324,6 +327,7 @@ export function createFileBrowser(
   // capture the value when they start and bail after each await if it changed,
   // so work belonging to an old root can never mutate state for the new one.
   let rootGeneration = 0;
+  let disposed = false;
 
   const normalizeGitPath = (path: string): string => path.split(sep).join("/");
 
@@ -333,7 +337,7 @@ export function createFileBrowser(
   }
 
   function queueLineCount(node: FileNode, force = false): void {
-    if (node.isDirectory) return;
+    if (disposed || node.isDirectory) return;
     if (!force && node.lineCount !== undefined) return;
     if (lineCountPending.has(node.path)) return;
     lineCountPending.add(node.path);
@@ -361,9 +365,10 @@ export function createFileBrowser(
     }
   }
 
-  async function updateLineCount(node: FileNode): Promise<void> {
+  async function updateLineCount(node: FileNode, generation: number): Promise<void> {
     try {
       const fileStat = await stat(node.path);
+      if (generation !== rootGeneration) return;
       if (fileStat.size > MAX_LINE_COUNT_BYTES) {
         node.lineCount = undefined;
         return;
@@ -374,24 +379,25 @@ export function createFileBrowser(
         return;
       }
       const content = await readFile(node.path, "utf-8");
+      if (generation !== rootGeneration) return;
       const count = content.split("\n").length;
       node.lineCount = count;
       lineCountCache.set(node.path, { size: fileStat.size, mtimeMs: fileStat.mtimeMs, count });
     } catch {
-      node.lineCount = undefined;
+      if (generation === rootGeneration) node.lineCount = undefined;
     }
   }
 
   async function processLineCountBatch(): Promise<void> {
     lineCountTimer = null;
-    if (!browser.root) return;
+    if (disposed || !browser.root) return;
     const generation = rootGeneration;
     const batch = lineCountQueue.splice(0, LINE_COUNT_BATCH_SIZE);
     if (batch.length === 0) return;
 
     await Promise.all(
       batch.map(async (node) => {
-        await updateLineCount(node);
+        await updateLineCount(node, generation);
         if (generation === rootGeneration) {
           lineCountPending.delete(node.path);
         }
@@ -444,7 +450,7 @@ export function createFileBrowser(
   }
 
   function enqueueScan(node: FileNode, depth: number, force = false): void {
-    if (depth > MAX_TREE_DEPTH) return;
+    if (disposed || depth > MAX_TREE_DEPTH) return;
     if (!force && browser.scanState.mode === "safe" && depth > 0) return;
     if ((node.children !== undefined && !incompleteDirectories.has(node)) || node.loading) return;
     if (scanQueued.has(node.path)) return;
@@ -510,7 +516,7 @@ export function createFileBrowser(
         }
 
         if (entry.isSymbolicLink()) {
-          const pathInfo = await getPathInfo(fullPath, true);
+          const pathInfo = await getPathInfo(fullPath, true, () => generation === rootGeneration);
           if (generation !== rootGeneration) return;
           if (pathInfo.isDirectory) {
             const isCycle = pathInfo.realPath ? hasAncestorRealPath(node, pathInfo.realPath) : false;
@@ -581,7 +587,7 @@ export function createFileBrowser(
 
   async function processScanBatch(): Promise<void> {
     scanTimer = null;
-    if (!browser.root) return;
+    if (disposed || !browser.root) return;
     const generation = rootGeneration;
     const batch = scanQueue.splice(0, getScanBatchSize());
     if (batch.length === 0) {
@@ -617,6 +623,20 @@ export function createFileBrowser(
       clearTimeout(scanTimer);
       scanTimer = null;
     }
+  }
+
+  function dispose(): void {
+    if (disposed) return;
+    disposed = true;
+    rootGeneration += 1;
+    stopBackgroundTasks();
+    scanQueue.length = 0;
+    scanQueued.clear();
+    lineCountQueue.length = 0;
+    lineCountPending.clear();
+    lineCountCache.clear();
+    textInput.reset();
+    viewer.close();
   }
 
   function applyAgentModified(): void {
@@ -1021,7 +1041,9 @@ export function createFileBrowser(
         changedIndicator;
     lines.push(truncateToWidth(help, width));
 
-    return lines;
+    // Every result and status row must fit, including empty-search text and
+    // position counters in very narrow viewports.
+    return lines.map((line) => truncateToWidth(line, width));
   }
 
   function handleViewerInput(data: string): void {
@@ -1046,8 +1068,7 @@ export function createFileBrowser(
     const maxIndex = Math.max(0, displayList.length - 1);
 
     if (matchesKey(data, "q") && !browser.searchMode) {
-      textInput.reset();
-      stopBackgroundTasks();
+      dispose();
       onClose();
       return;
     }
@@ -1057,8 +1078,7 @@ export function createFileBrowser(
         browser.searchQuery = "";
         textInput.reset();
       } else {
-        textInput.reset();
-        stopBackgroundTasks();
+        dispose();
         onClose();
       }
       return;
@@ -1171,6 +1191,8 @@ export function createFileBrowser(
 
   return {
     render(width: number): string[] {
+      if (disposed) return [];
+      width = Math.max(1, width);
       const now = Date.now();
       if (now - browser.lastPollTime > POLL_INTERVAL_MS) {
         browser.lastPollTime = now;
@@ -1185,6 +1207,7 @@ export function createFileBrowser(
     },
 
     handleInput(data: string): void {
+      if (disposed) return;
       if (viewer.isOpen()) {
         handleViewerInput(data);
       } else {
@@ -1193,5 +1216,6 @@ export function createFileBrowser(
     },
 
     invalidate(): void {},
+    dispose,
   };
 }

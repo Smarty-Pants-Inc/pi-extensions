@@ -25,6 +25,10 @@ interface ActiveRun {
   skills: SkillActivationRecord[];
   skillIndexes: Map<string, number>;
   providerErrors: ProviderErrorRecord[];
+  terminalOutcome?: GenerationOutcome;
+  responseCount: number;
+  successfulResponses: number[];
+  errorResponses: Map<string, number>;
 }
 
 export class ResponseCollector {
@@ -36,6 +40,18 @@ export class ResponseCollector {
 
   getActiveRunId(): string | undefined {
     return this.active?.id;
+  }
+
+  hasPendingGeneration(): boolean {
+    return this.latestGeneration()?.outcome === "pending";
+  }
+
+  beginTurn(now: number): void {
+    const generation = this.latestGeneration();
+    if (generation?.outcome !== "pending") return;
+    generation.outcome = "interrupted";
+    generation.finishedAtMs = now;
+    generation.durationMs = elapsed(generation.startedAtMs, now);
   }
 
   begin(input: {
@@ -58,6 +74,9 @@ export class ResponseCollector {
       skills: [],
       skillIndexes: new Map(),
       providerErrors: [],
+      responseCount: 0,
+      successfulResponses: [],
+      errorResponses: new Map(),
     };
     return interrupted;
   }
@@ -69,6 +88,7 @@ export class ResponseCollector {
   beginGeneration(input: { id: string; now: number; model?: ModelIdentity }): void {
     const active = this.active;
     if (!active || active.generationIds.has(input.id)) return;
+    active.terminalOutcome = undefined;
     active.generationIds.add(input.id);
     active.generations.push({
       id: input.id,
@@ -92,21 +112,36 @@ export class ResponseCollector {
     });
   }
 
-  finishGeneration(input: { now: number; stopReason: string; errorMessage?: string }): void {
+  finishGeneration(input: { now: number; stopReason: string; errorMessage?: string; model?: ModelIdentity }): void {
     const active = this.active;
-    const generation = this.latestGeneration();
-    if (!active || !generation || generation.outcome !== "pending") return;
-    generation.finishedAtMs = input.now;
-    generation.durationMs = elapsed(generation.startedAtMs, input.now);
-    generation.stopReason = input.stopReason;
-    generation.outcome = generationOutcome(input.stopReason);
-    if (generation.outcome === "error") {
+    if (!active) return;
+    // A virtual route can fail before any provider request exists. Preserve the
+    // assistant outcome without inventing a generation or reusing the last one.
+    const latest = this.latestGeneration();
+    const generation = latest?.outcome === "pending" ? latest : undefined;
+    const outcome = generationOutcome(input.stopReason);
+    const responseOrdinal = active.responseCount++;
+    active.terminalOutcome = outcome;
+    if (outcome === "stop" || outcome === "tool_use") active.successfulResponses.push(responseOrdinal);
+    if (generation) {
+      generation.finishedAtMs = input.now;
+      generation.durationMs = elapsed(generation.startedAtMs, input.now);
+      generation.stopReason = input.stopReason;
+      generation.outcome = outcome;
+      generation.provider = input.model?.provider;
+      generation.model = input.model?.model;
+      generation.thinkingLevel = input.model?.thinkingLevel;
+    }
+    if (outcome === "error") {
+      const id = randomUUID();
+      active.errorResponses.set(id, responseOrdinal);
       active.providerErrors.push({
-        id: randomUUID(),
-        generationId: generation.id,
+        id,
+        generationId: generation?.id,
         occurredAtMs: input.now,
-        provider: generation.provider,
-        model: generation.model,
+        provider: generation ? input.model?.provider : undefined,
+        model: generation ? input.model?.model : undefined,
+        thinkingLevel: generation ? input.model?.thinkingLevel : undefined,
         category: classifyProviderError(input.errorMessage),
         recovered: false,
         terminal: true,
@@ -124,6 +159,7 @@ export class ResponseCollector {
       name: input.name,
       provider: input.model?.provider,
       model: input.model?.model,
+      thinkingLevel: input.model?.thinkingLevel,
       startedAtMs: input.now,
       isError: false,
       completionState: "running",
@@ -150,6 +186,7 @@ export class ResponseCollector {
         existing.occurredAtMs = input.now;
         existing.provider = input.model?.provider;
         existing.model = input.model?.model;
+        existing.thinkingLevel = input.model?.thinkingLevel;
       }
       return;
     }
@@ -161,6 +198,7 @@ export class ResponseCollector {
       occurredAtMs: input.now,
       provider: input.model?.provider,
       model: input.model?.model,
+      thinkingLevel: input.model?.thinkingLevel,
     });
   }
 
@@ -214,15 +252,16 @@ export class ResponseCollector {
       }
     }
     for (const error of active.providerErrors) {
-      const generationIndex = active.generations.findIndex(({ id }) => id === error.generationId);
-      error.recovered = [...successfulGenerationIndexes].some((index) => index > generationIndex);
+      const responseOrdinal = active.errorResponses.get(error.id) ?? active.responseCount;
+      error.recovered = active.successfulResponses.some((ordinal) => ordinal > responseOrdinal);
       error.terminal = !error.recovered;
     }
 
     const recoveredGenerationErrors = active.providerErrors.filter(({ recovered }) => recovered).length;
     const providerErrorCount = httpErrors + active.providerErrors.length;
     const recoveredErrorCount = recoveredHttpErrors + recoveredGenerationErrors;
-    const outcome = forcedOutcome ?? deriveOutcome(active.generations, providerErrorCount);
+    const outcome =
+      forcedOutcome ?? deriveOutcome(active.terminalOutcome ?? active.generations.at(-1)?.outcome, providerErrorCount);
 
     return {
       id: active.id,
@@ -270,10 +309,9 @@ function isSuccessfulGeneration(generation: GenerationRecord): boolean {
   return generation.outcome === "stop" || generation.outcome === "tool_use";
 }
 
-function deriveOutcome(generations: readonly GenerationRecord[], providerErrors: number): RunOutcome {
-  const last = generations.at(-1);
+function deriveOutcome(last: GenerationOutcome | undefined, providerErrors: number): RunOutcome {
   if (!last) return providerErrors > 0 ? "error" : "success";
-  switch (last.outcome) {
+  switch (last) {
     case "stop":
     case "tool_use":
       return providerErrors > 0 ? "recovered_success" : "success";

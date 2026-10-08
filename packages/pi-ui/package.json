@@ -38,15 +38,15 @@
     "lint": "biome check src/ test/ --error-on-warnings"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.84.0 || ^0.85.0 || ^0.86.0 || ^0.87.0 || ^0.99.1",
-    "@earendil-works/pi-tui": "^0.84.0 || ^0.85.0 || ^0.86.0 || ^0.87.0 || ^0.99.1"
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.7",
-    "@earendil-works/pi-coding-agent": "0.99.1",
-    "@earendil-works/pi-tui": "0.99.1",
+    "@earendil-works/pi-coding-agent": "1.0.4",
+    "@earendil-works/pi-tui": "1.0.4",
     "typescript": "7.0.2",
-    "vitest": "4.0.18"
+    "vitest": "4.1.11"
   },
   "publishConfig": {
     "access": "public"

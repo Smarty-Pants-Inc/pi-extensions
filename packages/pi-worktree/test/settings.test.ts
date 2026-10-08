@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, posix, win32 } from "node:path";
 import { test } from "vitest";
@@ -211,6 +211,100 @@ test("runtime serializes saves in invocation order and remains usable after queu
     });
   } finally {
     releaseFirst();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test.each(["before write", "during write"])("cancellation %s preserves settings before publication", async (phase) => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-worktree-settings-cancel-"));
+  const settingsPath = join(directory, "pi-worktree.json");
+  const original = '{"worktreeRoot":"/srv/old","future":true}\n';
+  const controller = new AbortController();
+  const entered = Promise.withResolvers<void>();
+  const finishWrite = Promise.withResolvers<void>();
+  let renames = 0;
+  let writes = 0;
+  try {
+    await writeFile(settingsPath, original);
+    const runtime = createWorktreeSettingsRuntime({
+      path: settingsPath,
+      home: "/home/alice",
+      platform: "linux",
+      operations: {
+        write: async (path, data) => {
+          writes++;
+          entered.resolve();
+          await finishWrite.promise;
+          await writeFile(path, data, { flag: "wx" });
+        },
+        rename: async (source, destination) => {
+          renames++;
+          await rename(source, destination);
+        },
+      },
+    });
+    await runtime.reload();
+    const before = runtime.get();
+    if (phase === "before write") controller.abort();
+    const pending = runtime.save("/srv/new", controller.signal);
+    const rejected = assert.rejects(pending, /abort/i);
+    if (phase === "during write") {
+      await entered.promise;
+      controller.abort();
+      finishWrite.resolve();
+    }
+    await rejected;
+    await runtime.flush?.();
+    assert.equal(writes, phase === "before write" ? 0 : 1);
+    assert.equal(renames, 0);
+    assert.deepEqual(runtime.get(), before);
+    assert.equal(await readFile(settingsPath, "utf8"), original);
+    assert.deepEqual(await readdir(directory), ["pi-worktree.json"]);
+  } finally {
+    finishWrite.resolve();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test.each(["/srv/new", undefined])("cancellation during successful rename commits settings %j", async (root) => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-worktree-settings-publish-cancel-"));
+  const settingsPath = join(directory, "pi-worktree.json");
+  const controller = new AbortController();
+  const entered = Promise.withResolvers<void>();
+  const publish = Promise.withResolvers<void>();
+  try {
+    await writeFile(settingsPath, '{"worktreeRoot":"/srv/old","future":true}\n');
+    const runtime = createWorktreeSettingsRuntime({
+      path: settingsPath,
+      home: "/home/alice",
+      platform: "linux",
+      operations: {
+        rename: async (source, destination) => {
+          entered.resolve();
+          await publish.promise;
+          await rename(source, destination);
+        },
+      },
+    });
+    await runtime.reload();
+    const pending = runtime.save(root, controller.signal);
+    await entered.promise;
+    controller.abort();
+    assert.equal(runtime.get().effectiveRoot, "/srv/old");
+    publish.resolve();
+    const updated = await pending;
+    await runtime.flush?.();
+    assert.deepEqual(updated, runtime.get());
+    assert.equal(updated.effectiveRoot, root ?? "/home/alice/.worktrees");
+    assert.equal(updated.source, root ? "user" : "default");
+    assert.equal(updated.configuredRoot, root);
+    assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
+      ...(root ? { worktreeRoot: root } : {}),
+      future: true,
+    });
+    assert.deepEqual(await readdir(directory), ["pi-worktree.json"]);
+  } finally {
+    publish.resolve();
     await rm(directory, { recursive: true, force: true });
   }
 });

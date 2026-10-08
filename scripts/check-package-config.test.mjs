@@ -10,6 +10,13 @@ import { validatePackageConfig } from "./check-package-config.mjs";
 import { extractTarball, validatePackagedDocs } from "./pack-packages.mjs";
 
 const tempRoots = [];
+const PI_HOST_DEPENDENCIES = [
+  "@earendil-works/pi-ai",
+  "@earendil-works/pi-agent-core",
+  "@earendil-works/pi-coding-agent",
+  "@earendil-works/pi-tui",
+];
+const HOST_DEPENDENCIES = [...PI_HOST_DEPENDENCIES, "typebox", "@sinclair/typebox"];
 
 afterEach(() => {
   for (const root of tempRoots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -19,8 +26,8 @@ function makeFixture(
   check = "bun run lint && bun run typecheck && bun run test",
   directory = "pi-demo",
   packageName = `@signalridge/${directory}`,
-  peerDependencies = { "@earendil-works/pi-coding-agent": "^0.84.0 || ^0.85.0" },
-  rootManifest = { devDependencies: { "@earendil-works/pi-coding-agent": "0.85.1" } },
+  peerDependencies = { "@earendil-works/pi-coding-agent": "*" },
+  rootManifest = { devDependencies: { "@earendil-works/pi-coding-agent": "1.0.4" } },
 ) {
   const root = mkdtempSync(join(tmpdir(), "pi-package-config-"));
   tempRoots.push(root);
@@ -44,7 +51,7 @@ function makeFixture(
         piExtension: { lifecycle: "stable" },
         repository: { directory: `packages/${directory}` },
         publishConfig: { access: "public" },
-        files: ["CHANGELOG.md"],
+        files: ["CHANGELOG.md", "src"],
         scripts: {
           lint: "biome check .",
           typecheck: "tsc --noEmit",
@@ -60,6 +67,18 @@ function makeFixture(
   return root;
 }
 
+function updateFixtureManifest(root, changes) {
+  const path = join(root, "packages", "pi-demo", "package.json");
+  const manifest = JSON.parse(readFileSync(path, "utf8"));
+  writeFileSync(path, JSON.stringify({ ...manifest, ...changes }));
+}
+
+function writeFixtureSource(root, source, path = "src/index.ts") {
+  const absolute = join(root, "packages", "pi-demo", path);
+  mkdirSync(join(absolute, ".."), { recursive: true });
+  writeFileSync(absolute, source);
+}
+
 describe("check-package-config", () => {
   it("keeps Changesets updating ordinary internal dependency ranges", () => {
     const config = JSON.parse(readFileSync(new URL("../.changeset/config.json", import.meta.url), "utf8"));
@@ -69,22 +88,49 @@ describe("check-package-config", () => {
     assert.equal(validatePackageConfig(makeFixture()), 1);
   });
 
-  it("accepts a union retaining Pi 0.84 support and admitting tested Pi 0.85.1", () => {
-    assert.equal(validatePackageConfig(makeFixture()), 1);
+  it("accepts host-owned Pi peers while testing an exact Pi 1.0.4 baseline", () => {
+    const root = makeFixture();
+    updateFixtureManifest(root, { devDependencies: { "@earendil-works/pi-coding-agent": "1.0.4" } });
+    writeFixtureSource(root, 'import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";');
+    assert.equal(validatePackageConfig(root), 1);
   });
 
-  it("rejects a zero-major caret excluding the root-tested Pi version", () => {
-    const root = makeFixture(undefined, undefined, undefined, { "@earendil-works/pi-coding-agent": "^0.84.0" });
-    assert.throws(
-      () => validatePackageConfig(root),
-      /packages\/pi-demo\/package.json peerDependencies\[@earendil-works\/pi-coding-agent\].*excludes root-tested Pi 0\.85\.1/,
-    );
-  });
-
-  for (const range of ["not-semver", 85]) {
-    it(`rejects an invalid Pi peer range: ${JSON.stringify(range)}`, () => {
+  for (const range of ["^0.84.0", "^0.84.0 || ^0.85.0 || ^1.0.4", "^1.0.4", "1.0.4", ">=0", "not-semver", 85]) {
+    it(`rejects a Pi peer range other than literal "*": ${JSON.stringify(range)}`, () => {
       const root = makeFixture(undefined, undefined, undefined, { "@earendil-works/pi-coding-agent": range });
-      assert.throws(() => validatePackageConfig(root), /pi-coding-agent\].*invalid range.*valid semver peer range/);
+      assert.throws(
+        () => validatePackageConfig(root),
+        /packages\/pi-demo\/package.json peerDependencies\[@earendil-works\/pi-coding-agent\].*must use "\*" for host module ownership/,
+      );
+    });
+  }
+
+  for (const dependency of HOST_DEPENDENCIES) {
+    for (const section of ["dependencies", "optionalDependencies"]) {
+      it(`rejects host-provided ${dependency} in ${section}, even with a peer declaration`, () => {
+        const root = makeFixture();
+        updateFixtureManifest(root, {
+          peerDependencies: { [dependency]: "*" },
+          [section]: { [dependency]: "*" },
+        });
+        assert.throws(() => validatePackageConfig(root), /is host-provided; declare it only in peerDependencies/);
+      });
+    }
+    it(`requires a literal star peer for ${dependency}`, () => {
+      const root = makeFixture(undefined, undefined, undefined, { [dependency]: "^1.0.4" });
+      assert.throws(() => validatePackageConfig(root), /must use "\*" for host module ownership/);
+    });
+    it(`accepts a star peer for ${dependency}`, () => {
+      const root = makeFixture(
+        undefined,
+        undefined,
+        undefined,
+        { [dependency]: "*" },
+        {
+          devDependencies: Object.fromEntries(PI_HOST_DEPENDENCIES.map((name) => [name, "1.0.4"])),
+        },
+      );
+      assert.equal(validatePackageConfig(root), 1);
     });
   }
 
@@ -96,7 +142,7 @@ describe("check-package-config", () => {
     );
   });
 
-  for (const pin of ["^0.85.1", "latest", 85]) {
+  for (const pin of ["^1.0.4", "latest", 104]) {
     it(`rejects a non-exact tested Pi pin: ${JSON.stringify(pin)}`, () => {
       const root = makeFixture(undefined, undefined, undefined, undefined, {
         devDependencies: { "@earendil-works/pi-coding-agent": pin },
@@ -107,10 +153,127 @@ describe("check-package-config", () => {
 
   it("checks each Pi peer against its corresponding root dependency, not just coding-agent", () => {
     const root = makeFixture(undefined, undefined, undefined, {
-      "@earendil-works/pi-coding-agent": "^0.85.0",
-      "@earendil-works/pi-tui": "^0.85.0",
+      "@earendil-works/pi-coding-agent": "*",
+      "@earendil-works/pi-tui": "*",
     });
     assert.throws(() => validatePackageConfig(root), /devDependencies\[@earendil-works\/pi-tui\].*missing/);
+  });
+
+  for (const dependency of PI_HOST_DEPENDENCIES) {
+    for (const pin of ["0.99.1", "^1.0.4", "latest", 104]) {
+      it(`rejects ${dependency} dev pin ${JSON.stringify(pin)} instead of the exact root pin`, () => {
+        const root = makeFixture(
+          undefined,
+          undefined,
+          undefined,
+          { [dependency]: "*" },
+          {
+            devDependencies: { [dependency]: "1.0.4" },
+          },
+        );
+        updateFixtureManifest(root, { devDependencies: { [dependency]: pin } });
+        assert.throws(() => validatePackageConfig(root), /must match the exact root-tested Pi pin 1\.0\.4/);
+      });
+    }
+  }
+
+  it("checks Pi dev pins even without a peer declaration for test-only dependencies", () => {
+    const root = makeFixture(undefined, undefined, undefined, {});
+    updateFixtureManifest(root, { devDependencies: { "@earendil-works/pi-coding-agent": "0.99.1" } });
+    assert.throws(() => validatePackageConfig(root), /must match the exact root-tested Pi pin/);
+  });
+
+  it("requires an exact root baseline for Pi dev-only dependencies too", () => {
+    const root = makeFixture(undefined, undefined, undefined, {}, {});
+    updateFixtureManifest(root, { devDependencies: { "@earendil-works/pi-tui": "1.0.4" } });
+    assert.throws(() => validatePackageConfig(root), /needs an exact tested version.*pi-tui.*missing/);
+  });
+
+  it("does not impose exact Pi pin rules on modern or legacy TypeBox devDependencies", () => {
+    const root = makeFixture(
+      undefined,
+      undefined,
+      undefined,
+      { typebox: "*", "@sinclair/typebox": "*" },
+      {
+        devDependencies: { typebox: "1.3.27", "@sinclair/typebox": "^0.34.49" },
+      },
+    );
+    updateFixtureManifest(root, { devDependencies: { typebox: "1.3.11", "@sinclair/typebox": "^0.34.50" } });
+    assert.equal(validatePackageConfig(root), 1);
+  });
+
+  for (const dependency of HOST_DEPENDENCIES) {
+    it(`rejects a missing peer for a published source import of ${dependency}`, () => {
+      const root = makeFixture();
+      writeFixtureSource(root, `import { value } from "${dependency}";`, "src/nested/helper.ts");
+      updateFixtureManifest(root, { peerDependencies: {} });
+      assert.throws(
+        () => validatePackageConfig(root),
+        /src\/nested\/helper\.ts imports host-provided.*declare peerDependencies/,
+      );
+    });
+  }
+
+  for (const source of [
+    'import "typebox";',
+    'import type { TSchema } from "typebox";',
+    'export { Type } from "typebox";',
+    'export * from "typebox";',
+    'const schema = import("typebox");',
+    'const schema = require("typebox");',
+    'type Schema = import("typebox").TSchema;',
+    'import schema = require("typebox");',
+    'import { Type } from "typebox/type";',
+  ]) {
+    it(`detects published host references: ${source}`, () => {
+      const root = makeFixture();
+      writeFixtureSource(root, source);
+      assert.throws(() => validatePackageConfig(root), /imports host-provided typebox/);
+    });
+  }
+
+  it("accepts declared host peers for published source imports", () => {
+    const root = makeFixture(undefined, undefined, undefined, { typebox: "*" }, {});
+    writeFixtureSource(root, 'import { Type } from "typebox/type";');
+    assert.equal(validatePackageConfig(root), 1);
+  });
+
+  it("checks published library imports as well as extension imports", () => {
+    const root = makeFixture();
+    updateFixtureManifest(root, { signalridgePackage: { kind: "library" }, pi: undefined, piExtension: undefined });
+    writeFixtureSource(root, 'export type { TSchema } from "typebox";');
+    assert.throws(() => validatePackageConfig(root), /imports host-provided typebox/);
+  });
+
+  it("checks top-level published source globs", () => {
+    const root = makeFixture();
+    updateFixtureManifest(root, { files: ["CHANGELOG.md", "*.ts"] });
+    writeFixtureSource(root, 'import "typebox";', "extension.ts");
+    assert.throws(() => validatePackageConfig(root), /extension\.ts imports host-provided typebox/);
+  });
+
+  it("ignores unpublished test sources, excluded sources, and installed dependencies", () => {
+    const root = makeFixture();
+    updateFixtureManifest(root, { files: ["CHANGELOG.md", "src", "!src/excluded"] });
+    for (const path of ["test/example.ts", "src/excluded/example.ts", "node_modules/dep/index.js"]) {
+      writeFixtureSource(root, 'import "typebox";', path);
+    }
+    assert.equal(validatePackageConfig(root), 1);
+  });
+
+  it("does not mistake comments, strings, or host-like names for host imports", () => {
+    const root = makeFixture();
+    writeFixtureSource(
+      root,
+      [
+        '// import "typebox";',
+        "const example = 'import \"typebox\";';",
+        'import "typebox-helper";',
+        'import "@earendil-works/pi-client";',
+      ].join("\n"),
+    );
+    assert.equal(validatePackageConfig(root), 1);
   });
 
   it("does not require root test pins for non-Pi peers", () => {

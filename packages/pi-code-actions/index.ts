@@ -92,9 +92,43 @@ function collectSnippets(
 }
 
 export default function codeActionsExtension(pi: ExtensionAPI) {
+  let owner: { sessionId: string; leafId: string | null; controller: AbortController } | undefined;
+  let stopped = false;
+  const retire = () => {
+    const previous = owner;
+    owner = undefined;
+    previous?.controller.abort();
+  };
+  pi.on("session_before_switch", retire);
+  pi.on("session_before_fork", retire);
+  pi.on("session_before_tree", retire);
+  pi.on("session_start", () => {
+    retire();
+    stopped = false;
+  });
+  pi.on("session_tree", retire);
+  pi.on("session_shutdown", () => {
+    stopped = true;
+    retire();
+  });
+
   pi.registerCommand("code", {
     description: "Pick code from assistant messages and copy/insert/run it",
     handler: async (args, ctx) => {
+      if (stopped) return;
+      const sessionId = ctx.sessionManager.getSessionId();
+      const leafId = ctx.sessionManager.getLeafId();
+      if (!owner || owner.sessionId !== sessionId || owner.leafId !== leafId) {
+        retire();
+        owner = { sessionId, leafId, controller: new AbortController() };
+      }
+      const captured = owner;
+      // Only plain captured state is consulted after awaits: retired contexts may throw on access.
+      const operation = {
+        signal: captured.controller.signal,
+        isCurrent: () => owner === captured && !captured.controller.signal.aborted,
+      };
+
       if (!ctx.hasUI && (!args || args.trim().length === 0)) {
         return;
       }
@@ -121,8 +155,8 @@ export default function codeActionsExtension(pi: ExtensionAPI) {
             ctx.ui.notify("The /code picker requires TUI mode. Supply an index and action instead.", "warning");
           return;
         }
-        const result = await pickSnippet(ctx, snippets);
-        if (!result) return;
+        const result = await pickSnippet(ctx, snippets, operation);
+        if (!operation.isCurrent() || !result) return;
         snippet = result.snippet;
         pickedAction = result.action;
       }
@@ -130,12 +164,13 @@ export default function codeActionsExtension(pi: ExtensionAPI) {
       let action = parsed.action ?? pickedAction;
       if (!action) {
         if (!ctx.hasUI) return;
-        action = await pickAction(ctx);
+        action = await pickAction(ctx, operation);
       }
-      if (!action) return;
+      if (!operation.isCurrent() || !action) return;
 
       if (action === "copy") {
-        const ok = await copyToClipboard(pi, snippet.content);
+        const ok = await copyToClipboard(pi, snippet.content, operation);
+        if (!operation.isCurrent()) return;
         if (ctx.hasUI) {
           ctx.ui.notify(ok ? "Copied to clipboard." : "Failed to copy to clipboard.", ok ? "info" : "error");
         }
@@ -144,16 +179,19 @@ export default function codeActionsExtension(pi: ExtensionAPI) {
 
       if (action === "insert") {
         if (!ctx.hasUI) return;
-        insertIntoEditor(ctx, snippet.content);
+        const inserted = await insertIntoEditor(ctx, snippet.content, operation);
+        if (!operation.isCurrent() || !inserted) return;
         ctx.ui.notify("Inserted snippet into editor.", "info");
         return;
       }
 
       if (action === "run") {
         if (!ctx.hasUI) return;
-        const ok = await ctx.ui.confirm("Run snippet?", "This will execute the selected snippet in your shell.");
-        if (!ok) return;
-        await runSnippet(pi, ctx, snippet.content);
+        const ok = await ctx.ui.confirm("Run snippet?", "This will execute the selected snippet in your shell.", {
+          signal: operation.signal,
+        });
+        if (!operation.isCurrent() || !ok) return;
+        await runSnippet(pi, ctx, snippet.content, operation);
       }
     },
   });

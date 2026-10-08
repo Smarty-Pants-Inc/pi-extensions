@@ -46,7 +46,7 @@ function driver(script: Array<{ pick?: number; back?: true; cancel?: true; custo
         }
         return options[(action.pick ?? 1) - 1];
       },
-      editor: async () => pendingCustom,
+      input: async () => pendingCustom,
     },
   } as never;
 
