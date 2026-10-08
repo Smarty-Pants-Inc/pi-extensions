@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.4.4
+### Patch Changes
+
+- 3364cc0: Use patched Vitest 4.1.11 for development and regression testing without moving to a new major version. Refresh compatible transitive dependencies to include fixed source-map and brace-expansion releases.
+- 3364cc0: Adopt Pi 1.0.4's host-provided dependency contract: declare imported Pi and TypeBox modules as `*` peers rather than installing duplicate runtime modules, and align Pi development pins with the repository's tested 1.0.4 baseline. The wildcard identifies host module ownership; it does not promise compatibility with every Pi version.
+- 3364cc0: Cancel credential loaders, settings dialogs, and worktree operations when their owning session or branch retires, and ignore late results. Include boundary-generated usage receipts in statusline polling, mark only subscription-backed OAuth costs, and report headless worktree rejection on stderr.
+- 3364cc0: Keep runtime settings synchronized after successful atomic publication even when the command owner retires. Preserve sanitized recovery diagnostics for retained worktrees and uncertain metadata removal outcomes after cancellation, without notifying obsolete UI contexts or attempting to restore committed Git registrations.
+- Updated dependencies [3364cc0]
+- Updated dependencies [3364cc0]
+- Updated dependencies [3364cc0]
+  - @signalridge/pi-ui@1.3.3
+
 ## 1.4.3
 ### Patch Changes
 

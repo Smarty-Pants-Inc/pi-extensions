@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.4.3
+### Patch Changes
+
+- 3364cc0: Adopt Pi 1.0.4's host-provided dependency contract: declare imported Pi and TypeBox modules as `*` peers rather than installing duplicate runtime modules, and align Pi development pins with the repository's tested 1.0.4 baseline. The wildcard identifies host module ownership; it does not promise compatibility with every Pi version.
+- 3364cc0: Freeze planning tool permissions across late registrations and nested calls, restore branch-local state on committed tree navigation, cancel pending questions with their owning workflow, and keep completion model-only. Guard captured shortcut handlers until reload and remove unused fresh-session parent snapshots after vetoes or pre-replacement failures.
+- 3364cc0: Preserve canonical transcript-restored target tools, including empty loadouts, during tree navigation before applying branch-local planning restrictions. Retain in-memory parent snapshots once fresh-session setup begins so failures after destination commit remain resumable, while pre-commit failures still clean up.
+- Updated dependencies [3364cc0]
+- Updated dependencies [3364cc0]
+- Updated dependencies [3364cc0]
+  - @signalridge/pi-ui@1.3.3
+
 ## 1.4.2
 ### Patch Changes
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.8
+### Patch Changes
+
+- 3364cc0: Include credential resolution in the Codex compaction deadline and promptly stop waiting on cancellation without interrupting host-owned token persistence. Preserve configured-package inventory for default-autoload exclusion-only resource filters.
+- 3364cc0: Align guidance deduplication and setup profiles with host context selection. Render live welcome inventory after resource binding, restore cards from active branch facts after compaction, and use trust-resolved package and compaction settings. Keep Herdr idle during cache warming, validate blocked notifications, and allocate polling only for active TUI sessions.
+- 3364cc0: Adopt Pi 1.0.4's host-provided dependency contract: declare imported Pi and TypeBox modules as `*` peers rather than installing duplicate runtime modules, and align Pi development pins with the repository's tested 1.0.4 baseline. The wildcard identifies host module ownership; it does not promise compatibility with every Pi version.
+
 ## 1.3.7
 ### Patch Changes
 

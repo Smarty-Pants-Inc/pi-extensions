@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.3
+### Patch Changes
+
+- 3364cc0: Use patched Vitest 4.1.11 for development and regression testing without moving to a new major version. Refresh compatible transitive dependencies to include fixed source-map and brace-expansion releases.
+- 3364cc0: Adopt Pi 1.0.4's host-provided dependency contract: declare imported Pi and TypeBox modules as `*` peers rather than installing duplicate runtime modules, and align Pi development pins with the repository's tested 1.0.4 baseline. The wildcard identifies host module ownership; it does not promise compatibility with every Pi version.
+- 3364cc0: Preserve native descendant keyboard focus and custom overlay widths. Keep question frames and active controls within the terminal viewport, and distinguish RPC actions from duplicate or reserved option labels. Bound file-browser rows and dispose browser work and polling when interactions close or the session shuts down, without clearing badges on a vetoed session switch.
+
 ## 1.3.2
 ### Patch Changes
 

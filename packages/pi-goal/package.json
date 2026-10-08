@@ -1,6 +1,6 @@
 {
   "name": "@signalridge/pi-goal",
-  "version": "1.4.4",
+  "version": "1.4.5",
   "description": "Pi extension for autonomous /goal completion with opt-in experimental ordered queues.",
   "type": "module",
   "license": "MIT",
@@ -51,7 +51,7 @@
   },
   "dependencies": {
     "@narumitw/pi-tui-kit": "^0.54.0",
-    "@signalridge/pi-ui": "^1.3.2"
+    "@signalridge/pi-ui": "^1.3.3"
   },
   "repository": {
     "type": "git",
