@@ -1,6 +1,6 @@
 {
   "name": "@signalridge/pi-workflows",
-  "version": "1.7.4",
+  "version": "1.7.5",
   "description": "Deterministic JavaScript orchestration workflows backed by pi-subagents managed spawning.",
   "type": "module",
   "license": "MIT",
@@ -21,7 +21,7 @@
     "@sinclair/typebox": "*"
   },
   "dependencies": {
-    "@signalridge/pi-subagents-protocol": "^1.5.0",
+    "@signalridge/pi-subagents-protocol": "^1.5.1",
     "acorn": "^8.16.0"
   },
   "pi": {

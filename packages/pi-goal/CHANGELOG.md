@@ -1,5 +1,17 @@
 # @signalridge/pi-goal
 
+## 1.4.5
+### Patch Changes
+
+- 3364cc0: Adopt Pi 1.0.4's host-provided dependency contract: declare imported Pi and TypeBox modules as `*` peers rather than installing duplicate runtime modules, and align Pi development pins with the repository's tested 1.0.4 baseline. The wildcard identifies host module ownership; it does not promise compatibility with every Pi version.
+- 3364cc0: Keep Goal terminal tools directly declared but unavailable to nested execution, where termination is not propagated. Verify direct termination and settlement-gated queue advancement against the installed Pi 1.0.4 host and codemode.
+  
+  Translate Pi exec results into the existing gate executor contract, failing killed commands even when their code is zero and enabling successful git fingerprint inspection. Exercise real-SDK exposure, nested approval, policy, and navigation regressions on Pi 1.0.4 instead of skipping them.
+- Updated dependencies [3364cc0]
+- Updated dependencies [3364cc0]
+- Updated dependencies [3364cc0]
+  - @signalridge/pi-ui@1.3.3
+
 ## 1.4.4
 ### Patch Changes
 
