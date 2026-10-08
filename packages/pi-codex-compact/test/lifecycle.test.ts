@@ -10,6 +10,7 @@ import {
   type Model,
   type OpenAICodexResponsesOptions,
   type Provider,
+  type Tool,
   Type,
 } from "@earendil-works/pi-ai";
 import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
@@ -534,6 +535,81 @@ function sseResponse() {
   );
 }
 
+for (const [change, name] of [
+  ["none", "stable transformed descriptions allow compaction"],
+  ["description", "a registry description edit rejects compaction"],
+  ["schema", "a registry schema edit rejects compaction"],
+  ["membership", "an active tool change rejects compaction"],
+  ["prompt", "a live prompt edit rejects compaction"],
+  ["in-flight", "a later dispatch cannot bless an in-flight tool edit"],
+  ["reload", "reload discards dispatch evidence"],
+  ["tree", "tree navigation discards dispatch evidence"],
+] as const) {
+  test(`transformed loadout: ${name}`, async () => {
+    const read: Tool = { name: "read", description: "Read a file", parameters: Type.Object({ path: Type.String() }) };
+    const codemode: Tool = {
+      name: "codemode",
+      description: "Run tools",
+      parameters: Type.Object({ code: Type.String() }),
+    };
+    const manager = SessionManager.inMemory();
+    manager.appendMessage({
+      role: "system",
+      content: "Instructions",
+      toolsAdded: [{ ...read, description: "Read a file through codemode" }, codemode],
+      timestamp: 1,
+    });
+    const keptId = manager.appendMessage({ role: "user", content: "Task", timestamp: 2 });
+    const mock = createMockPi({ activeTools: ["read", "codemode"], allTools: [read, codemode] });
+    let requests = 0;
+    let prompt = "Instructions";
+    createCodexCompactExtension({
+      settingsRuntime: settingsRuntime(),
+      fetch: async () => {
+        requests += 1;
+        if (change === "in-flight") {
+          read.description = "Changed during the request";
+          await mock.events.get("before_provider_request")?.[0]({ payload: { input: [] } }, ctx);
+        }
+        return sseResponse();
+      },
+    })(mock.pi);
+    const { ctx, notifications } = createMockContext({
+      model,
+      hasUI: true,
+      getSystemPrompt: () => prompt,
+      sessionManager: manager,
+      modelRegistry: {
+        getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fake-test-key" }),
+        getProvider: () => fakeProvider(),
+      },
+    });
+    const input = event();
+    input.branchEntries = manager.getBranch();
+    input.preparation.firstKeptEntryId = keptId;
+    const compact = mock.events.get("session_before_compact")?.[0];
+    assert.ok(compact);
+    assert.equal(await compact(input, ctx), undefined, "unobserved transformations fail closed");
+    assert.equal(requests, 0);
+    await mock.events.get("before_provider_request")?.[0]({ payload: { input: [] } }, ctx);
+    if (change === "description") read.description = "A genuine new description";
+    if (change === "schema") read.parameters = Type.Object({ changed: Type.Boolean() });
+    if (change === "membership") mock.pi.setActiveTools(["codemode"]);
+    if (change === "prompt") prompt = "Changed instructions";
+    if (change === "reload") await mock.events.get("session_start")?.[0]({ reason: "reload" }, ctx);
+    if (change === "tree") await mock.events.get("session_tree")?.[0]({}, ctx);
+    const result = await compact(input, ctx);
+    if (change === "none") {
+      assert.ok(result);
+      assert.equal(requests, 1);
+    } else {
+      assert.equal(result, undefined);
+      assert.equal(requests, change === "in-flight" ? 1 : 0);
+      assert.match(notifications.at(-1)?.message ?? "", /using Pi compaction/);
+    }
+  });
+}
+
 test("registers the settings command and returns a versioned Remote V2 compaction with usage", async () => {
   const mock = createMockPi();
   let forwardedHeaders: OpenAICodexResponsesOptions["headers"];
@@ -586,6 +662,7 @@ test("registers the settings command and returns a versioned Remote V2 compactio
   };
   const replayContext = createMockContext({
     model,
+    getSystemPrompt: () => "",
     sessionManager: {
       getSessionId: () => "session",
       getBranch: () => [...entries, compactionEntry],

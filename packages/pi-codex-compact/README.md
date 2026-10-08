@@ -170,6 +170,13 @@ opaque replay.
 If fingerprints, model identity, payload shape, or marker count do not match exactly, the extension
 leaves Pi's visible fallback context unchanged instead of guessing.
 
+Loadout hooks can transform model-facing tool descriptions without changing the raw registry.
+The extension recognizes those transformations after observing a normal provider request in the
+active session, while still rejecting later prompt, tool, or schema changes. This evidence is
+in-memory only and resets on startup, reload, or tree navigation. Until another normal request
+establishes it, transformed descriptions cause safe Pi-native compaction rather than guessed
+tool-state compatibility.
+
 ## Privacy, storage, and limits
 
 Remote compaction sends the active conversation context, system prompt, and active tool schemas to
