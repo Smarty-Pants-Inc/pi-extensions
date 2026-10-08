@@ -24,6 +24,7 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import { createResponseRendezvous, queueAdmissionReady } from "./smoke-response-rendezvous.mjs";
 
 const root = resolve(new URL("..", import.meta.url).pathname);
 const packagesRoot = join(root, "packages");
@@ -353,12 +354,17 @@ async function runRealPiWorkflowIntegration(session, faux) {
 
   let activeResponses = 0;
   let maxActiveResponses = 0;
-  const response = (text) => async () => {
+  const dagResponses = createResponseRendezvous("real Pi DAG", ["task A", "task B"]);
+  const response = (text, rendezvous) => async () => {
     activeResponses += 1;
     maxActiveResponses = Math.max(maxActiveResponses, activeResponses);
-    await new Promise((resolve) => setTimeout(resolve, 25));
-    activeResponses -= 1;
-    return fauxAssistantMessage(text);
+    try {
+      if (rendezvous) await rendezvous.enter(text);
+      else await new Promise((resolve) => setTimeout(resolve, 25));
+      return fauxAssistantMessage(text);
+    } finally {
+      activeResponses -= 1;
+    }
   };
   const isolatedResponse = async (context) => {
     assert.ok(
@@ -368,8 +374,8 @@ async function runRealPiWorkflowIntegration(session, faux) {
     return response("isolated task")();
   };
   faux.setResponses([
-    response("task A"),
-    response("task B"),
+    response("task A", dagResponses),
+    response("task B", dagResponses),
     response("task C"),
     isolatedResponse,
     response("synthesis output"),
@@ -382,16 +388,24 @@ const results = await parallel([
 const c = await agent("Return C.", { label: "c" });
 const isolated = await agent("Return isolated.", { label: "isolated", agentType: "isolated" });
 return "synthesis output";`;
-  const completed = await workflow.execute(
-    "real-dag",
-    {
-      script: dagScript,
-      background: false,
-    },
-    undefined,
-    undefined,
-    undefined,
-  );
+  let completed;
+  try {
+    completed = await workflow.execute(
+      "real-dag",
+      {
+        script: dagScript,
+        background: false,
+      },
+      undefined,
+      undefined,
+      undefined,
+    );
+    // Faux-provider failures can be returned as a failed workflow result. Keep
+    // the rendezvous timeout explicit instead of hiding it in a status mismatch.
+    dagResponses.assertReleased();
+  } finally {
+    dagResponses.dispose();
+  }
   assert.match(toolText(completed), /status=completed/);
   assert.match(toolText(completed), /synthesis output/);
   const completedRunId = completed.details?.runId;
@@ -419,36 +433,94 @@ return "synthesis output";`;
     ),
   );
 
-  // Force a real managed queue with the temporary maxConcurrent=2 setting and
-  // ensure every queued response drains instead of being lost at the terminal
-  // boundary.
+  // Force a real shared-manager queue with two independent workflows. A
+  // single three-call workflow caps its own dispatch at the host pool size,
+  // before a third managed request can allocate. Hold one workflow's pair,
+  // then submit the third task from another workflow and verify queue drainage.
   let queuedActive = 0;
   let queuedMaxActive = 0;
   let queuedStarts = 0;
-  const queuedResponse = (text) => async () => {
+  const previousManagedIds = new Set(
+    session.sessionManager
+      .getBranch()
+      .filter((entry) => entry.type === "custom" && entry.customType === "subagents:managed-spawn")
+      .map((entry) => entry.data?.id),
+  );
+  let queueAdmissionObserved = false;
+  const queueResponses = createResponseRendezvous("real Pi queue", ["queue 1", "queue 2"], 5_000, () => {
+    const latest = new Map();
+    for (const entry of session.sessionManager.getBranch()) {
+      const data = entry.data;
+      if (
+        entry.type === "custom" &&
+        entry.customType === "subagents:managed-spawn" &&
+        typeof data?.id === "string" &&
+        !previousManagedIds.has(data.id) &&
+        data.owner?.extension === "pi-workflows"
+      ) {
+        latest.set(data.id, data.state);
+      }
+    }
+    const ready = queueAdmissionReady([...latest.values()]);
+    if (ready) queueAdmissionObserved = true;
+    return ready;
+  });
+  const queuedResponse = (text, rendezvous) => async () => {
     queuedStarts += 1;
     queuedActive += 1;
     queuedMaxActive = Math.max(queuedMaxActive, queuedActive);
-    await new Promise((resolve) => setTimeout(resolve, 30));
-    queuedActive -= 1;
-    return fauxAssistantMessage(text);
+    try {
+      if (rendezvous) await rendezvous.enter(text);
+      else await new Promise((resolve) => setTimeout(resolve, 30));
+      return fauxAssistantMessage(text);
+    } finally {
+      queuedActive -= 1;
+    }
   };
-  faux.setResponses([queuedResponse("queue 1"), queuedResponse("queue 2"), queuedResponse("queue 3")]);
-  const queueScript = `export const meta = { name: "real Pi queue", description: "Queue" };
-await parallel(Array.from({ length: 3 }, (_, i) => () => agent("Return queue " + (i + 1) + ".", { label: "q" + (i + 1) })));
+  faux.setResponses([
+    queuedResponse("queue 1", queueResponses),
+    queuedResponse("queue 2", queueResponses),
+    queuedResponse("queue 3"),
+  ]);
+  const queueScript = `export const meta = { name: "real Pi queue pair", description: "Hold the manager pool" };
+await parallel(Array.from({ length: 2 }, (_, i) => () => agent("Return queue " + (i + 1) + ".", { label: "q" + (i + 1) })));
 return 0;`;
-  const queued = await workflow.execute(
-    "real-queue",
-    {
-      script: queueScript,
-      background: false,
-    },
+  const thirdQueueScript = `export const meta = { name: "real Pi queued task", description: "Wait for the manager pool" };
+await agent("Return queue 3.", { label: "q3" });
+return 0;`;
+  let queued;
+  let queuedThird;
+  const pair = workflow.execute(
+    "real-queue-pair",
+    { script: queueScript, background: false },
     undefined,
     undefined,
     undefined,
   );
+  void pair.catch(() => {});
+  try {
+    await waitFor(() => queuedStarts === 2, "both held queue callbacks");
+    [queued, queuedThird] = await Promise.all([
+      pair,
+      workflow.execute(
+        "real-queue-third",
+        { script: thirdQueueScript, background: false },
+        undefined,
+        undefined,
+        undefined,
+      ),
+    ]);
+    queueResponses.assertReleased();
+  } finally {
+    queueResponses.dispose();
+  }
   assert.match(toolText(queued), /status=completed/);
+  assert.match(toolText(queuedThird), /status=completed/);
   assert.equal(queuedStarts, 3);
+  assert.ok(
+    queueAdmissionObserved,
+    "real Pi queue did not record two running tasks and one queued task before release",
+  );
   assert.equal(queuedMaxActive, 2, "real Pi queue did not enforce maxConcurrent");
 
   // Exercise Pi's public tree navigation. The workflow and subagent lifecycle

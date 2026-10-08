@@ -270,6 +270,7 @@ async function compactRemotely(
       provider,
       model,
       context,
+      validatePayload: toolState.payloadValidator(ctx.sessionManager, sessionId),
       apiKey: auth.apiKey,
       headers: auth.headers,
       env: auth.env,
@@ -417,6 +418,20 @@ export function createCodexCompactExtension(
 
     pi.on("context", (event, ctx) => {
       if (!active || !settingsRuntime.get().settings.enabled) return undefined;
+      // Agent-core invokes context preparation for a new request. Cache warming
+      // reuses the prepared context and only invokes provider callbacks.
+      if (piCodingAgentCompat.buildSessionProjection && piAiCompat.getCurrentTools) {
+        // The public context event hides system messages. Read the canonical
+        // branch, whose prepared declarations were persisted before this hook.
+        const branch = ctx.sessionManager.getBranch();
+        const transcript = buildSessionContext(branch, branch.at(-1)?.id ?? null).messages;
+        toolState.prepare(
+          ctx.sessionManager,
+          ctx.sessionManager.getSessionId(),
+          comparableTools(piAiCompat.getCurrentTools(transcript)),
+          activeTools(pi),
+        );
+      }
       const checkpoint = activeCheckpoint(ctx);
       if (!checkpoint || !isCheckpointCompatible(checkpoint.details, ctx.model)) return undefined;
       const provenance = tailProvenance.get(ctx.sessionManager);
@@ -431,9 +446,9 @@ export function createCodexCompactExtension(
 
     pi.on("before_provider_request", (event, ctx) => {
       if (!active || !settingsRuntime.get().settings.enabled) return undefined;
-      // Normal requests establish the relationship between persisted model-facing
-      // declarations and raw registry tools. Remote compaction's own onPayload
-      // does not dispatch this hook, so it cannot bless an in-flight state change.
+      // A provider callback must match fresh context preparation and the actual
+      // wire declarations. Warming cannot bless an unsent registry edit; remote
+      // compaction's own onPayload does not establish observations.
       if (
         piCodingAgentCompat.buildSessionProjection &&
         piAiCompat.getCurrentTools &&
@@ -447,6 +462,7 @@ export function createCodexCompactExtension(
             ctx.sessionManager.getSessionId(),
             comparableTools(piAiCompat.getCurrentTools(transcript)),
             activeTools(pi),
+            event.payload,
           );
         } else {
           toolState.reset(ctx.sessionManager);

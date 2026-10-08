@@ -171,11 +171,13 @@ If fingerprints, model identity, payload shape, or marker count do not match exa
 leaves Pi's visible fallback context unchanged instead of guessing.
 
 Loadout hooks can transform model-facing tool descriptions without changing the raw registry.
-The extension recognizes those transformations after observing a normal provider request in the
-active session, while still rejecting later prompt, tool, or schema changes. This evidence is
-in-memory only and resets on startup, reload, or tree navigation. Until another normal request
-establishes it, transformed descriptions cause safe Pi-native compaction rather than guessed
-tool-state compatibility.
+The extension recognizes those transformations only after fresh agent-context preparation and a
+provider payload whose tool names and descriptions match the persisted declarations. It freezes
+both public tool surfaces and the serialized wire tools; Remote V2 must reproduce that wire snapshot
+before sending. Cached provider callbacks cannot approve unsent registry edits, and hidden
+declarations cause Pi-native fallback rather than restoring hidden tools remotely. Evidence is
+in-memory only and resets on startup, reload, or tree navigation. A fresh, unchanged normal request
+can establish it again; prompt, tool, and schema changes remain guarded.
 
 ## Privacy, storage, and limits
 
@@ -207,11 +209,10 @@ ceilings are intentionally not configurable.
   compatibility fallback, exact pre-turn ordering, or exact mid-turn model-session ownership.
 - A live prompt or tool change that has not been written into Pi's transcript causes a native
   compaction fallback; an opaque checkpoint must match the system state Pi will persist.
-- `prepareLoadout` transformations, including codemode tool rewrites, can make the persisted
-  effective tool schemas differ from the raw `getAllTools()` declarations available to this
-  extension. Such combinations conservatively use native compaction until Pi exposes a public
-  effective-loadout snapshot. The extension does not weaken prompt/tool equality or stale-state
-  checks to enable Remote V2.
+- Pi exposes no public effective-loadout snapshot. Observed, unchanged description-only rewrites
+  (including codemode `mode: "on"`) can use Remote V2, but unproven transformations, hidden declarations
+  (including codemode `mode: "only"`), membership/schema mismatches, or different serialized wire tools
+  use native compaction. Observation does not weaken prompt/tool equality or stale-state checks.
 - Pi invokes `session_before_compact` handlers in registration order. Another extension that mutates
   prompt, tools, or context **after this handler returns** can invalidate an already prepared opaque
   checkpoint before Pi appends it. Load such handlers before this extension or disable Remote V2 in
@@ -226,6 +227,7 @@ ceilings are intentionally not configurable.
 ```text
 src/index.ts          Thin Pi entrypoint
 src/codex-compact.ts  Pi lifecycle, command, provider projection, and fallback
+src/tool-state.ts     Prepared/observed public tool surfaces and frozen wire evidence
 src/remote.ts         Provider stream invocation, auth payload, timeout, and retry controls
 src/protocol.ts       Bounded SSE parsing and Remote V2 payload/output validation
 src/checkpoint.ts     Replacement history, fingerprints, persistence, and replay projection

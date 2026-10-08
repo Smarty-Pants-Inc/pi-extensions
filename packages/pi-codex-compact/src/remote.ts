@@ -22,6 +22,7 @@ export interface RemoteCompactionRequest {
   env?: Record<string, string>;
   signal: AbortSignal;
   priorCheckpoint?: PriorCheckpointPayload;
+  validatePayload?: (payload: unknown) => boolean;
   requestTimeoutMs?: number;
   maxRetries?: number;
   fetch?: typeof globalThis.fetch;
@@ -144,6 +145,9 @@ async function performRemoteCompaction(request: RemoteCompactionRequest): Promis
       maxRetries: request.maxRetries ?? 2,
       fetch: inspectedFetch,
       onPayload: (payload) => {
+        if (request.validatePayload && !request.validatePayload(payload)) {
+          throw new CodexCompactionProtocolError("Compaction tool declarations differ from the observed request");
+        }
         const prepared = prepareRemoteCompactionPayload(payload, request.priorCheckpoint);
         if (!Array.isArray(prepared.input) || !prepared.input.every(isObject)) {
           throw new CodexCompactionProtocolError("Prepared compaction payload has invalid input items");

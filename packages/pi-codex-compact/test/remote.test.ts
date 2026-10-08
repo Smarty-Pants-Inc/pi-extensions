@@ -130,6 +130,32 @@ test("uses the public provider stream with SSE, bounded retry options, and a fin
   assert.equal(result.promptInput.length, 1);
 });
 
+test("a rejected or throwing wire validator stops transport and keeps public errors credential-safe", async () => {
+  for (const validatePayload of [
+    () => false,
+    () => {
+      throw new Error(credentialEcho);
+    },
+  ]) {
+    let fetches = 0;
+    await assert.rejects(
+      requestRemoteCompaction({
+        provider: fakeProvider(() => assert.fail("rejected payload must not leave onPayload")),
+        model,
+        context: { messages: [] },
+        signal: new AbortController().signal,
+        validatePayload,
+        fetch: async () => {
+          fetches += 1;
+          return responseSse();
+        },
+      }),
+      assertSafeError,
+    );
+    assert.equal(fetches, 0);
+  }
+});
+
 test("normalizes system prompt and tools before calling a Pi 0.87 provider", async () => {
   const tools = [{ name: "inspect", description: "Inspect a path", parameters: Type.Object({ path: Type.String() }) }];
   const user = { role: "user" as const, content: "inspect this", timestamp: 1 };

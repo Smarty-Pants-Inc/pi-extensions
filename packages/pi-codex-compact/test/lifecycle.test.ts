@@ -100,7 +100,13 @@ function fakeProvider(
               const text = typeof content === "string" ? content : "text" in content ? content.text : "image";
               return { role: "user", content: [{ type: "input_text", text }] };
             });
-          const payload = await options?.onPayload?.({ model: model.id, input }, model);
+          const tools = getCurrentTools(context.messages).map(({ name, description, parameters }) => ({
+            type: "function",
+            name,
+            description,
+            parameters,
+          }));
+          const payload = await options?.onPayload?.({ model: model.id, input, tools }, model);
           onPayload?.(payload);
           assert.deepEqual((payload as { input: unknown[] }).input.at(-1), {
             type: "compaction_trigger",
@@ -538,6 +544,11 @@ function sseResponse() {
 for (const [change, name] of [
   ["none", "stable transformed descriptions allow compaction"],
   ["description", "a registry description edit rejects compaction"],
+  ["cached-description", "a cached callback cannot bless an unsent registry description"],
+  ["hidden", "hidden declarations reject compaction"],
+  ["wire-description", "wire description changes reject compaction"],
+  ["wire-schema", "different remote wire schemas reject compaction before transport"],
+  ["reload-warming", "cached callbacks after reload cannot reestablish evidence"],
   ["schema", "a registry schema edit rejects compaction"],
   ["membership", "an active tool change rejects compaction"],
   ["prompt", "a live prompt edit rejects compaction"],
@@ -591,8 +602,26 @@ for (const [change, name] of [
     assert.ok(compact);
     assert.equal(await compact(input, ctx), undefined, "unobserved transformations fail closed");
     assert.equal(requests, 0);
-    await mock.events.get("before_provider_request")?.[0]({ payload: { input: [] } }, ctx);
-    if (change === "description") read.description = "A genuine new description";
+    await mock.events.get("context")?.[0]({ messages: manager.buildSessionContext().messages }, ctx);
+    const payload = {
+      input: [],
+      tools: getCurrentTools(manager.buildSessionContext().messages).map(({ name, description, parameters }) => ({
+        type: "function",
+        name,
+        description,
+        parameters: structuredClone(parameters),
+      })),
+    };
+    if (change === "hidden") payload.tools = payload.tools.filter((tool) => tool.name !== "read");
+    if (change === "wire-description") payload.tools[0].description = "Unpersisted wire description";
+    if (change === "wire-schema") payload.tools[0].parameters = Type.Object({ changed: Type.Boolean() });
+    await mock.events.get("before_provider_request")?.[0]({ payload }, ctx);
+    if (change === "description" || change === "cached-description") read.description = "A genuine new description";
+    if (change === "cached-description") await mock.events.get("before_provider_request")?.[0]({ payload }, ctx);
+    if (change === "reload-warming") {
+      await mock.events.get("session_start")?.[0]({ reason: "reload" }, ctx);
+      await mock.events.get("before_provider_request")?.[0]({ payload }, ctx);
+    }
     if (change === "schema") read.parameters = Type.Object({ changed: Type.Boolean() });
     if (change === "membership") mock.pi.setActiveTools(["codemode"]);
     if (change === "prompt") prompt = "Changed instructions";
@@ -868,7 +897,11 @@ test("canonical recovery omits B before compaction and absorbs retained error A 
     const resumedSession = SessionManager.open(sessionFile);
     const resumed = createMockPi();
     createCodexCompactExtension({ settingsRuntime: settingsRuntime() })(resumed.pi);
-    const resumedContext = createMockContext({ model, sessionManager: resumedSession }).ctx;
+    const resumedContext = createMockContext({
+      model,
+      getSystemPrompt: () => getCurrentSystemPrompt(resumedSession.buildSessionContext().messages),
+      sessionManager: resumedSession,
+    }).ctx;
     await resumed.events.get("session_start")?.[0]({ reason: "resume" }, resumedContext);
     await assertAbsorbed(resumed, resumedContext, resumedSession);
   } finally {
