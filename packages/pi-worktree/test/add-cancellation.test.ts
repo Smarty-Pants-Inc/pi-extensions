@@ -4,6 +4,7 @@ import { existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExecResult, ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import lockfile from "proper-lockfile";
 import { test, vi } from "vitest";
 import { registerWorktreeCommand } from "../src/command.js";
 import { listWorktrees, resolveCommit } from "../src/git.js";
@@ -20,8 +21,16 @@ const env = {
   GIT_COMMITTER_EMAIL: "fixture@example.invalid",
 };
 
-for (const scenario of ["create", "attach", "inventory-failure", "branch-failure", "branch-only"] as const) {
-  test(`cancelled Add reconciles ${scenario} after Git finishes, without using the retired owner`, async () => {
+for (const [scenario, cancelled] of [
+  ["create", true],
+  ["attach", true],
+  ["inventory-failure", true],
+  ["branch-failure", true],
+  ["branch-only", true],
+  ["lock-release-failure", true],
+  ["lock-release-failure", false],
+] as const) {
+  test(`Add reconciles ${scenario} after Git finishes (cancelled: ${cancelled})`, async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "pi-worktree-add-cancel-")));
     const main = join(root, "repo");
     const linked = join(root, "linked");
@@ -36,6 +45,18 @@ for (const scenario of ["create", "attach", "inventory-failure", "branch-failure
       git("commit", "--allow-empty", "-m", "fixture");
       const oid = git("rev-parse", "HEAD");
       if (scenario === "attach") git("branch", "feature");
+      if (scenario === "lock-release-failure") {
+        const acquire = lockfile.lock;
+        vi.spyOn(lockfile, "lock").mockImplementation(async (file, options) => {
+          const release = await acquire(file, options);
+          return async () => {
+            assert.equal(recoveryCalls.length, 2, "release must fail only after both verification reads finish");
+            await release();
+            if (cancelled) controller.abort();
+            throw new Error("fixture release failed");
+          };
+        });
+      }
       const exec: ExtensionAPI["exec"] = async (command, args, options): Promise<ExecResult> => {
         if (mutationFinished) {
           recoveryCalls.push(args);
@@ -55,8 +76,8 @@ for (const scenario of ["create", "attach", "inventory-failure", "branch-failure
           assert.equal(value.status, 0, value.stderr);
           assert.ok(options?.signal);
           mutationFinished = true;
-          controller.abort();
-          assert.equal(options.signal.aborted, true);
+          if (scenario !== "lock-release-failure") controller.abort();
+          assert.equal(options.signal.aborted, scenario !== "lock-release-failure");
         }
         return {
           stdout: value.stdout,
@@ -94,10 +115,18 @@ for (const scenario of ["create", "attach", "inventory-failure", "branch-failure
       assert.equal(mutationFinished, true);
       assert.ok(recoveryCalls.some((args) => args[0] === "worktree" && args[1] === "list"));
       assert.ok(recoveryCalls.some((args) => args[0] === "rev-parse" && args.includes("refs/heads/feature^{commit}")));
-      assert.equal(confirms, 1, "a retired flow must not offer workspace switching");
-      assert.deepEqual(context.notifications, [], "a retired context must not be notified");
-      assert.equal(stderr.mock.calls.length, 1);
-      const notice = String(stderr.mock.calls[0]?.[0]);
+      assert.equal(confirms, 1, "a retired or recovery flow must not offer workspace switching");
+      let notice: string;
+      if (cancelled) {
+        assert.deepEqual(context.notifications, [], "a retired context must not be notified");
+        assert.equal(stderr.mock.calls.length, 1);
+        notice = String(stderr.mock.calls[0]?.[0]);
+      } else {
+        assert.equal(stderr.mock.calls.length, 0);
+        assert.equal(context.notifications.length, 1);
+        assert.equal(context.notifications[0]?.level, "error");
+        notice = context.notifications[0]?.message ?? "";
+      }
       assert.ok(notice.includes(linked));
       assert.match(notice, /feature/);
       if (scenario === "inventory-failure" || scenario === "branch-failure") {
@@ -111,6 +140,11 @@ for (const scenario of ["create", "attach", "inventory-failure", "branch-failure
       } else {
         assert.match(notice, /verified.*retained/i);
         assert.ok(notice.includes(oid));
+      }
+      if (scenario === "lock-release-failure") {
+        assert.match(notice, /Git add completed/i);
+        assert.match(notice, /Cannot release worktree mutation lock.*fixture release failed/);
+        assert.match(notice, /before retrying/);
       }
       // Inspect real Git independently of the failure-injecting host.
       const cleanPi = {
