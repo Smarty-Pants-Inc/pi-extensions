@@ -1,14 +1,14 @@
 /**
- * Persistent History + Ctrl+R Fuzzy Popup (fzf / atuin style)
+ * Persistent History + Ctrl+Alt+R Fuzzy Popup (fzf / atuin style)
  *
  * - Loads recent prompts from previous sessions into up/down history on startup.
- * - Ctrl+R opens a large two-pane popup: a filterable list on the left (row
+ * - Ctrl+Alt+R opens a large two-pane popup: a filterable list on the left (row
  *   number + age + one-line summary) and the FULL text of the highlighted entry
  *   on the right, `fzf --preview` style. Newest entry sits at the top.
  *
  * Hotkeys while searching:
  * - ↑ / Ctrl+P / Ctrl+S : move up (toward newer)
- * - ↓ / Ctrl+N / Ctrl+R : move down (toward older — "press ctrl+R again to go further back")
+ * - ↓ / Ctrl+N / Ctrl+Alt+R / Ctrl+R : move down (toward older — repeat the opening key)
  * - Ctrl+D / Ctrl+U     : scroll the preview pane
  * - <type>              : fuzzy-filter (subsequence, space = multi-token)
  * - Enter               : accept selection (fills editor)
@@ -181,8 +181,8 @@ export default function (pi: ExtensionAPI) {
     historyReady = Promise.resolve();
   });
 
-  // Ctrl+R: fuzzy history popup (fzf / atuin style)
-  pi.registerShortcut("ctrl+r", {
+  // Ctrl+Alt+R: fuzzy history popup; leave Ctrl+R available for Pi's session rename.
+  pi.registerShortcut(Key.ctrlAlt("r"), {
     description: "Fuzzy popup search through prompt history",
     handler: async (ctx) => {
       if (ctx.mode !== "tui" || !ctx.hasUI) return;
@@ -428,8 +428,13 @@ export class HistoryPopupComponent implements Component, Focusable {
       return;
     }
 
-    // Older: ↓ / Ctrl+N (next line) / Ctrl+R (press again to search further back)
-    if (matchesKey(data, Key.down) || matchesKey(data, Key.ctrl("n")) || matchesKey(data, Key.ctrl("r"))) {
+    // Older: ↓ / Ctrl+N / repeated Ctrl+Alt+R; Ctrl+R is a popup-only compatibility alias.
+    if (
+      matchesKey(data, Key.down) ||
+      matchesKey(data, Key.ctrl("n")) ||
+      matchesKey(data, Key.ctrlAlt("r")) ||
+      matchesKey(data, Key.ctrl("r"))
+    ) {
       this.moveDown();
       this.tui.requestRender();
       return;
