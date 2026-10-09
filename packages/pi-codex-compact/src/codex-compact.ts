@@ -32,6 +32,7 @@ import {
   createCodexCompactSettingsRuntime,
 } from "./settings.js";
 import { showCodexCompactMenu } from "./settings-menu.js";
+import { comparableTools, sameTools, ToolStateTracker } from "./tool-state.js";
 
 // Extension-owned reload handoff only. Weak keys retain neither sessions nor ctx;
 // one scalar record per live manager, fenced by session identity + checkpoint ID.
@@ -90,7 +91,6 @@ const piCodingAgentCompat: { buildSessionProjection?: typeof piCodingAgent.build
 const piAiCompat: {
   getCurrentSystemPrompt?: typeof piAi.getCurrentSystemPrompt;
   getCurrentTools?: typeof piAi.getCurrentTools;
-  getToolStateChanges?: typeof piAi.getToolStateChanges;
 } = piAi;
 
 function keptMessages(event: SessionBeforeCompactEvent): AgentMessage[] {
@@ -129,39 +129,33 @@ function activeTools(pi: ExtensionAPI): Tool[] {
   ) {
     throw new Error("Active tool declarations cannot be resolved unambiguously");
   }
-  return tools.map((tool) => ({
-    name: tool.name,
-    description: tool.description,
-    parameters: tool.parameters,
-  }));
-}
-
-function comparableTools(tools: Tool[]): Tool[] {
-  return tools.map(({ name, parameters }) => {
-    if (!parameters || typeof parameters !== "object" || Array.isArray(parameters)) {
+  return tools.map((tool) => {
+    if (!tool.parameters || typeof tool.parameters !== "object" || Array.isArray(tool.parameters)) {
       throw new Error("Active tool parameter schema is unavailable");
     }
-    return { name, description: "", parameters };
+    return { name: tool.name, description: tool.description, parameters: tool.parameters };
   });
 }
 
-function transcriptMatchesLiveState(messages: AgentMessage[], pi: ExtensionAPI, ctx: ExtensionContext): boolean {
+function transcriptMatchesLiveState(
+  messages: AgentMessage[],
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  toolState: ToolStateTracker,
+): boolean {
   // Older Pi hosts have no persisted system/tool projection: their provider
   // still uses the live shorthand, so retain that legacy compaction path.
   if (!piCodingAgentCompat.buildSessionProjection) return true;
-  const { getCurrentSystemPrompt, getCurrentTools, getToolStateChanges } = piAiCompat;
-  if (!getCurrentSystemPrompt || !getCurrentTools || !getToolStateChanges) return false;
-  // Pi's public ExtensionAPI exposes registration descriptions, not the effective
-  // ones produced by prepareLoadout(). That hook only changes descriptions and
-  // request visibility, never names or parameter schemas. Prove the complete
-  // declared name/schema set instead; ignore only the top-level description.
-  // Schema descriptions and all other JSON Schema fields remain part of the
-  // comparison. constrainedSampling is also absent from public ToolInfo, as before.
-  const recorded = comparableTools(getCurrentTools(messages));
-  const live = comparableTools(activeTools(pi));
-  const { toolsAdded, toolsRemoved } = getToolStateChanges(recorded, live);
+  const { getCurrentSystemPrompt, getCurrentTools } = piAiCompat;
+  if (!getCurrentSystemPrompt || !getCurrentTools) return false;
   return (
-    getCurrentSystemPrompt(messages) === ctx.getSystemPrompt() && toolsAdded.length === 0 && toolsRemoved.length === 0
+    getCurrentSystemPrompt(messages) === ctx.getSystemPrompt() &&
+    toolState.matches(
+      ctx.sessionManager,
+      ctx.sessionManager.getSessionId(),
+      comparableTools(getCurrentTools(messages)),
+      activeTools(pi),
+    )
   );
 }
 
@@ -170,14 +164,15 @@ function sessionStateMatchesRequest(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
   expectedLeafId: string | null,
+  toolState: ToolStateTracker,
 ): boolean {
-  if (!transcriptMatchesLiveState(messages, pi, ctx)) return false;
+  if (!transcriptMatchesLiveState(messages, pi, ctx, toolState)) return false;
   if (!piCodingAgentCompat.buildSessionProjection) return true;
   const branch = ctx.sessionManager.getBranch();
   const currentLeafId = ctx.sessionManager.getLeafId?.() ?? branch.at(-1)?.id ?? null;
   if (currentLeafId !== expectedLeafId) return false;
   const latest = buildSessionContext(branch, currentLeafId).messages;
-  return transcriptMatchesLiveState(latest, pi, ctx);
+  return transcriptMatchesLiveState(latest, pi, ctx, toolState);
 }
 
 function projectedCurrentMessages(
@@ -208,14 +203,42 @@ function projectedCurrentMessages(
   return { messages: projected, transcript: session.messages, prior };
 }
 
-function notifyFailure(ctx: ExtensionContext, error: unknown, settings: CodexCompactSettings): void {
+function notifyFailure(ctx: ExtensionContext, settings: CodexCompactSettings): void {
   if (!ctx.hasUI || !settings.notifyOnFallback) return;
-  const message = error instanceof Error ? error.message : String(error);
-  ctx.ui.notify(`Codex remote compaction failed; using Pi compaction. ${message}`, "warning");
+  ctx.ui.notify("Codex remote compaction failed; using Pi compaction.", "warning");
 }
 
 function sessionStillOwned(ctx: ExtensionContext, sessionId: string, signal: AbortSignal): boolean {
   return !signal.aborted && ctx.sessionManager.getSessionId() === sessionId;
+}
+
+async function awaitCompactionAuth(
+  ctx: ExtensionContext,
+  model: Model<"openai-codex-responses">,
+  signal: AbortSignal,
+  deadline: number,
+) {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  let onAbort = () => {};
+  try {
+    if (signal.aborted) throw new DOMException("Compaction aborted", "AbortError");
+    const remainingMs = deadline - performance.now();
+    if (remainingMs <= 0) throw new Error("OpenAI Codex compaction deadline exceeded");
+    const interrupted = new Promise<never>((_resolve, reject) => {
+      onAbort = () => reject(new DOMException("Compaction aborted", "AbortError"));
+      signal.addEventListener("abort", onAbort, { once: true });
+      timeout = setTimeout(() => reject(new Error("OpenAI Codex compaction deadline exceeded")), remainingMs);
+    });
+    // Race only our wait. Pi owns token refresh and persistence, which must be
+    // allowed to finish after cancellation. Promise.race observes late rejection.
+    return await Promise.race([ctx.modelRegistry.getApiKeyAndHeaders(model), interrupted]);
+  } catch {
+    // Authentication errors and abort reasons can contain credentials.
+    throw new Error("OpenAI Codex authentication failed");
+  } finally {
+    clearTimeout(timeout);
+    signal.removeEventListener("abort", onAbort);
+  }
 }
 
 async function compactRemotely(
@@ -223,34 +246,40 @@ async function compactRemotely(
   event: SessionBeforeCompactEvent,
   ctx: ExtensionContext,
   settings: CodexCompactSettings,
+  toolState: ToolStateTracker,
   fetch?: typeof globalThis.fetch,
 ) {
   const model = ctx.model;
   if (!settings.enabled || !isSupportedModel(model)) return undefined;
+  const deadline = performance.now() + settings.requestTimeoutMs;
   const sessionId = ctx.sessionManager.getSessionId();
   ctx.ui.setStatus(STATUS_KEY, "Codex remote compaction…");
   try {
-    const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+    const auth = await awaitCompactionAuth(ctx, model, event.signal, deadline);
     if (!sessionStillOwned(ctx, sessionId, event.signal)) return { cancel: true };
     if (!auth.ok || !auth.apiKey) {
-      throw new Error(auth.ok ? "OpenAI Codex OAuth token is unavailable" : auth.error);
+      throw new Error("OpenAI Codex OAuth token is unavailable");
     }
     const provider = ctx.modelRegistry.getProvider(model.provider);
     if (!provider) throw new Error("OpenAI Codex provider is unavailable");
     const current = projectedCurrentMessages(event, model);
     const sourceLeafId = event.branchEntries.at(-1)?.id ?? null;
-    if (!sessionStateMatchesRequest(current.transcript, pi, ctx, sourceLeafId)) {
+    if (!sessionStateMatchesRequest(current.transcript, pi, ctx, sourceLeafId, toolState)) {
       throw new Error("Live prompt or tools differ from the persisted transcript");
     }
+    const requestTools = structuredClone(activeTools(pi));
     const context: Context = {
       systemPrompt: ctx.getSystemPrompt(),
       messages: convertToLlm(current.messages),
-      tools: activeTools(pi),
+      tools: requestTools,
     };
+    const remainingMs = deadline - performance.now();
+    if (remainingMs <= 0) throw new Error("OpenAI Codex compaction deadline exceeded");
     const response = await requestRemoteCompaction({
       provider,
       model,
       context,
+      validatePayload: toolState.payloadValidator(ctx.sessionManager, sessionId),
       apiKey: auth.apiKey,
       headers: auth.headers,
       env: auth.env,
@@ -261,14 +290,17 @@ async function compactRemotely(
             replacementHistory: current.prior.replacementHistory,
           }
         : undefined,
-      requestTimeoutMs: settings.requestTimeoutMs,
+      requestTimeoutMs: remainingMs,
       maxRetries: settings.maxRetries,
       fetch,
     });
     if (!sessionStillOwned(ctx, sessionId, event.signal)) return { cancel: true };
     // appendCompaction will snapshot the session's resolved system/tool state;
     // never persist a checkpoint for a request that became stale while in flight.
-    if (!sessionStateMatchesRequest(current.transcript, pi, ctx, sourceLeafId)) {
+    if (
+      !sessionStateMatchesRequest(current.transcript, pi, ctx, sourceLeafId, toolState) ||
+      (piCodingAgentCompat.buildSessionProjection && !sameTools(requestTools, activeTools(pi)))
+    ) {
       throw new Error("Live prompt, tools, or session branch changed during remote compaction");
     }
     const replacementHistory = buildReplacementHistory(response.promptInput, response.item, {
@@ -278,7 +310,9 @@ async function compactRemotely(
       modelId: model.id,
       replacementHistory,
       keptMessages: keptMessages(event),
-      willRetry: event.willRetry,
+      // Canonical hosts persist recovery omissions before this hook. Retained
+      // projected messages are full lineage, never a tail to remove afterward.
+      willRetry: !piCodingAgentCompat.buildSessionProjection && event.willRetry,
     });
     return {
       compaction: {
@@ -289,11 +323,11 @@ async function compactRemotely(
         details,
       },
     };
-  } catch (error) {
+  } catch {
     if (event.signal.aborted || ctx.sessionManager.getSessionId() !== sessionId) {
       return { cancel: true };
     }
-    notifyFailure(ctx, error, settings);
+    notifyFailure(ctx, settings);
     return undefined;
   } finally {
     if (ctx.sessionManager.getSessionId() === sessionId) ctx.ui.setStatus(STATUS_KEY, undefined);
@@ -306,6 +340,7 @@ export function createCodexCompactExtension(
   return (pi) => {
     const providerWarnings = new Set<string>();
     const settingsRuntime = options.settingsRuntime ?? createCodexCompactSettingsRuntime();
+    const toolState = new ToolStateTracker();
     let sessionController = new AbortController();
     let generation = 0;
     let active = true;
@@ -323,6 +358,7 @@ export function createCodexCompactExtension(
 
     pi.on("session_start", async (event, ctx) => {
       active = true;
+      toolState.reset(ctx.sessionManager);
       if (event.reason !== "reload") resetTailProvenance(ctx);
       sessionController.abort();
       sessionController = new AbortController();
@@ -362,21 +398,21 @@ export function createCodexCompactExtension(
     });
 
     pi.on("session_before_compact", (event, ctx) =>
-      compactRemotely(pi, event, ctx, settingsRuntime.get().settings, options.fetch),
+      compactRemotely(pi, event, ctx, settingsRuntime.get().settings, toolState, options.fetch),
     );
 
-    // Post-compaction continuation (item 53): `session_before_compact` drives
-    // the remote request, but the replay window only opens after Pi finishes
-    // compaction. Observing `session_compact` keeps both sides of the
-    // lifecycle handled and lets the extension re-validate the checkpoint in
-    // the post-compaction context without mutating session state.
+    // Legacy hosts trim a recovery tail after compaction. Canonical hosts have
+    // already persisted context edits before the hook and keep full provenance.
     pi.on("session_compact", (event, ctx) => {
       if (!active) return;
       resetTailProvenance(ctx);
       const checkpoint = activeCheckpoint(ctx);
-      // Pi rebuilds persisted context before this event, then removes the eligible
-      // tail before retry. Only this event plus validated proof establishes omission.
-      if (event.willRetry && checkpoint?.entry.id === event.compactionEntry.id && checkpoint.details.retryTrimmedTail) {
+      if (
+        !piCodingAgentCompat.buildSessionProjection &&
+        event.willRetry &&
+        checkpoint?.entry.id === event.compactionEntry.id &&
+        checkpoint.details.retryTrimmedTail
+      ) {
         tailProvenance.set(ctx.sessionManager, {
           checkpointId: provenanceId(ctx, checkpoint.details.checkpointId),
           mode: "runtime-omitted",
@@ -385,22 +421,62 @@ export function createCodexCompactExtension(
     });
 
     pi.on("session_tree", (_event, ctx) => {
+      toolState.reset(ctx.sessionManager);
       if (active) resetTailProvenance(ctx);
     });
 
     pi.on("context", (event, ctx) => {
       if (!active || !settingsRuntime.get().settings.enabled) return undefined;
+      // Agent-core invokes context preparation for a new request. Cache warming
+      // reuses the prepared context and only invokes provider callbacks.
+      if (piCodingAgentCompat.buildSessionProjection && piAiCompat.getCurrentTools) {
+        // The public context event hides system messages. Read the canonical
+        // branch, whose prepared declarations were persisted before this hook.
+        const branch = ctx.sessionManager.getBranch();
+        const transcript = buildSessionContext(branch, branch.at(-1)?.id ?? null).messages;
+        toolState.prepare(
+          ctx.sessionManager,
+          ctx.sessionManager.getSessionId(),
+          comparableTools(piAiCompat.getCurrentTools(transcript)),
+          activeTools(pi),
+        );
+      }
       const checkpoint = activeCheckpoint(ctx);
       if (!checkpoint || !isCheckpointCompatible(checkpoint.details, ctx.model)) return undefined;
       const provenance = tailProvenance.get(ctx.sessionManager);
-      const mode =
-        provenance?.checkpointId === provenanceId(ctx, checkpoint.details.checkpointId) ? provenance.mode : undefined;
+      const mode = piCodingAgentCompat.buildSessionProjection
+        ? "full"
+        : provenance?.checkpointId === provenanceId(ctx, checkpoint.details.checkpointId)
+          ? provenance.mode
+          : undefined;
       const messages = projectCheckpointContext(event.messages, checkpoint.details, mode);
       return messages ? { messages } : undefined;
     });
 
     pi.on("before_provider_request", (event, ctx) => {
-      if (!settingsRuntime.get().settings.enabled) return undefined;
+      if (!active || !settingsRuntime.get().settings.enabled) return undefined;
+      // A provider callback must match fresh context preparation and the actual
+      // wire declarations. Warming cannot bless an unsent registry edit; remote
+      // compaction's own onPayload does not establish observations.
+      if (
+        piCodingAgentCompat.buildSessionProjection &&
+        piAiCompat.getCurrentTools &&
+        piAiCompat.getCurrentSystemPrompt
+      ) {
+        const branch = ctx.sessionManager.getBranch();
+        const transcript = buildSessionContext(branch, branch.at(-1)?.id ?? null).messages;
+        if (piAiCompat.getCurrentSystemPrompt(transcript) === ctx.getSystemPrompt()) {
+          toolState.observe(
+            ctx.sessionManager,
+            ctx.sessionManager.getSessionId(),
+            comparableTools(piAiCompat.getCurrentTools(transcript)),
+            activeTools(pi),
+            event.payload,
+          );
+        } else {
+          toolState.reset(ctx.sessionManager);
+        }
+      }
       const checkpoint = activeCheckpoint(ctx);
       if (!checkpoint || !isCheckpointCompatible(checkpoint.details, ctx.model)) return undefined;
       const markers = checkpointMarkerVariants(checkpoint.details.checkpointId);
@@ -425,6 +501,7 @@ export function createCodexCompactExtension(
 
     pi.on("session_shutdown", async (event, ctx) => {
       active = false;
+      toolState.reset(ctx.sessionManager);
       if (event.reason !== "reload") tailProvenance.delete(ctx.sessionManager);
       generation += 1;
       sessionController.abort();

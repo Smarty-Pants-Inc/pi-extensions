@@ -12,6 +12,7 @@ import { isManagedAgentTier, MAX_AGENT_TIER_PROFILES } from "@signalridge/pi-sub
 // edit index.ts in the same change.
 import { setDefaultToolTimeoutMs } from "./agent-runner.js";
 import { NO_FALLBACK } from "./agent-types.js";
+import { isProjectResource } from "./project-trust.js";
 import type { JoinMode, ThinkingLevel } from "./types.js";
 
 /** How a `@handle message` mention is dispatched. See `agentMentions`. */
@@ -722,11 +723,13 @@ function readSettingsFile(path: string): ReadSettings {
  * Load merged settings: global provides defaults, project overrides. Agent-tier
  * profiles are complete replacement units: a project entry never inherits one
  * field from the global entry, and an invalid project entry blocks that global
- * entry instead of silently reviving it.
+ * entry instead of silently reviving it. Runtime callers must pass captured trust;
+ * the default preserves standalone helper compatibility.
  */
-export function loadSettings(cwd: string = process.cwd()): SubagentsSettings {
-  const global = readSettingsFile(globalPath());
-  const project = readSettingsFile(projectPath(cwd));
+export function loadSettings(cwd: string = process.cwd(), projectTrusted = true): SubagentsSettings {
+  const empty = (): ReadSettings => ({ settings: {}, agentTiers: emptyAgentTiersSource() });
+  const global = projectTrusted || !isProjectResource(globalPath(), cwd) ? readSettingsFile(globalPath()) : empty();
+  const project = projectTrusted ? readSettingsFile(projectPath(cwd)) : empty();
   const { agentTiers: _globalAgentTiers, ...globalSettings } = global.settings;
   const { agentTiers: _projectAgentTiers, ...projectSettings } = project.settings;
   const agentTiers = mergeAgentTierSources(global.agentTiers, project.agentTiers);

@@ -111,6 +111,68 @@ test("collector ignores duplicate or out-of-run events", () => {
   assert.equal(run?.tools.length, 1);
 });
 
+test("route failures settle as errors without fabricating provider requests or recovering against earlier success", () => {
+  for (const earlierSuccess of [false, true]) {
+    const collector = new ResponseCollector();
+    collector.begin({ id: "route-failure", now: 0, triggerSource: "interactive", model });
+    if (earlierSuccess) {
+      collector.beginGeneration({ id: "first", now: 1 });
+      collector.finishGeneration({ now: 2, stopReason: "toolUse", model });
+      collector.beginTool({ id: "tool", name: "read", now: 3, model });
+      collector.finishTool({ id: "tool", now: 4, isError: false });
+    }
+    collector.finishGeneration({
+      now: 5,
+      stopReason: "error",
+      errorMessage: "virtual route failed with secret payload",
+      model: { provider: "virtual", model: "router" },
+    });
+    const run = collector.settle(6);
+    assert.ok(run);
+    assert.equal(run.outcome, "error");
+    assert.equal(run.generations.length, earlierSuccess ? 1 : 0);
+    assert.equal(run.providerErrorCount, 1);
+    assert.equal(run.recoveredErrorCount, 0);
+    assert.equal(run.providerErrors[0]?.generationId, undefined);
+    assert.equal(run.providerErrors[0]?.terminal, true);
+    assert.equal(run.providerErrors[0]?.provider, undefined);
+    assert.doesNotMatch(JSON.stringify(run), /secret|payload/);
+  }
+});
+
+test("a pre-request route failure can recover only after a later successful assistant", () => {
+  const collector = new ResponseCollector();
+  collector.begin({ id: "recover-route", now: 0, triggerSource: "rpc" });
+  collector.finishGeneration({ now: 1, stopReason: "error" });
+  collector.beginGeneration({ id: "physical", now: 1 });
+  collector.finishGeneration({ now: 1, stopReason: "stop", model });
+  const run = collector.settle(1);
+  assert.equal(run?.outcome, "recovered_success");
+  assert.equal(run?.providerErrors[0]?.recovered, true);
+});
+
+test("pending dispatch evidence expires at message, turn, settlement and run boundaries", () => {
+  const collector = new ResponseCollector();
+  assert.equal(collector.hasPendingGeneration(), false);
+  collector.begin({ id: "one", now: 0, triggerSource: "rpc" });
+  collector.beginGeneration({ id: "first", now: 1 });
+  assert.equal(collector.hasPendingGeneration(), true);
+  collector.finishGeneration({ now: 2, stopReason: "stop", model });
+  assert.equal(collector.hasPendingGeneration(), false);
+  collector.beginGeneration({ id: "unfinished", now: 3 });
+  collector.beginTurn(4);
+  assert.equal(collector.hasPendingGeneration(), false);
+  collector.finishGeneration({ now: 5, stopReason: "error", model });
+  const run = collector.settle(6);
+  assert.equal(run?.providerErrors[0]?.provider, undefined);
+  assert.equal(run?.generations[1]?.outcome, "interrupted");
+  assert.equal(collector.hasPendingGeneration(), false);
+  collector.begin({ id: "two", now: 7, triggerSource: "rpc" });
+  collector.beginGeneration({ id: "next", now: 8 });
+  collector.begin({ id: "three", now: 9, triggerSource: "rpc" });
+  assert.equal(collector.hasPendingGeneration(), false);
+});
+
 test("provider errors are classified without preserving their messages", () => {
   assert.equal(classifyProviderError("getaddrinfo ENOTFOUND api.example.com"), "dns");
   assert.equal(classifyProviderError("connect ECONNREFUSED 127.0.0.1"), "connection_refused");

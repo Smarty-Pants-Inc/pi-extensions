@@ -88,7 +88,7 @@ describe("Pi SDK extension prefilter", () => {
         hasConfiguredAuth: () => true,
       },
     };
-    const ctx: any = { cwd, getSystemPrompt: () => "PARENT", model, modelRegistry };
+    const ctx: any = { cwd, isProjectTrusted: () => true, getSystemPrompt: () => "PARENT", model, modelRegistry };
     let session: Parameters<typeof shutdownAndDisposeSession>[0] | undefined;
     try {
       await runAgent(ctx, "e2e", "go", {

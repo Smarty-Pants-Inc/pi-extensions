@@ -1,5 +1,5 @@
 export const ASSISTANT_METADATA_MODES = ["off", "compact", "expanded"] as const;
-export const ASSISTANT_STOP_REASONS = ["stop", "toolUse", "length", "error", "aborted"] as const;
+export const ASSISTANT_STOP_REASONS = ["stop", "toolUse", "length", "error", "aborted", "deferred"] as const;
 
 export type StampAssistantMetadataMode = (typeof ASSISTANT_METADATA_MODES)[number];
 export type AssistantStopReason = (typeof ASSISTANT_STOP_REASONS)[number];

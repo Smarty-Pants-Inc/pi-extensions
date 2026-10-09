@@ -202,6 +202,7 @@ function createSession(finalText: string) {
 
 const ctx = {
   cwd: "/tmp",
+  isProjectTrusted: () => true,
   model: undefined,
   modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
   getSystemPrompt: vi.fn(() => "parent prompt"),
@@ -660,7 +661,7 @@ describe("agent-runner final output capture", () => {
       cwd: "/tmp/worktree",
       agentDir: "/mock/agent-dir",
     }));
-    expect(settingsManagerCreate).toHaveBeenCalledWith("/tmp/worktree", "/mock/agent-dir");
+    expect(settingsManagerCreate).toHaveBeenCalledWith("/tmp/worktree", "/mock/agent-dir", { projectTrusted: false });
     expect(sessionManagerInMemory).toHaveBeenCalledWith("/tmp/worktree");
     expect(createAgentSession).toHaveBeenCalledWith(expect.objectContaining({
       cwd: "/tmp/worktree",
@@ -1269,7 +1270,7 @@ describe("agent-runner skill scope", () => {
       expect((skillsOverride as (base: typeof extensionSkills) => typeof extensionSkills)(extensionSkills))
         .toEqual({ skills: [], diagnostics: [] });
       if (Array.isArray(skills)) {
-        expect(preloadSkills).toHaveBeenCalledWith(["selected-skill"], "/tmp");
+        expect(preloadSkills).toHaveBeenCalledWith(["selected-skill"], "/tmp", { projectTrusted: true, deniedResource: expect.any(Function) });
       } else {
         expect(preloadSkills).not.toHaveBeenCalled();
       }

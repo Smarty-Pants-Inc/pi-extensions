@@ -1,5 +1,19 @@
 # @signalridge/pi-analytics
 
+## 1.3.3
+### Patch Changes
+
+- 3364cc0: Require a current observed dispatch before attributing assistant failures to a physical provider, and ignore idle cache-warming provider hooks so they cannot create phantom response cycles.
+- 3364cc0: Treat raw provider hooks as ambiguous after extension reload because retained in-flight cache warmers can deliver delayed callbacks to fresh extension factories. Keep pre-dispatch router failures unattributed without phantom generations or warm HTTP errors, while preserving normal startup/new-session defaults and successful generation and tool attribution.
+- 3364cc0: Use patched Vitest 4.1.11 for development and regression testing without moving to a new major version. Refresh compatible transitive dependencies to include fixed source-map and brace-expansion releases.
+- 3364cc0: Preserve pre-request route failures and finalized physical dispatch attribution in analytics, normalize skill read paths, and account for direct tool usage and dispatched thinking levels with a rebuilt usage cache and Pi's public agent-directory resolver. Capture sanitized terminal deferred assistant stamps and use finalized tool outcomes while retaining execution timings.
+- 3364cc0: Adopt Pi 1.0.4's host-provided dependency contract: declare imported Pi and TypeBox modules as `*` peers rather than installing duplicate runtime modules, and align Pi development pins with the repository's tested 1.0.4 baseline. The wildcard identifies host module ownership; it does not promise compatibility with every Pi version.
+- 3364cc0: Keep live native prompt history ahead of deferred cross-session scans without remounting the editor, while retaining cached prompts for Ctrl+R. Exclude streaming cache warming from assistant generations and reliability, preserve finalized model attribution across sequential tools and skill reads, and conservatively avoid dispatch attribution from untagged overlapping provider hooks.
+- Updated dependencies [3364cc0]
+- Updated dependencies [3364cc0]
+- Updated dependencies [3364cc0]
+  - @signalridge/pi-ui@1.3.3
+
 ## 1.3.2
 ### Patch Changes
 

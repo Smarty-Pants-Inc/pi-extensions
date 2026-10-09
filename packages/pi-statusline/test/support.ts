@@ -1,6 +1,7 @@
 import os from "node:os";
 import path from "node:path";
-import { Key, type KeyId, matchesKey } from "@earendil-works/pi-tui";
+import { ExtensionEditorComponent } from "@earendil-works/pi-coding-agent";
+import { Editor, Key, type KeyId, matchesKey } from "@earendil-works/pi-tui";
 
 type MockHandler = (...args: unknown[]) => unknown;
 
@@ -38,6 +39,7 @@ type MockPiApi = {
   setActiveTools(names: string[]): void;
   getAllTools(): unknown[];
   getThinkingLevel(): string;
+  getSettings(): { externalEditor?: string };
   setThinkingLevel(level: string): void;
   appendEntry(customType: string, data: unknown): void;
   sendUserMessage(text: string, messageOptions?: unknown): void;
@@ -50,6 +52,7 @@ export function createMockPi(
     activeTools?: string[];
     allTools?: unknown[];
     thinkingLevel?: string;
+    externalEditor?: string;
     clampThinkingLevel?: (level: string) => string;
   } = {},
 ) {
@@ -145,6 +148,9 @@ export function createMockPi(
     },
     getThinkingLevel() {
       return thinkingLevel;
+    },
+    getSettings() {
+      return { externalEditor: options.externalEditor };
     },
     setThinkingLevel(level: string) {
       thinkingLevel = options.clampThinkingLevel?.(level) ?? level;
@@ -259,15 +265,31 @@ export function createMockContext(overrides: Record<string, unknown> = {}) {
     return harness.result;
   };
   const customOverride = overrides.custom as ((factory: unknown, options?: unknown) => Promise<unknown>) | undefined;
-  const custom =
-    customOverride && selectOverride
-      ? async (factory: unknown, options?: unknown) => {
-          const probe = createCustomSelectorHarness(factory, 100);
-          const standard = probe.isPiTuiKitScreen;
-          probe.dispose();
-          return standard ? defaultCustom(factory) : customOverride(factory, options);
+  const editorOverride = overrides.editor as
+    | ((title: string, prefill: string) => Promise<string | undefined>)
+    | undefined;
+  const custom = async (factory: unknown, options?: unknown) => {
+    if (editorOverride || (customOverride && selectOverride)) {
+      const probe = createCustomSelectorHarness(factory, 100);
+      if (probe.component instanceof ExtensionEditorComponent && editorOverride) {
+        // Script the real public editor rather than resolving a native-editor promise.
+        const editor = probe.component.children.find((child) => child instanceof Editor);
+        if (!(editor instanceof Editor)) throw new Error("Expected Pi's extension editor");
+        probe.setFocused(true);
+        const response = await editorOverride(probe.render().join("\n"), editor.getText());
+        if (response === undefined) probe.handleInput("tui.select.cancel");
+        else {
+          editor.setText(response);
+          probe.handleInput("tui.input.submit");
         }
-      : (customOverride ?? defaultCustom);
+        return probe.resultPromise;
+      }
+      const standard = probe.isPiTuiKitScreen;
+      probe.dispose();
+      return standard ? defaultCustom(factory) : (customOverride ?? defaultCustom)(factory, options);
+    }
+    return (customOverride ?? defaultCustom)(factory, options);
+  };
 
   const ctx = {
     cwd: overrides.cwd ?? process.cwd(),
@@ -444,6 +466,9 @@ export function createCustomSelectorHarness(
       (component as { dispose?: () => void }).dispose?.();
     },
     resultPromise,
+    get component() {
+      return component;
+    },
     get isPiTuiKitScreen() {
       return (component as { __piTuiKitScreen?: true }).__piTuiKitScreen === true;
     },

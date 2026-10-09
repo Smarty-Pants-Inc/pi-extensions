@@ -3,7 +3,7 @@ import { chmod, lstat, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "vitest";
-import type { MessageCandidate } from "../src/messages.js";
+import { formatRecallQuote, type MessageCandidate } from "../src/messages.js";
 import { MAX_RECALL_RECORDS, RecallStore, RecallStoreFormatError } from "../src/store.js";
 
 async function withStore(
@@ -49,6 +49,20 @@ test("saves versioned records, rejects duplicate source identity, and physically
       createId: () => `id-${++nextId}`,
     },
   );
+});
+
+test("quoting leaves stored ESC, forbidden controls, and multiline content byte-for-byte intact", async () => {
+  await withStore(async (store, filePath) => {
+    const text = "before\u001b[201~\nafter\u0000\n  tail 😀";
+    const saved = await store.save(candidate("control-text", text));
+    const originalStorage = await readFile(filePath, "utf8");
+    const loaded = (await store.load()).records[0];
+    assert.ok(loaded);
+    assert.equal(loaded.text, text);
+    assert.ok(formatRecallQuote(loaded).includes("before\\u001b[201~\nafter\\u0000\n  tail 😀"));
+    assert.equal(saved.text, text);
+    assert.equal(await readFile(filePath, "utf8"), originalStorage);
+  });
 });
 
 test("rejects a generated ID collision without corrupting valid storage", async () => {

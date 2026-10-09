@@ -88,6 +88,7 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
   let settings: PlanModeSettings = { thinkingLevel: "inherit" };
   let toggleShortcut: ReturnType<typeof configuredPlanModeToggleShortcut>;
   let previousTools: string[] | undefined;
+  let permittedTools: Set<string> | undefined;
   let readyPresentationIntent: ReadyPresentationIntent | undefined;
   let latestCommandContext: ExtensionCommandContext | undefined;
   let nextReadyPresentationNonce = 0;
@@ -95,6 +96,9 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
   let workflowGeneration = 0;
   let refreshStateBeforeFirstAgentStart = false;
   let menuController = new AbortController();
+  let workflowController = new AbortController();
+  const ownedThinkingChanges: Array<{ previousLevel: string; level: string }> = [];
+  let settingOwnedThinking = false;
   const implementationRetention = createImplementationRetentionCoordinator();
   const persistState = () => pi.appendEntry<PlanModeState>(STATE_ENTRY_TYPE, state);
 
@@ -113,7 +117,9 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
     pi.registerShortcut(nextShortcut, {
       description: "Toggle Plan mode",
       handler: (ctx) => {
-        togglePlanMode(ctx);
+        // Pi's editor captures registrations at startup; replacing a registration
+        // does not replace that captured handler until /reload.
+        if (configuredPlanModeToggleShortcut(settings) === nextShortcut) togglePlanMode(ctx);
       },
     });
     toggleShortcut = nextShortcut;
@@ -164,7 +170,7 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
       "In Plan mode, use plan_mode_question for important preferences, tradeoffs, or assumptions that cannot be discovered from read-only exploration.",
     ],
     parameters: PLAN_MODE_QUESTION_PARAMS,
-    async execute(_toolCallId, params: unknown, _signal, _onUpdate, ctx) {
+    async execute(_toolCallId, params: unknown, signal, _onUpdate, ctx) {
       if (!state.enabled) {
         return planModeQuestionCancelled(
           [],
@@ -189,6 +195,11 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
       const sessionGeneration = menuGeneration;
       const questionWorkflowGeneration = workflowGeneration;
       return answerPlanModeQuestions(parsed.questions, ctx, {
+        signal: AbortSignal.any(
+          [signal, ctx.signal, menuController.signal, workflowController.signal].filter(
+            (candidate): candidate is AbortSignal => candidate !== undefined,
+          ),
+        ),
         isCurrent: () => sessionGeneration === menuGeneration && questionWorkflowGeneration === workflowGeneration,
         isEnabled: () => state.enabled,
       });
@@ -197,6 +208,7 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
 
   pi.registerTool({
     name: PLAN_MODE_COMPLETE_TOOL_NAME,
+    exposure: "model-only",
     label: "Complete plan",
     description:
       "Submit the complete decision-ready implementation plan for user review. Only available while Plan mode is active, and must be the final standalone action.",
@@ -316,6 +328,8 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
 
   pi.on("session_start", async (event, ctx) => {
     const generation = ++menuGeneration;
+    advanceWorkflow();
+    permittedTools = undefined;
     refreshStateBeforeFirstAgentStart = event.reason === "new";
     menuController.abort(new DOMException("Plan-mode session replaced", "AbortError"));
     menuController = new AbortController();
@@ -356,7 +370,45 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
     updateUi(ctx);
   });
 
+  pi.on("session_tree", (_event, ctx) => {
+    // This is the committed boundary: getBranch() now belongs to the target.
+    // Pi has already restored any loadout declared by the target's canonical
+    // transcript. Even an empty system loadout owns the target's tools.
+    const targetDeclaresTools = ctx.sessionManager
+      .buildSessionProjection()
+      .messages.some((message) => message.role === "system");
+    menuGeneration += 1;
+    advanceWorkflow();
+    menuController.abort(new DOMException("Plan-mode branch changed", "AbortError"));
+    menuController = new AbortController();
+    readyPresentationIntent = undefined;
+    latestCommandContext = undefined;
+    refreshStateBeforeFirstAgentStart = false;
+    if (state.enabled) {
+      if (!targetDeclaresTools) restoreTools();
+      restoreThinkingLevel();
+    }
+    previousTools = undefined;
+    permittedTools = undefined;
+    restoreState(ctx);
+    implementationRetention.reset();
+    implementationRetention.restore(state.activeImplementation);
+    if (state.enabled) {
+      activatePlanModeTools();
+      applyPlanThinkingLevel();
+    } else deactivatePlanModeQuestionTool();
+    updateUi(ctx);
+  });
+
   pi.on("thinking_level_select", (event) => {
+    const owned = ownedThinkingChanges.findIndex(
+      (change) =>
+        change.previousLevel === event.previousLevel && (settingOwnedThinking || change.level === event.level),
+    );
+    if (owned >= 0) {
+      ownedThinkingChanges.splice(owned, 1);
+      return;
+    }
     if (!state.enabled || !state.appliedThinkingLevel) return;
     if (event.level !== state.appliedThinkingLevel) {
       state = {
@@ -371,6 +423,7 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
 
   pi.on("session_shutdown", async (_event, ctx) => {
     menuGeneration += 1;
+    advanceWorkflow();
     menuController.abort(new DOMException("Plan-mode session shut down", "AbortError"));
     readyPresentationIntent = undefined;
     latestCommandContext = undefined;
@@ -408,6 +461,12 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
         reason: `Plan mode blocks built-in tool '${event.toolName}' because its metadata is unavailable.`,
       };
     }
+    if (!permittedTools?.has(event.toolName)) {
+      return {
+        block: true,
+        reason: `Plan mode blocks tool '${event.toolName}' because it is outside the frozen planning tool selection.`,
+      };
+    }
     // Built-in-compatible overrides retain the canonical name but replace its source metadata.
     if (event.toolName !== "bash") return;
 
@@ -421,11 +480,30 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
   });
 
   pi.on("context", async (event, ctx) => {
+    // Tool registration may refresh Pi's loadout during a run. Reconcile at
+    // every model response boundary, not only at before_agent_start.
+    if (state.enabled) applyPlanModeTools();
     const result = implementationRetention.transformContext(event.messages, state);
     if (result.clearActiveImplementationId) {
       clearActiveImplementation(result.clearActiveImplementationId, ctx);
     }
     return { messages: result.messages as typeof event.messages };
+  });
+
+  pi.on("context_with_system", (event) => {
+    if (!state.enabled) return;
+    // Pi declares a live loadout delta before context handlers run. Removing a
+    // late registration from the runtime alone is too late for that request's
+    // transcript; also filter its request-local declarations at this boundary.
+    applyPlanModeTools();
+    const active = new Set(safeGetActiveTools());
+    return {
+      messages: event.messages.map((message) =>
+        message.role === "system" && message.toolsAdded
+          ? { ...message, toolsAdded: message.toolsAdded.filter((tool) => active.has(tool.name)) }
+          : message,
+      ),
+    };
   });
 
   pi.on("before_agent_start", (event, ctx) => {
@@ -502,9 +580,18 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
     }
   });
 
-  function enterPlanMode(ctx: ExtensionContext) {
+  function advanceWorkflow() {
     workflowGeneration += 1;
-    if (!state.enabled) previousTools = withoutRequiredPlanModeTools(safeGetActiveTools());
+    workflowController.abort(new DOMException("Plan-mode workflow changed", "AbortError"));
+    workflowController = new AbortController();
+  }
+
+  function enterPlanMode(ctx: ExtensionContext) {
+    advanceWorkflow();
+    if (!state.enabled) {
+      previousTools = withoutRequiredPlanModeTools(safeGetActiveTools());
+      permittedTools = undefined;
+    }
     state = {
       ...state,
       enabled: true,
@@ -536,7 +623,7 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
   }
 
   function exitPlanMode(ctx: ExtensionContext) {
-    workflowGeneration += 1;
+    advanceWorkflow();
     const wasEnabled = state.enabled;
     readyPresentationIntent = undefined;
     state = {
@@ -656,7 +743,7 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
     }
     const source = state.latestPlanSource ?? "legacy_proposed_plan";
 
-    workflowGeneration += 1;
+    advanceWorkflow();
     readyPresentationIntent = undefined;
     state = {
       ...state,
@@ -705,7 +792,7 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
       return;
     }
 
-    workflowGeneration += 1;
+    advanceWorkflow();
     const previousState = state;
     const wasEnabled = state.enabled;
     readyPresentationIntent = undefined;
@@ -749,7 +836,7 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
 
   function clearActiveImplementation(id: string, ctx: ExtensionContext) {
     if (state.activeImplementation?.id !== id) return false;
-    workflowGeneration += 1;
+    advanceWorkflow();
     state = { ...state, activeImplementation: undefined };
     persistState();
     updateUi(ctx);
@@ -865,11 +952,17 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
 
   function activatePlanModeTools() {
     previousTools ??= withoutRequiredPlanModeTools(safeGetActiveTools());
+    permittedTools ??= new Set(planModeToolNames());
     applyPlanModeTools();
   }
 
   function applyPlanModeTools() {
-    pi.setActiveTools(planModeToolNames());
+    pi.setActiveTools(
+      Array.from(permittedTools ?? []).filter((name) => {
+        const tool = toolByName(name);
+        return !tool || canSelectToolInPlanMode(tool);
+      }),
+    );
   }
 
   function planModeToolNames() {
@@ -915,12 +1008,30 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
     const restoredTools = previousTools ?? DEFAULT_TOOLS;
     pi.setActiveTools(withoutRequiredPlanModeTools(restoredTools));
     previousTools = undefined;
+    permittedTools = undefined;
+  }
+
+  function setOwnedThinkingLevel(level: Parameters<typeof setPlanThinkingLevel>[1]) {
+    const change = { previousLevel: pi.getThinkingLevel(), level: String(level) };
+    if (change.previousLevel === level) return;
+    ownedThinkingChanges.push(change);
+    settingOwnedThinking = true;
+    try {
+      setPlanThinkingLevel(pi, level);
+      change.level = pi.getThinkingLevel();
+    } finally {
+      settingOwnedThinking = false;
+      if (change.level === change.previousLevel) {
+        const index = ownedThinkingChanges.indexOf(change);
+        if (index >= 0) ownedThinkingChanges.splice(index, 1);
+      }
+    }
   }
 
   function applyPlanThinkingLevel() {
     if (state.manualThinkingLevel) {
       if (pi.getThinkingLevel() !== state.manualThinkingLevel) {
-        setPlanThinkingLevel(pi, state.manualThinkingLevel);
+        setOwnedThinkingLevel(state.manualThinkingLevel);
       }
       return;
     }
@@ -935,7 +1046,7 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
     }
     const current = pi.getThinkingLevel();
     if (!state.appliedThinkingLevel) state.previousThinkingLevel = current;
-    if (current !== configured) setPlanThinkingLevel(pi, configured);
+    if (current !== configured) setOwnedThinkingLevel(configured);
     state.appliedThinkingLevel = pi.getThinkingLevel();
   }
 
@@ -955,7 +1066,7 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
     captureManualThinkingLevel();
     const { appliedThinkingLevel, previousThinkingLevel } = state;
     if (appliedThinkingLevel && previousThinkingLevel && pi.getThinkingLevel() === appliedThinkingLevel) {
-      setPlanThinkingLevel(pi, previousThinkingLevel);
+      setOwnedThinkingLevel(previousThinkingLevel);
     }
     state = { ...state, appliedThinkingLevel: undefined, previousThinkingLevel: undefined };
   }
@@ -997,7 +1108,7 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
   }
 
   function formatToolSummary() {
-    const names = planModeToolNames();
+    const names = state.enabled ? Array.from(permittedTools ?? []) : planModeToolNames();
     return `Tools: ${names.length > 0 ? names.join(", ") : "none"}`;
   }
 

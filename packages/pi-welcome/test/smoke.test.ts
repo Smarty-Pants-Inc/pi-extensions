@@ -39,7 +39,7 @@ test("summarizes resources without reloading the active resource loader", async 
     mode: "tui",
     cwd: process.cwd(),
     hasUI: false,
-    sessionManager: { getEntries: () => [] },
+    sessionManager: { buildContextEntries: () => [], getBranch: () => [] },
     isProjectTrusted: () => true,
     model: undefined,
     thinkingLevel: undefined,

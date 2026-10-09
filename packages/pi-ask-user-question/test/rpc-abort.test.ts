@@ -24,7 +24,7 @@ for (const kind of ["single", "multi", "other"] as const) {
       });
     runner.setUIContext(
       {
-        select: kind === "other" ? async () => "Other (free text)" : pending,
+        select: kind === "other" ? async () => "[action:other] Other (free text)" : pending,
         input: pending,
         editor: () => {
           throw new Error("RPC editor cannot be aborted");
@@ -58,8 +58,8 @@ for (const kind of ["single", "multi", "other"] as const) {
       undefined,
       runner.createContext(),
     );
-    staleComplete("B");
-    complete("A");
+    staleComplete("[option:2] B");
+    complete("[option:1] A");
     const answer = await next;
     assert.equal(answer.details.cancelled, false);
     assert.deepEqual(answer.details.answers[0]?.selected, { label: "A", value: "A", index: 0 });

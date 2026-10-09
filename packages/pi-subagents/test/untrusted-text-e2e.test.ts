@@ -53,6 +53,7 @@ function makePi() {
 function ctxWith(cwd: string) {
   return {
     mode: "tui",
+    isProjectTrusted: () => true,
     hasUI: true,
     ui: {
       setStatus: vi.fn(),

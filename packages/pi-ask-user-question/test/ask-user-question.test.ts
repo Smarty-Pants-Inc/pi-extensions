@@ -84,7 +84,12 @@ test("non-TUI and no-UI execution returns structured cancellation without custom
 });
 
 test("RPC fallback answers single and batch questions, including Other and Back", async () => {
-  const choices = ["Other (free text)", "Back (revise previous answer)", "Fast", "Safe"];
+  const choices = [
+    "[action:other] Other (free text)",
+    "[action:back] Back (revise previous answer)",
+    "[option:1] Fast",
+    "[option:1] Safe",
+  ];
   const titles: string[] = [];
   const select = async (title: string): Promise<string | undefined> => {
     titles.push(title);
@@ -136,7 +141,7 @@ test("RPC cancellation keeps ordered partial answers", async () => {
       hasUI: true,
       ui: {
         custom: async () => undefined,
-        select: async () => (calls++ === 0 ? "A" : undefined),
+        select: async () => (calls++ === 0 ? "[option:1] A" : undefined),
         editor: async () => undefined,
       },
     } as never,

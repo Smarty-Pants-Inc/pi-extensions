@@ -118,12 +118,7 @@ export class FooterUsageAccumulator {
         sessionMessageIndex += 1;
         continue;
       }
-      if (entry.type === "usage") {
-        this.addUsageEntry(entry);
-        continue;
-      }
-      const value = usageForEntry(entry);
-      if (value) addContribution(this.summary, contribution(value.usage, value.assistant), 1);
+      this.addStandaloneEntry(entry);
     }
     if (lastAnonymousAssistantKey) this.anonymousAssistantKey = lastAnonymousAssistantKey;
   }
@@ -133,16 +128,19 @@ export class FooterUsageAccumulator {
     let changed = false;
     for (let index = this.scannedEntryCount; index < entries.length; index += 1) {
       const entry = entries[index];
-      if (entry?.type === "usage" && this.addUsageEntry(entry)) changed = true;
+      if (entry && this.addStandaloneEntry(entry)) changed = true;
     }
     this.scannedEntryCount = entries.length;
     return changed;
   }
 
-  private addUsageEntry(entry: { id: string; usage: UsageLike }): boolean {
-    if (this.usageEntryIds.has(entry.id)) return false;
+  private addStandaloneEntry(entry: UsageSessionEntry): boolean {
+    // Message events already contribute these; polling must never count them twice.
+    if (entry.type === "message") return false;
+    const value = usageForEntry(entry);
+    if (!value || this.usageEntryIds.has(entry.id)) return false;
     this.usageEntryIds.add(entry.id);
-    addContribution(this.summary, contribution(entry.usage, false), 1);
+    addContribution(this.summary, contribution(value.usage, false), 1);
     return true;
   }
 

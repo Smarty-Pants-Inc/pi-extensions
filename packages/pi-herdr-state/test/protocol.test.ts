@@ -1,4 +1,4 @@
-import { test } from "bun:test";
+import { spyOn, test } from "bun:test";
 import assert from "node:assert/strict";
 import { createReporter, normalizeSessionStartSource, sessionRefFromValues, socketEndpointFor } from "../src/index.js";
 
@@ -164,6 +164,104 @@ test("settling while a native prompt is open stays blocked until its end", async
     assert.equal((requests.at(-1)?.params as Request | undefined)?.state, "idle");
   } finally {
     await pi.emit("session_shutdown", { reason: "reload" });
+  }
+});
+
+test("idle cache warming onPayload refresh never revives working after settlement or poll ticks", async () => {
+  const interval = spyOn(globalThis, "setInterval");
+  const pi = fakePi();
+  const requests: Request[] = [];
+  createReporter(pi, async (request) => {
+    requests.push(request as Request);
+  });
+  let idle = false;
+  const ctx = { ...context("tui", "/tmp/warm.jsonl", "warm"), isIdle: () => idle };
+  try {
+    await pi.emit("session_start", { reason: "startup" }, ctx);
+    idle = true;
+    await pi.emit("agent_settled", {}, ctx);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    requests.length = 0;
+    await pi.emit("before_provider_request", { reason: "cache_warming_idle", payload: { private: "payload" } }, ctx);
+    const tick = interval.mock.calls[0]?.[0];
+    assert.equal(typeof tick, "function");
+    if (typeof tick === "function") {
+      tick();
+      tick();
+      await flushRequests();
+      tick();
+      tick();
+      await flushRequests();
+    }
+    assert.ok(requests.length > 0);
+    assert.ok(requests.every((request) => (request.params as Request).state === "idle"));
+    assert.equal(JSON.stringify(requests).includes("payload"), false);
+  } finally {
+    await pi.emit("session_shutdown", { reason: "reload" });
+    interval.mockRestore();
+  }
+});
+
+test("malformed bus notifications cannot release or acquire manual blocked ownership", async () => {
+  const pi = fakePi();
+  const requests: Request[] = [];
+  createReporter(pi, async (request) => {
+    requests.push(request as Request);
+  });
+  const ctx = context("tui", "/tmp/malformed.jsonl", "malformed");
+  try {
+    await pi.emit("session_start", { reason: "startup" }, ctx);
+    await pi.emit("herdr:blocked", { active: true, label: "manual" });
+    await flushRequests();
+    const count = requests.length;
+    for (const payload of [
+      null,
+      {},
+      [],
+      "false",
+      { active: "false" },
+      { active: 0 },
+      { active: false, label: null },
+      { active: true, label: 123 },
+    ]) {
+      await pi.emit("herdr:blocked", payload);
+      await flushRequests();
+      assert.equal(requests.length, count);
+      assert.equal((requests.at(-1)?.params as Request | undefined)?.state, "blocked");
+      assert.equal((requests.at(-1)?.params as Request | undefined)?.message, "manual");
+    }
+    await pi.emit("herdr:blocked", { active: false });
+    await flushRequests();
+    assert.equal((requests.at(-1)?.params as Request | undefined)?.state, "idle");
+  } finally {
+    await pi.emit("session_shutdown", { reason: "reload" });
+  }
+});
+
+test("poll allocation is session-scoped: discovery/headless zero, TUI one, shutdown zero", async () => {
+  const interval = spyOn(globalThis, "setInterval");
+  const clear = spyOn(globalThis, "clearInterval");
+  const pi = fakePi();
+  createReporter(pi, async () => {});
+  try {
+    assert.equal(interval.mock.calls.length, 0);
+    await pi.emit("session_start", { reason: "startup" }, context("rpc", undefined, "rpc"));
+    await pi.emit("session_start", { reason: "startup" }, context("print", undefined, "print"));
+    assert.equal(interval.mock.calls.length, 0);
+    await pi.emit("session_start", { reason: "startup" }, context("tui", undefined, "tui"));
+    await pi.emit("session_start", { reason: "startup" }, context("tui", undefined, "tui"));
+    assert.equal(interval.mock.calls.length, 1);
+    assert.equal(clear.mock.calls.length, 0);
+    await pi.emit("session_shutdown", { reason: "reload" });
+    assert.equal(clear.mock.calls.length, 1);
+    await pi.emit("session_shutdown", { reason: "reload" });
+    await pi.emit("session_start", { reason: "startup" }, context("tui", undefined, "tui"));
+    assert.equal(interval.mock.calls.length, 1);
+    assert.equal(clear.mock.calls.length, 1);
+  } finally {
+    await pi.emit("session_shutdown", { reason: "reload" });
+    interval.mockRestore();
+    clear.mockRestore();
   }
 });
 

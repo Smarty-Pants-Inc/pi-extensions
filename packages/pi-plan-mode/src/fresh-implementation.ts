@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionCommandContext, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
@@ -123,9 +123,11 @@ export async function startFreshImplementationSession(
   }
   let parentSession =
     typeof ctx.sessionManager.getSessionFile === "function" ? ctx.sessionManager.getSessionFile() : undefined;
+  let snapshot: ReturnType<typeof snapshotInMemoryBranch> | undefined;
   if (!parentSession && sourceBranch.length > 0) {
     try {
-      parentSession = snapshotInMemoryBranch(ctx, sourceBranch);
+      snapshot = snapshotInMemoryBranch(ctx, sourceBranch);
+      parentSession = snapshot.sessionFile;
     } catch (error: unknown) {
       safeNotify(
         ctx,
@@ -140,13 +142,15 @@ export async function startFreshImplementationSession(
   let modelNeedsConfirmation = false;
   let replaced = false;
 
-  if (ctx.mode === "rpc") ctx.ui.notify("Starting fresh implementation session…", "info");
-
   let result: Awaited<ReturnType<ExtensionCommandContext["newSession"]>>;
   try {
+    if (ctx.mode === "rpc") ctx.ui.notify("Starting fresh implementation session…", "info");
     result = await ctx.newSession({
       ...(parentSession ? { parentSession } : {}),
       setup: async (sessionManager) => {
+        // Pi applies the destination before setup, then rebinds before withSession.
+        // A failure at either later boundary must retain its resumable parent.
+        replaced = true;
         try {
           sessionManager.appendCustomEntry(request.stateEntryType, destinationState);
         } catch (error: unknown) {
@@ -192,6 +196,10 @@ export async function startFreshImplementationSession(
       "error",
     );
     return { kind: "rejected" };
+  } finally {
+    // Only a committed destination owns the parent snapshot. A veto or failure
+    // before replacement must not leave a copy of private planning history.
+    if (!replaced) snapshot?.cleanup();
   }
 
   if (result.cancelled) {
@@ -242,22 +250,28 @@ function safeNotify(ctx: ExtensionCommandContext, message: string, level: "info"
   }
 }
 
-function snapshotInMemoryBranch(ctx: ExtensionCommandContext, branch: readonly SessionEntry[]): string {
+function snapshotInMemoryBranch(ctx: ExtensionCommandContext, branch: readonly SessionEntry[]) {
   const directory = mkdtempSync(join(tmpdir(), "pi-plan-mode-"));
-  const sessionId = randomUUID();
-  const sessionFile = join(directory, `${sessionId}.jsonl`);
-  const header = {
-    type: "session" as const,
-    version: 3,
-    id: sessionId,
-    timestamp: new Date().toISOString(),
-    cwd: typeof ctx.sessionManager.getCwd === "function" ? ctx.sessionManager.getCwd() : ctx.cwd,
-  };
-  writeFileSync(sessionFile, `${[header, ...branch].map((entry) => JSON.stringify(entry)).join("\n")}\n`, {
-    encoding: "utf8",
-    mode: 0o600,
-  });
-  return sessionFile;
+  const cleanup = () => rmSync(directory, { recursive: true, force: true });
+  try {
+    const sessionId = randomUUID();
+    const sessionFile = join(directory, `${sessionId}.jsonl`);
+    const header = {
+      type: "session" as const,
+      version: 3,
+      id: sessionId,
+      timestamp: new Date().toISOString(),
+      cwd: typeof ctx.sessionManager.getCwd === "function" ? ctx.sessionManager.getCwd() : ctx.cwd,
+    };
+    writeFileSync(sessionFile, `${[header, ...branch].map((entry) => JSON.stringify(entry)).join("\n")}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    return { sessionFile, cleanup };
+  } catch (error) {
+    cleanup();
+    throw error;
+  }
 }
 
 function isCommandContext(ctx: ExtensionContext): ctx is ExtensionCommandContext {

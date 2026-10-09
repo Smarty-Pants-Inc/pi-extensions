@@ -32,6 +32,7 @@ jobs:
       - run: bun run lint
       - run: bun run typecheck
       - run: bun run test
+      - run: bun run test:integration
       - run: bun run test:release
       - run: bun run test:config
       - run: bun run smoke:pi

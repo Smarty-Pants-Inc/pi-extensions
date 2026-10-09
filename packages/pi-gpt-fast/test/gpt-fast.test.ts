@@ -7,10 +7,13 @@
  * fails the entire request, which is exactly why the allowlist is exact pairs
  * rather than a prefix match — so the gate is what these tests are mostly about.
  */
-import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { SettingsManager } from "@earendil-works/pi-coding-agent";
+import lockfile from "proper-lockfile";
 import gptFast from "../src/index.js";
 
 let agentDir: string;
@@ -232,4 +235,181 @@ test("confirms the model by name when enabled on an allowlisted one", async () =
   await pi.command("on", ctx(onAllowlist));
   expect(notices.at(-1)?.level).toBe("info");
   expect(notices.at(-1)?.message).toContain("openai/gpt-5.6");
+});
+
+test("both settings readers accept a BOM and preserve unrelated keys", async () => {
+  const path = join(agentDir, "settings.json");
+  writeFileSync(path, '\uFEFF{"theme":"dark","pi-gpt-fast":{"enabled":true,"other":1}}');
+  const pi = boot();
+  pi.sessionStart(ctx(onAllowlist));
+  expect(pi.request({ m: 1 }, ctx(onAllowlist))).toBeDefined();
+  await pi.command("off");
+  expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({
+    theme: "dark",
+    "pi-gpt-fast": { enabled: false, other: 1 },
+  });
+});
+
+for (const bytes of ["{ not json", "", "null", "[]", "42", '{"pi-gpt-fast":false}', '{"pi-gpt-fast":null}']) {
+  test(`invalid settings remain byte-for-byte unchanged: ${JSON.stringify(bytes)}`, async () => {
+    const path = join(agentDir, "settings.json");
+    writeFileSync(path, bytes);
+    await boot().command("on");
+    expect(readFileSync(path)).toEqual(Buffer.from(bytes));
+    expect(notices.some(({ message }) => message.includes("could not persist state"))).toBe(true);
+    expect(existsSync(`${path}.lock`)).toBe(false);
+    expect(readdirSync(agentDir)).toEqual(["settings.json"]);
+  });
+}
+
+test("an unreadable settings target is not replaced", async () => {
+  const path = join(agentDir, "settings.json");
+  mkdirSync(path);
+  writeFileSync(join(path, "retained"), "untouched");
+  await boot().command("on");
+  expect(readFileSync(join(path, "retained"), "utf8")).toBe("untouched");
+  expect(notices.some(({ message }) => message.includes("could not persist state"))).toBe(true);
+  expect(existsSync(`${path}.lock`)).toBe(false);
+});
+
+test("a lock acquisition failure cannot create or overwrite settings", async () => {
+  const path = join(agentDir, "settings.json");
+  const lock = spyOn(lockfile, "lockSync").mockImplementation(() => {
+    throw Object.assign(new Error("lock denied"), { code: "EACCES" });
+  });
+  try {
+    await boot().command("on");
+    expect(existsSync(path)).toBe(false);
+    expect(lock).toHaveBeenCalledWith(path, { realpath: false });
+    expect(lock).toHaveBeenCalledTimes(1);
+    expect(notices.some(({ message }) => message.includes("lock denied"))).toBe(true);
+  } finally {
+    lock.mockRestore();
+  }
+});
+
+test("contention with the host settings lock never falls back to an unlocked write", async () => {
+  const path = join(agentDir, "settings.json");
+  writeFileSync(path, '{"theme":"retained"}');
+  const release = lockfile.lockSync(path, { realpath: false });
+  try {
+    await boot().command("on");
+    expect(readFileSync(path, "utf8")).toBe('{"theme":"retained"}');
+    expect(existsSync(`${path}.lock`)).toBe(true); // Do not release another writer's lock.
+    expect(notices.some(({ message }) => message.includes("could not persist state"))).toBe(true);
+  } finally {
+    release();
+  }
+});
+
+test("an absent settings file is created only under the same host lock", async () => {
+  const path = join(agentDir, "settings.json");
+  const acquire = lockfile.lockSync;
+  let released = false;
+  const lock = spyOn(lockfile, "lockSync").mockImplementation((target, options) => {
+    expect(target).toBe(path);
+    expect(options).toEqual({ realpath: false });
+    expect(existsSync(path)).toBe(false);
+    const release = acquire(target, options);
+    return () => {
+      expect(JSON.parse(readFileSync(path, "utf8"))["pi-gpt-fast"]).toEqual({ enabled: true });
+      expect(existsSync(`${path}.lock`)).toBe(true);
+      release();
+      released = true;
+    };
+  });
+  try {
+    await boot().command("on");
+    expect(released).toBe(true);
+    expect(existsSync(`${path}.lock`)).toBe(false);
+  } finally {
+    lock.mockRestore();
+  }
+});
+
+test("a release failure is reported after the atomic settings update", async () => {
+  const path = join(agentDir, "settings.json");
+  writeFileSync(path, '{"theme":"retained"}');
+  const acquire = lockfile.lockSync;
+  const lock = spyOn(lockfile, "lockSync").mockImplementation((target, options) => {
+    const release = acquire(target, options);
+    return () => {
+      release();
+      throw new Error("release failed");
+    };
+  });
+  try {
+    await boot().command("on");
+    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({ theme: "retained", "pi-gpt-fast": { enabled: true } });
+    expect(notices.some(({ message }) => message.includes("release failed"))).toBe(true);
+    expect(readdirSync(agentDir)).toEqual(["settings.json"]);
+  } finally {
+    lock.mockRestore();
+  }
+});
+
+test("a host update at lock acquisition is read before merging the toggle", async () => {
+  const path = join(agentDir, "settings.json");
+  writeFileSync(path, '{"theme":"old","unrelated":1}');
+  const acquire = lockfile.lockSync;
+  const lock = spyOn(lockfile, "lockSync").mockImplementation((target, options) => {
+    // Gate an independent host writer immediately before our lock acquisition.
+    // Reading before lockSync would capture "old" and overwrite the host update.
+    const host = spawnSync(
+      "node",
+      [
+        "--input-type=module",
+        "--eval",
+        `import { SettingsManager } from "@earendil-works/pi-coding-agent";
+         const host = SettingsManager.create(${JSON.stringify(agentDir)}, ${JSON.stringify(agentDir)});
+         host.setTheme("host-updated");
+         await host.flush();
+         if (host.drainErrors().length) process.exit(1);`,
+      ],
+      { cwd: process.cwd(), encoding: "utf8" },
+    );
+    expect(host.status).toBe(0);
+    return acquire(target, options);
+  });
+  try {
+    await boot().command("on");
+    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({
+      theme: "host-updated",
+      unrelated: 1,
+      "pi-gpt-fast": { enabled: true },
+    });
+    expect(existsSync(`${path}.lock`)).toBe(false);
+  } finally {
+    lock.mockRestore();
+  }
+});
+
+test("a deterministic concurrent host settings update preserves both owners' keys", async () => {
+  const path = join(agentDir, "settings.json");
+  writeFileSync(path, '{"theme":"old","unrelated":1}');
+  const host = SettingsManager.create(agentDir, agentDir);
+  const pi = boot();
+  pi.sessionStart(ctx(onAllowlist));
+  // Queue a host write with its old snapshot, but do not flush before the toggle.
+  // The extension writes first; the pending host write must merge under its lock.
+  host.setTheme("new");
+  const toggled = pi.command("on");
+  await Promise.all([toggled, host.flush()]);
+  expect(host.drainErrors()).toEqual([]);
+  expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({
+    theme: "new",
+    unrelated: 1,
+    "pi-gpt-fast": { enabled: true },
+  });
+  // Reverse the ordering too: the extension must read the host's latest bytes,
+  // not the settings snapshot from session_start.
+  host.setTheme("newer");
+  await host.flush();
+  await pi.command("off");
+  expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({
+    theme: "newer",
+    unrelated: 1,
+    "pi-gpt-fast": { enabled: false },
+  });
+  expect(existsSync(`${path}.lock`)).toBe(false);
 });

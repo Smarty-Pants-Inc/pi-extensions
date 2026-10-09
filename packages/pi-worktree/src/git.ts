@@ -70,6 +70,14 @@ export class GitWorktreeError extends Error {
     this.args = args;
   }
 }
+/** A mutation left retained data or an outcome that requires recovery inspection. */
+export class WorktreeRecoveryError extends GitWorktreeError {
+  constructor(message: string) {
+    super(message);
+    this.name = "WorktreeRecoveryError";
+  }
+}
+
 class MetadataDeletionRetainedError extends Error {
   readonly retainedPath: string;
   readonly outcomeUnknown: boolean;
@@ -376,19 +384,35 @@ async function acquireFilesystemMutationLock(key: string, signal?: AbortSignal):
   }
 }
 
-async function withMetadataPruneLock<T>(key: string, operation: () => Promise<T>): Promise<T> {
+async function withMetadataPruneLock<T>(key: string, operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+  signal?.throwIfAborted();
   const previous = metadataPruneLocks.get(key);
   let release!: () => void;
   const current = new Promise<void>((resolveLock) => {
     release = resolveLock;
   });
   metadataPruneLocks.set(key, current);
-  if (previous) await previous;
+  let cancel: (() => void) | undefined;
   try {
+    if (previous) {
+      await Promise.race([
+        previous,
+        new Promise<never>((_resolve, reject) => {
+          cancel = () => reject(new GitWorktreeError("worktree mutation lock wait aborted."));
+          signal?.addEventListener("abort", cancel, { once: true });
+          if (signal?.aborted) cancel();
+        }),
+      ]);
+    }
+    signal?.throwIfAborted();
     return await operation();
   } finally {
-    release();
-    if (metadataPruneLocks.get(key) === current) metadataPruneLocks.delete(key);
+    if (cancel) signal?.removeEventListener("abort", cancel);
+    // A cancelled queue slot must not let its successors overtake the holder.
+    void Promise.resolve(previous).then(() => {
+      release();
+      if (metadataPruneLocks.get(key) === current) metadataPruneLocks.delete(key);
+    });
   }
 }
 
@@ -398,14 +422,19 @@ export function withWorktreeMutationLock<T>(
   signal?: AbortSignal,
 ): Promise<T> {
   const key = worktreeMutationLockKey(cwd);
-  return withMetadataPruneLock(key, async () => {
-    const release = await acquireFilesystemMutationLock(key, signal);
-    try {
-      return await operation();
-    } finally {
-      await release();
-    }
-  });
+  return withMetadataPruneLock(
+    key,
+    async () => {
+      const release = await acquireFilesystemMutationLock(key, signal);
+      try {
+        signal?.throwIfAborted();
+        return await operation();
+      } finally {
+        await release();
+      }
+    },
+    signal,
+  );
 }
 
 function commonDirectoryForGitdir(gitdir: string): string {
@@ -515,19 +544,36 @@ export async function removeWorktreeMetadata(
       throw new GitWorktreeError(`Refusing metadata prune because the stale-record preview changed.`);
     }
     if (targetAdministrative) {
-      await removeAdministrativeRecord(targetAdministrative);
+      await removeAdministrativeRecord(targetAdministrative, signal);
     } else {
-      await runGit(pi, ["worktree", "prune", "--expire", "now"], cwd, signal, GIT_MUTATION_TIMEOUT_MS);
+      signal?.throwIfAborted();
+      try {
+        await runGit(pi, ["worktree", "prune", "--expire", "now"], cwd, signal, GIT_MUTATION_TIMEOUT_MS);
+      } catch (error) {
+        // An interrupted Git process may already have deregistered the tree.
+        throw new WorktreeRecoveryError(
+          `Worktree metadata removal outcome is unknown for ${path}: ${formatError(error)}`,
+        );
+      }
     }
-    const after = await listWorktrees(pi, cwd, signal);
-    if (after.some((record) => pathsEqual(record.path, path))) {
-      throw new GitWorktreeError(`Git did not remove worktree metadata for ${path}.`);
-    }
-    const administrativeAfter = await administrativePruneCandidatesIfPresent(pi, cwd, signal);
-    if (administrativeAfter.length !== 0) {
-      throw new GitWorktreeError(`Git left stale administrative records after pruning ${path}.`);
-    }
+    // Deregistration is the commit point, not the subsequent verification.
+    // Never attempt registration rollback after successful metadata deletion.
     onMetadataRemoved?.();
+    try {
+      // Recovery verification must finish independently of the retired UI owner.
+      const after = await listWorktrees(pi, cwd);
+      if (after.some((record) => pathsEqual(record.path, path))) {
+        throw new GitWorktreeError(`Git did not remove worktree metadata for ${path}.`);
+      }
+      const administrativeAfter = await administrativePruneCandidatesIfPresent(pi, cwd);
+      if (administrativeAfter.length !== 0) {
+        throw new GitWorktreeError(`Git left stale administrative records after pruning ${path}.`);
+      }
+    } catch (error) {
+      throw new WorktreeRecoveryError(
+        `Worktree metadata removal completed for ${path}, but verification failed: ${formatError(error)}`,
+      );
+    }
   };
   if (lockHeld) await operation();
   else await withWorktreeMutationLock(cwd, operation, signal);
@@ -817,7 +863,11 @@ async function removeMetadataTree(path: string, expected: MetadataIdentity): Pro
   }
 }
 
-async function removeAdministrativeRecord(candidate: AdministrativePruneCandidate): Promise<void> {
+async function removeAdministrativeRecord(
+  candidate: AdministrativePruneCandidate,
+  signal?: AbortSignal,
+): Promise<void> {
+  signal?.throwIfAborted();
   const expected = administrativeIdentities.get(candidate);
   if (!expected) throw new GitWorktreeError(`Git metadata identity was not captured for ${candidate.id}.`);
   const source = candidate.administrativePath;
@@ -829,12 +879,21 @@ async function removeAdministrativeRecord(candidate: AdministrativePruneCandidat
     if (worktreeGitFile && existsSync(worktreeGitFile)) {
       throw new Error(`worktree ${worktreePath} became valid before metadata removal`);
     }
+    signal?.throwIfAborted();
     await rename(source, tombstone);
     moved = true;
     if (worktreeGitFile && existsSync(worktreeGitFile)) {
       await rename(tombstone, source);
       moved = false;
       throw new Error(`worktree ${worktreePath} became valid while claiming metadata`);
+    }
+    if (signal?.aborted) {
+      // Claiming metadata is reversible; finish rollback without the cancelled signal.
+      if (!existsSync(source)) {
+        await rename(tombstone, source);
+        moved = false;
+      }
+      signal.throwIfAborted();
     }
     await removeMetadataTree(tombstone, expected);
   } catch (error: unknown) {
@@ -844,9 +903,9 @@ async function removeAdministrativeRecord(candidate: AdministrativePruneCandidat
       error instanceof MetadataDeletionRetainedError && error.outcomeUnknown
         ? " Metadata removal outcome is unknown."
         : "";
-    throw new GitWorktreeError(
-      `Git administrative metadata removal failed for ${candidate.id}${retainedPath ? `; retained at ${retainedPath}` : ""}.${outcomeWarning} ${formatError(error)}`,
-    );
+    const message = `Git administrative metadata removal failed for ${candidate.id}${retainedPath ? `; retained at ${retainedPath}` : ""}.${outcomeWarning} ${formatError(error)}`;
+    if (retainedPath || outcomeWarning) throw new WorktreeRecoveryError(message);
+    throw new GitWorktreeError(message);
   }
 }
 function sameAdministrativeCandidate(left: AdministrativePruneCandidate, right: AdministrativePruneCandidate): boolean {
@@ -959,7 +1018,7 @@ export async function pruneWorktrees(
       const result = await runGit(pi, ["worktree", "prune", "--verbose"], cwd, signal, GIT_MUTATION_TIMEOUT_MS);
       return combineOutput(result);
     }
-    for (const candidate of candidates) await removeAdministrativeRecord(candidate);
+    for (const candidate of candidates) await removeAdministrativeRecord(candidate, signal);
     return candidates.map((candidate) => `Removed ${candidate.id}`).join("\n");
   };
   return lockHeld ? operation() : withWorktreeMutationLock(cwd, operation, signal);
@@ -1050,7 +1109,10 @@ async function runGitAllowFailure(
   timeout = GIT_TIMEOUT_MS,
 ): Promise<ExecResult> {
   try {
-    return await pi.exec("git", args, { cwd, signal, timeout });
+    signal?.throwIfAborted();
+    const result = await pi.exec("git", args, { cwd, signal, timeout });
+    signal?.throwIfAborted();
+    return result;
   } catch (error) {
     const message = formatError(error);
     if (/\bENOENT\b|not found/i.test(message)) {

@@ -1,12 +1,13 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, fauxProvider, fauxText } from "@earendil-works/pi-ai";
 import { ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { getAgentConfig, registerAgents } from "../src/agent-types.js";
+import { getAgentConfig, registerAgents, setFallbackSubagent } from "../src/agent-types.js";
 import { CHILD_CONTEXT_RPC } from "../src/cross-extension-rpc.js";
 import subagentsExtension from "../src/index.js";
+import { configurationContext } from "../src/project-trust.js";
 
 function makePi() {
   const tools = new Map<string, any>();
@@ -40,6 +41,7 @@ function makePi() {
 
 function sessionCtx() {
   return {
+    isProjectTrusted: () => true,
     hasUI: false,
     ui: { setStatus: vi.fn(), setWidget: vi.fn(), notify: vi.fn() },
     cwd,
@@ -95,7 +97,112 @@ describe("strictAgentFiles activation wiring", () => {
     if (originalHome == null) delete process.env.HOME;
     else process.env.HOME = originalHome;
     registerAgents(new Map());
+    setFallbackSubagent(undefined);
     rmSync(cwd, { recursive: true, force: true });
+  });
+
+  it.each(["false", "unknown", "throwing", "trusted"].flatMap(trust =>
+    (trust === "trusted" ? [false] : [false, true]).map(malformed => ({ trust, malformed })),
+  ))("gates own configuration at root bootstrap and replacement: $trust, malformed=$malformed", async ({ trust, malformed }) => {
+    const global = mkdtempSync(join(tmpdir(), "global-agent-trust-"));
+    process.env.PI_CODING_AGENT_DIR = global;
+    const pi = makePi();
+    const ctx = sessionCtx();
+    ctx.isProjectTrusted = trust === "unknown" ? undefined : () => {
+      if (trust === "throwing") throw new Error("unavailable");
+      return trust === "trusted";
+    };
+    try {
+      mkdirSync(join(global, "agents"));
+      writeFileSync(join(global, "agents", "global.md"), "---\ndescription: safe\n---\nglobal");
+      writeFileSync(join(global, "subagents.json"), JSON.stringify({ strictAgentFiles: true, toolDescriptionMode: "custom", maxSubagentDepth: 3, fallbackSubagent: "none" }));
+      writeFileSync(join(global, "agent-tool-description.md"), "GLOBAL_DESCRIPTION");
+      writeSettings({ strictAgentFiles: true, toolDescriptionMode: "custom", maxSubagentDepth: 15 });
+      if (malformed) writeFileSync(join(cwd, ".pi", "subagents.json"), "{malformed");
+      writeFileSync(join(cwd, ".pi", "agent-tool-description.md"), "PROJECT_DESCRIPTION");
+      const broken = writeBrokenAgent();
+      mkdirSync(join(cwd, ".agents", "agents"), { recursive: true });
+      writeFileSync(join(cwd, ".agents", "agents", "workspace.md"), "---\ndescription: workspace override\n---\nworkspace");
+      if (trust === "trusted") writeFileSync(broken, "---\ndescription: approved\n---\nproject");
+      subagentsExtension(pi);
+      await pi.lifecycle.get("session_start")({}, ctx);
+      expect(getAgentConfig("global")?.source).toBe("global");
+      expect(getAgentConfig("Explore")?.isDefault).toBe(true);
+      expect(getAgentConfig("broken")?.source).toBe(trust === "trusted" ? "project" : undefined);
+      expect(getAgentConfig("workspace")?.source).toBe(trust === "trusted" ? "project" : undefined);
+      expect(pi.tools.get("Agent").description).toBe(trust === "trusted" ? "PROJECT_DESCRIPTION" : "GLOBAL_DESCRIPTION");
+      const loaded = () => pi.events.emit.mock.calls.filter(([name]: [string]) => name === "subagents:settings_loaded").at(-1)?.[1].settings;
+      expect(loaded().maxSubagentDepth).toBe(trust === "trusted" ? 15 : 3);
+      expect(loaded().strictAgentFiles).toBe(true);
+      if (trust === "trusted") {
+        ctx.isProjectTrusted = () => false;
+        const result = await pi.tools.get("Agent").execute("denied-reload", {
+          subagent_type: "broken", prompt: "must not run", description: "denied",
+        }, undefined, undefined, ctx);
+        expect(JSON.stringify(result)).toContain("Unknown or disabled agent type");
+        expect(getAgentConfig("broken")).toBeUndefined();
+        expect(loaded().maxSubagentDepth).toBe(3);
+      }
+      // A replacement context must revoke project settings and definitions,
+      // including malformed files that would otherwise block the global tier.
+      writeFileSync(join(cwd, ".pi", "subagents.json"), "{malformed");
+      writeFileSync(broken, BROKEN);
+      await pi.lifecycle.get("session_start")({}, { ...ctx, isProjectTrusted: () => false });
+      expect(loaded().maxSubagentDepth).toBe(3);
+      expect(getAgentConfig("broken")).toBeUndefined();
+      expect(pi.tools.get("Agent").description).toBe("GLOBAL_DESCRIPTION");
+      expect(warn.mock.calls.flat().join(" ")).not.toContain("malformed settings");
+    } finally {
+      await pi.lifecycle.get("session_shutdown")?.({}, ctx);
+      rmSync(global, { recursive: true, force: true });
+    }
+  });
+
+  it("does not launder project settings, definitions, or descriptions through global aliases", async () => {
+    const global = mkdtempSync(join(tmpdir(), "aliased-global-agents-"));
+    process.env.PI_CODING_AGENT_DIR = global;
+    const pi = makePi();
+    const ctx = sessionCtx();
+    ctx.isProjectTrusted = () => false;
+    try {
+      const broken = writeBrokenAgent();
+      writeSettings({ toolDescriptionMode: "custom", defaultModel: "evil/model" });
+      writeFileSync(join(cwd, ".pi", "agent-tool-description.md"), "PROJECT_DESCRIPTION");
+      mkdirSync(join(global, "agents"));
+      symlinkSync(broken, join(global, "agents", "aliased.md"));
+      symlinkSync(join(cwd, ".pi", "subagents.json"), join(global, "subagents.json"));
+      symlinkSync(join(cwd, ".pi", "agent-tool-description.md"), join(global, "agent-tool-description.md"));
+      // Captured configuration ownership wins over an execution-only cwd.
+      configurationContext(ctx, cwd);
+      ctx.cwd = join(global, "execution");
+      subagentsExtension(pi);
+      await pi.lifecycle.get("session_start")({}, ctx);
+      expect(getAgentConfig("aliased")).toBeUndefined();
+      expect(getAgentConfig("broken")).toBeUndefined();
+      expect(pi.tools.get("Agent").description).not.toContain("PROJECT_DESCRIPTION");
+      const loaded = pi.events.emit.mock.calls.find(([name]: [string]) => name === "subagents:settings_loaded")?.[1].settings;
+      expect(loaded).toEqual({});
+      expect(warn.mock.calls.flat().join(" ")).not.toContain("Skipping agent file");
+    } finally {
+      await pi.lifecycle.get("session_shutdown")?.({}, ctx);
+      rmSync(global, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps globally configured strict parsing under denied trust", async () => {
+    const global = mkdtempSync(join(tmpdir(), "strict-global-agents-"));
+    process.env.PI_CODING_AGENT_DIR = global;
+    try {
+      mkdirSync(join(global, "agents"));
+      const path = join(global, "agents", "broken.md");
+      writeFileSync(path, BROKEN);
+      writeFileSync(join(global, "subagents.json"), JSON.stringify({ strictAgentFiles: true }));
+      const pi = makePi();
+      subagentsExtension(pi);
+      await expect(pi.lifecycle.get("session_start")({}, { ...sessionCtx(), isProjectTrusted: () => false })).rejects.toThrow(path);
+    } finally {
+      rmSync(global, { recursive: true, force: true });
+    }
   });
 
   it("fails startup with the path when strict mode is enabled", async () => {
@@ -180,6 +287,7 @@ describe("strictAgentFiles activation wiring", () => {
         undefined,
         vi.fn(),
         {
+          isProjectTrusted: () => true,
           hasUI: false,
           ui: { setStatus: vi.fn(), setWidget: vi.fn(), notify: vi.fn() },
           cwd,

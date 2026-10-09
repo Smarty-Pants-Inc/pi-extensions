@@ -44,6 +44,7 @@ function makePi() {
 
 function sessionContext(cwd: string) {
   return {
+    isProjectTrusted: () => true,
     hasUI: true,
     ui: { setStatus: vi.fn(), setWidget: vi.fn(), notify: vi.fn() },
     cwd,

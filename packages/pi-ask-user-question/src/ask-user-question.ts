@@ -237,26 +237,18 @@ async function selectSingle(
   ctx: ExtensionContext,
   signal: AbortSignal | undefined,
 ): Promise<FallbackChoice> {
-  const values = question.options.map((option, optionIndex) => ({
-    text: `${option.label}${option.description ? ` — ${option.description}` : ""}`,
-    selection: { label: option.label, value: option.value, index: optionIndex },
-  }));
-  const other = "Other (free text)";
-  const back = "Back (revise previous answer)";
-  const options = [
-    ...values.map((value) => value.text),
-    ...(question.allowOther ? [other] : []),
-    ...(canGoBack ? [back] : []),
-  ];
+  const actions = rpcActions(question, canGoBack);
   const selected = await withAbort(
-    ctx.ui.select(`${progress(index, total)}${question.header}: ${question.question}`, options, { signal }),
+    ctx.ui.select(`${progress(index, total)}${question.header}: ${question.question}`, [...actions.keys()], { signal }),
     signal,
   );
   if (selected === undefined) return { kind: "cancelled", reason: signal?.aborted ? "aborted" : "cancelled" };
-  if (selected === other) return { kind: "other", selections: [] };
-  if (selected === back) return { kind: "back" };
-  const value = values.find((entry) => entry.text === selected);
-  return value ? { kind: "selected", selections: [value.selection] } : { kind: "cancelled", reason: "ui_error" };
+  const action = actions.get(selected);
+  if (action?.kind === "other") return { kind: "other", selections: [] };
+  if (action?.kind === "back") return { kind: "back" };
+  return action?.kind === "option"
+    ? { kind: "selected", selections: [rpcSelection(question, action.index)] }
+    : { kind: "cancelled", reason: "ui_error" };
 }
 
 async function selectMulti(
@@ -267,52 +259,57 @@ async function selectMulti(
   signal: AbortSignal | undefined,
 ): Promise<FallbackChoice> {
   const selected = new Set<number>();
-  let custom = false;
   while (true) {
-    const values = question.options.map((option, optionIndex) => ({
-      text: `${selected.has(optionIndex) ? "[x]" : "[ ]"} ${option.label}${option.description ? ` — ${option.description}` : ""}`,
-      selection: { label: option.label, value: option.value, index: optionIndex },
-    }));
-    const other = `${custom ? "[x]" : "[ ]"} Other (free text)`;
-    const done = "Done";
-    const back = "Back (revise previous answer)";
-    const options = [
-      ...values.map((value) => value.text),
-      ...(question.allowOther ? [other] : []),
-      done,
-      ...(index > 0 ? [back] : []),
-    ];
+    const actions = rpcActions(question, index > 0, selected);
     const choice = await withAbort(
-      ctx.ui.select(`${progress(index, total)}${question.header}: ${question.question}`, options, { signal }),
+      ctx.ui.select(`${progress(index, total)}${question.header}: ${question.question}`, [...actions.keys()], {
+        signal,
+      }),
       signal,
     );
     if (choice === undefined) return { kind: "cancelled", reason: signal?.aborted ? "aborted" : "cancelled" };
-    if (choice === done) {
+    const action = actions.get(choice);
+    if (action?.kind === "done" || action?.kind === "other") {
       return {
-        kind: "selected",
-        selections: [
-          ...values.filter((_value, optionIndex) => selected.has(optionIndex)).map((value) => value.selection),
-        ],
+        kind: action.kind === "done" ? "selected" : "other",
+        selections: question.options.flatMap((_option, optionIndex) =>
+          selected.has(optionIndex) ? [rpcSelection(question, optionIndex)] : [],
+        ),
       };
     }
-    if (choice === back) return { kind: "back" };
-    const optionIndex = values.findIndex((value) => value.text === choice);
-    if (optionIndex >= 0) {
-      if (selected.has(optionIndex)) selected.delete(optionIndex);
-      else selected.add(optionIndex);
+    if (action?.kind === "back") return { kind: "back" };
+    if (action?.kind === "option") {
+      if (selected.has(action.index)) selected.delete(action.index);
+      else selected.add(action.index);
       continue;
-    }
-    if (choice === other) {
-      custom = true;
-      return {
-        kind: "other",
-        selections: [
-          ...values.filter((_value, optionIndex) => selected.has(optionIndex)).map((value) => value.selection),
-        ],
-      };
     }
     return { kind: "cancelled", reason: "ui_error" };
   }
+}
+
+type RpcAction = { kind: "option"; index: number } | { kind: "other" | "done" | "back" };
+
+// Select returns display strings, not opaque values. Prefix every action with a
+// unique identity and resolve only entries actually offered in this request.
+function rpcActions(question: Question, canGoBack: boolean, selected?: ReadonlySet<number>): Map<string, RpcAction> {
+  const actions = new Map<string, RpcAction>();
+  for (const [index, option] of question.options.entries()) {
+    const checked = selected ? `${selected.has(index) ? "[x]" : "[ ]"} ` : "";
+    actions.set(
+      `[option:${index + 1}] ${checked}${option.label}${option.description ? ` — ${option.description}` : ""}`,
+      { kind: "option", index },
+    );
+  }
+  if (question.allowOther) actions.set("[action:other] Other (free text)", { kind: "other" });
+  if (selected) actions.set("[action:done] Done", { kind: "done" });
+  if (canGoBack) actions.set("[action:back] Back (revise previous answer)", { kind: "back" });
+  return actions;
+}
+
+function rpcSelection(question: Question, index: number): QuestionSelection {
+  const option = question.options[index];
+  if (!option) throw new Error("RPC selection index is outside the offered options");
+  return { label: option.label, value: option.value, index };
 }
 
 function answerFor(question: Question, selections: QuestionSelection[], freeText?: string): QuestionAnswer {

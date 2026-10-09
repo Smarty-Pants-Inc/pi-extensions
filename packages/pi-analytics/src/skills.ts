@@ -1,5 +1,7 @@
 import { realpath } from "node:fs/promises";
+import { homedir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { InputSource } from "@earendil-works/pi-coding-agent";
 
 export interface AvailableSkill {
@@ -68,7 +70,19 @@ export class SkillTracker {
     if (input.toolName !== "read" || input.isError || !isRecord(input.input)) return undefined;
     const rawPath = input.input.path;
     if (typeof rawPath !== "string" || rawPath.length === 0) return undefined;
-    const normalized = rawPath.startsWith("@") ? rawPath.slice(1) : rawPath;
+    // Match Pi's read-path spelling before canonical lookup, without relying
+    // on host-private path utilities. Invalid file URLs are not skill reads.
+    let normalized = rawPath.replace(/[\u00a0\u2000-\u200a\u202f\u205f\u3000]/gu, " ");
+    if (normalized.startsWith("@")) normalized = normalized.slice(1);
+    if (normalized === "~") normalized = homedir();
+    else if (normalized.startsWith("~/") || (process.platform === "win32" && normalized.startsWith("~\\"))) {
+      normalized = path.join(homedir(), normalized.slice(2));
+    }
+    try {
+      if (normalized.startsWith("file://")) normalized = fileURLToPath(normalized);
+    } catch {
+      return undefined;
+    }
     const absolute = path.resolve(this.cwd, normalized);
     const canonical = await this.canonicalize(absolute).catch(() => absolute);
     return this.skillByPath.get(canonical);

@@ -441,6 +441,7 @@ describe("mention clone provider context (Pi SDK)", () => {
       expect(parent.model).toEqual(virtual);
       const ctx = {
         cwd, model: parent.model, modelRegistry: registry, sessionManager: parentManager,
+        isProjectTrusted: () => true,
         getSystemPrompt: () => parent.agent.state.systemPrompt,
       } as unknown as ExtensionContext;
       const deltas: string[] = [];

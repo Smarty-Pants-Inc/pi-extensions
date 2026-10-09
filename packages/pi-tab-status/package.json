@@ -1,6 +1,6 @@
 {
   "name": "@signalridge/pi-tab-status",
-  "version": "1.2.4",
+  "version": "1.2.5",
   "description": "Terminal tab status indicators for Pi sessions.",
   "license": "MIT",
   "author": "Thomas Mustier",
@@ -22,14 +22,14 @@
     ]
   },
   "peerDependencies": {
-    "@earendil-works/pi-agent-core": "^0.84.0 || ^0.85.0 || ^0.86.0 || ^0.87.0 || ^0.99.1 || ^1.0.0",
-    "@earendil-works/pi-ai": "^0.84.0 || ^0.85.0 || ^0.86.0 || ^0.87.0 || ^0.99.1 || ^1.0.0",
-    "@earendil-works/pi-coding-agent": "^0.84.0 || ^0.85.0 || ^0.86.0 || ^0.87.0 || ^0.99.1 || ^1.0.0"
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-agent-core": "1.0.0",
-    "@earendil-works/pi-ai": "1.0.0",
-    "@earendil-works/pi-coding-agent": "1.0.0"
+    "@earendil-works/pi-agent-core": "1.0.4",
+    "@earendil-works/pi-ai": "1.0.4",
+    "@earendil-works/pi-coding-agent": "1.0.4"
   },
   "type": "module",
   "private": false,

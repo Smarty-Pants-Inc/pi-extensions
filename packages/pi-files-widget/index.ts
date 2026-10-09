@@ -43,13 +43,14 @@ export default function editorExtension(pi: ExtensionAPI): void {
   const agentModifiedFiles = new Set<string>();
   const observedChangedFiles = new Set<string>();
   const mutations = new Map<string, { cwd: string; path: string; before: string | undefined }>();
+  let closeActiveInteraction: (() => void) | undefined;
   const requiredDeps = ["bat", "delta", "glow"] as const;
   const getMissingDeps = () => requiredDeps.filter((dep) => !hasCommand(dep));
 
   pi.registerCommand("readfiles", {
     description: "Open file browser (optional: /readfiles <path> to start outside the current directory)",
     handler: async (args, ctx) => {
-      if (ctx.mode !== "tui") {
+      if (ctx.mode !== "tui" || !ctx.hasUI) {
         if (ctx.hasUI)
           ctx.ui.notify("The /readfiles browser requires TUI mode and is unavailable over RPC.", "warning");
         return;
@@ -69,12 +70,21 @@ export default function editorExtension(pi: ExtensionAPI): void {
       const initialPath = resolved.path;
       await ctx.ui.custom<void>((tui, theme, _kb, done) => {
         let pollInterval: ReturnType<typeof setInterval> | null = null;
+        let disposed = false;
 
-        const cleanup = () => {
+        const dispose = () => {
+          if (disposed) return;
+          disposed = true;
           if (pollInterval) {
             clearInterval(pollInterval);
             pollInterval = null;
           }
+          browser.dispose();
+          if (closeActiveInteraction === cleanup) closeActiveInteraction = undefined;
+        };
+        const cleanup = () => {
+          if (disposed) return;
+          dispose();
           done();
         };
 
@@ -82,6 +92,7 @@ export default function editorExtension(pi: ExtensionAPI): void {
           payload: { relPath: string; lineRange: string; ext: string; selectedText: string },
           comment: string,
         ) => {
+          if (disposed) return;
           const message = formatCommentMessage(payload, comment);
           if (ctx.isIdle()) {
             pi.sendUserMessage(message);
@@ -92,7 +103,9 @@ export default function editorExtension(pi: ExtensionAPI): void {
           }
         };
 
-        const requestRender = () => tui.requestRender();
+        const requestRender = () => {
+          if (!disposed) tui.requestRender();
+        };
         const browser = createFileBrowser(
           initialPath,
           agentModifiedFiles,
@@ -104,6 +117,8 @@ export default function editorExtension(pi: ExtensionAPI): void {
           observedChangedFiles,
         );
 
+        closeActiveInteraction?.();
+        closeActiveInteraction = cleanup;
         pollInterval = setInterval(() => {
           requestRender();
         }, POLL_INTERVAL_MS);
@@ -115,6 +130,7 @@ export default function editorExtension(pi: ExtensionAPI): void {
             requestRender();
           },
           invalidate: () => browser.invalidate(),
+          dispose,
         };
       });
     },
@@ -167,9 +183,8 @@ export default function editorExtension(pi: ExtensionAPI): void {
     observedChangedFiles.clear();
   });
 
-  pi.on("session_before_switch", async () => {
-    mutations.clear();
-    agentModifiedFiles.clear();
-    observedChangedFiles.clear();
+  pi.on("session_shutdown", async () => {
+    // Complete the owned custom interaction while its context is still valid.
+    closeActiveInteraction?.();
   });
 }

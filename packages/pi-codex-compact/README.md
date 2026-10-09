@@ -113,7 +113,7 @@ project-level override.
 | Setting | Default | Accepted values | Behavior | Recommendation |
 | --- | ---: | --- | --- | --- |
 | `enabled` | `true` | Boolean | Attempt Remote V2 for a compatible model. | Keep enabled unless diagnosing provider behavior. |
-| `requestTimeoutMs` | `300000` | Integer from 30,000 to 600,000 ms | Bound one extension-owned remote request. | Keep five minutes; increase only for a consistently slow connection. |
+| `requestTimeoutMs` | `300000` | Integer from 30,000 to 600,000 ms | Bound the entire extension-owned operation, including retries and response-body inspection. | Keep five minutes; increase only for a consistently slow connection. |
 | `maxRetries` | `2` | Integer from 0 to 2 | Retry transient provider transport failures before Pi fallback. | Keep two; use zero when diagnosing the first failure. |
 | `replacementTokenBudget` | `64000` | Integer from 8,000 to 128,000 tokens | Bound approximate retained user-message text beside the opaque item. | Keep 64K; lower it to reduce session size or raise it only when recent user context is being lost. |
 | `notifyOnFallback` | `true` | Boolean | Warn when Remote V2 fails and Pi-native compaction takes over. | Keep enabled so silent fallback does not hide protocol or entitlement problems. |
@@ -170,6 +170,15 @@ opaque replay.
 If fingerprints, model identity, payload shape, or marker count do not match exactly, the extension
 leaves Pi's visible fallback context unchanged instead of guessing.
 
+Loadout hooks can transform model-facing tool descriptions without changing the raw registry.
+The extension recognizes those transformations only after fresh agent-context preparation and a
+provider payload whose tool names and descriptions match the persisted declarations. It freezes
+both public tool surfaces and the serialized wire tools; Remote V2 must reproduce that wire snapshot
+before sending. Cached provider callbacks cannot approve unsent registry edits, and hidden
+declarations cause Pi-native fallback rather than restoring hidden tools remotely. Evidence is
+in-memory only and resets on startup, reload, or tree navigation. A fresh, unchanged normal request
+can establish it again; prompt, tool, and schema changes remain guarded.
+
 ## Privacy, storage, and limits
 
 Remote compaction sends the active conversation context, system prompt, and active tool schemas to
@@ -200,6 +209,10 @@ ceilings are intentionally not configurable.
   compatibility fallback, exact pre-turn ordering, or exact mid-turn model-session ownership.
 - A live prompt or tool change that has not been written into Pi's transcript causes a native
   compaction fallback; an opaque checkpoint must match the system state Pi will persist.
+- Pi exposes no public effective-loadout snapshot. Observed, unchanged description-only rewrites
+  (including codemode `mode: "on"`) can use Remote V2, but unproven transformations, hidden declarations
+  (including codemode `mode: "only"`), membership/schema mismatches, or different serialized wire tools
+  use native compaction. Observation does not weaken prompt/tool equality or stale-state checks.
 - Pi invokes `session_before_compact` handlers in registration order. Another extension that mutates
   prompt, tools, or context **after this handler returns** can invalidate an already prepared opaque
   checkpoint before Pi appends it. Load such handlers before this extension or disable Remote V2 in
@@ -214,6 +227,7 @@ ceilings are intentionally not configurable.
 ```text
 src/index.ts          Thin Pi entrypoint
 src/codex-compact.ts  Pi lifecycle, command, provider projection, and fallback
+src/tool-state.ts     Prepared/observed public tool surfaces and frozen wire evidence
 src/remote.ts         Provider stream invocation, auth payload, timeout, and retry controls
 src/protocol.ts       Bounded SSE parsing and Remote V2 payload/output validation
 src/checkpoint.ts     Replacement history, fingerprints, persistence, and replay projection

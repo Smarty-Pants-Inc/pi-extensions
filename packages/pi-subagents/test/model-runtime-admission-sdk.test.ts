@@ -55,6 +55,8 @@ async function parentFixture() {
   const stale = { provider: "retired-provider", id: "retired-model" };
   const ctx = {
     cwd,
+    // This approved fixture intentionally owns both global and project roots.
+    isProjectTrusted: () => true,
     model: stale,
     modelRegistry: registry,
     hasUI: true,

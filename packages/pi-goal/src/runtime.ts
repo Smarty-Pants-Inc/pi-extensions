@@ -17,7 +17,7 @@ export { queueGoalSafetyReset, resetGoalSafetyEpoch } from "./safety.js";
 
 import { DEFAULT_GOAL_SETTINGS, type GoalSettings, type GoalSettingsLoadIssue } from "./settings.js";
 import { GoalToolPolicy, type GoalToolVisibilitySnapshot } from "./tool-policy.js";
-import { GoalWaitTimer } from "./wait.js";
+import { type GoalWait, GoalWaitTimer } from "./wait.js";
 
 export { GOAL_BLOCKED_TOOL, GOAL_COMPLETE_TOOL, GOAL_TOOL_NAMES, GOAL_WAIT_TOOL } from "./tool-policy.js";
 
@@ -69,7 +69,7 @@ export type GoalStopRequest =
    * same stale-call block — but lands on `paused`, which is already the state
    * every resume path knows how to bring back.
    */
-  | { kind: "wait"; expectedGoalId: string; reason: string }
+  | { kind: "wait"; expectedGoalId: string; wait: GoalWait }
   | {
       kind: "tools_unavailable";
       expectedGoalId: string;
@@ -152,6 +152,9 @@ export interface GoalSettingsRuntimeSnapshot {
   goalRecovery?: GoalRecovery;
   budgetWrapUp?: BudgetWrapUp;
   guardAbortGoalId?: string;
+  pendingStoppedUsageGoalId?: string;
+  pendingReplacementUsage?: { runGoalId: string | null; replacementGoalId: string };
+  ambiguousWaitInputGoalId?: string;
   staleGoalToolCallsBlocked: boolean;
   cancelledContinuationMarkers: string[];
   terminalDetails?: GoalTerminalDetails;
@@ -166,12 +169,26 @@ interface PendingGoalPrompt {
 interface PendingNonGoalInput {
   behavior: "steer" | "followUp";
   fingerprint: string;
-  resetSafetyEpoch: boolean;
+  realInput: boolean;
+}
+
+interface PendingDirectInput {
+  goalId: string;
+  fingerprint: string;
+  realInput: boolean;
+  waiting: boolean;
+}
+
+export interface WaitingInputWake {
+  waitingGoal: ActiveGoal;
+  resumedGoal: ActiveGoal;
+  generation: number;
 }
 
 const MAX_CANCELLED_CONTINUATION_PROMPTS = 20;
 const MAX_PENDING_GOAL_PROMPTS = 20;
 const MAX_PENDING_NON_GOAL_INPUTS = 20;
+const WAIT_WAKE_RECHECK_MS = 60_000;
 const BUDGET_WRAP_UP_MESSAGE_TYPE = "goal-budget-wrap-up";
 const BUDGET_WRAP_UP_PROMPT =
   "The active /goal token budget is exhausted. Stop substantive work and do not call substantive tools. Summarize progress, verified results, remaining work, and blockers concisely. Treat completion as unproven. Do not call goal_complete unless authoritative, requirement-by-requirement evidence already proves every requirement is complete. Weak, indirect, or missing evidence is not enough. Budget exhaustion is not completion.";
@@ -210,8 +227,22 @@ export class GoalRuntime {
   /** `null` marks a run that must not be charged to the active goal. */
   agentRunGoalId?: string | null;
   agentRunOrigin?: GoalRunOrigin;
+  /** Input wakes inside an existing run cannot refresh its system prompt. */
+  inputWakeGoalId?: string;
+  inputWakeNeedsPrompt = false;
+  /** Accepted idle inputs, not their early input hooks, own wait wakes. */
+  pendingDirectInputs: PendingDirectInput[] = [];
+  /** A mixed-source delivery cannot prove which waiting input remains pending. */
+  ambiguousWaitInputGoalId?: string;
+  /** The accepted prompt whose initial user message must not claim queued input. */
+  acceptedRunPrompt?: string;
+  pendingInputWake?: WaitingInputWake;
   agentRunToolAttempted = false;
   guardAbortGoalId?: string;
+  /** A stopped goal still owns its aborted run's final assistant usage. */
+  pendingStoppedUsageGoalId?: string;
+  /** Exclude a replaced run's late response from its successor's baseline. */
+  pendingReplacementUsage?: { runGoalId: string | null; replacementGoalId: string };
   staleGoalToolCallsBlocked = false;
   readonly toolPolicy: GoalToolPolicy;
   pendingGoalPromptMarkers = new Map<string, PendingGoalPrompt>();
@@ -319,6 +350,17 @@ export class GoalRuntime {
     return true;
   }
 
+  finalizeStoppedRunUsage(ctx: StatusContext, runGoalId = this.agentRunGoalId) {
+    if (!runGoalId || this.pendingStoppedUsageGoalId !== runGoalId) return false;
+    this.pendingStoppedUsageGoalId = undefined;
+    const goal = this.activeGoal;
+    if (goal?.id !== runGoalId || goal.status === "active") return false;
+    updateGoalUsage(goal, ctx, false);
+    this.persistGoal(goal);
+    if (this.activeGoal === goal) this.updateStatus(ctx, goal);
+    return true;
+  }
+
   requestContinuation(goal: ActiveGoal) {
     if (this.hasContinuationWorkForGoal(goal.id)) return false;
     const marker = continuationMarker(goal);
@@ -383,12 +425,19 @@ export class GoalRuntime {
     let terminalReason: string | undefined;
     switch (request.kind) {
       case "explicit_pause":
-        this.recordGoalUsage(goal, ctx);
+        if (goal.status === "active") this.recordGoalUsage(goal, ctx);
         this.cancelContinuationWork();
         this.clearGoalRecoveryForGoal(goal.id);
         this.clearBudgetWrapUp();
-        this.blockStaleGoalToolCalls();
-        abortCurrentTurn(ctx);
+        if (goal.status === "active") {
+          if (this.agentRunGoalId === goal.id) this.pendingStoppedUsageGoalId = goal.id;
+          this.blockStaleGoalToolCalls();
+          abortCurrentTurn(ctx);
+        } else if (this.agentRunGoalId === goal.id && ctx.isIdle?.() === false) {
+          this.blockStaleGoalToolCalls();
+        } else {
+          this.clearStaleGoalToolCallBlock();
+        }
         status = "paused";
         break;
       case "budget_limit":
@@ -404,6 +453,7 @@ export class GoalRuntime {
         this.clearBudgetWrapUp();
         this.blockStaleGoalToolCalls();
         if (request.abortTurn) {
+          if (this.agentRunGoalId === goal.id) this.pendingStoppedUsageGoalId = goal.id;
           this.guardAbortGoalId = goal.id;
           abortCurrentTurn(ctx);
         }
@@ -418,7 +468,7 @@ export class GoalRuntime {
         this.clearBudgetWrapUp();
         this.blockStaleGoalToolCalls();
         status = "paused";
-        terminalReason = request.reason;
+        terminalReason = request.wait.reason;
         break;
       case "retry_exhausted":
         this.clearGoalRecoveryForGoal(goal.id);
@@ -434,6 +484,7 @@ export class GoalRuntime {
         this.clearGoalRecoveryForGoal(goal.id);
         this.clearBudgetWrapUp();
         if (request.abortTurn) {
+          if (this.agentRunGoalId === goal.id) this.pendingStoppedUsageGoalId = goal.id;
           this.blockStaleGoalToolCalls();
           abortCurrentTurn(ctx);
         } else {
@@ -467,6 +518,10 @@ export class GoalRuntime {
     }
 
     this.activeGoal = transitionGoal(goal, status);
+    if (request.kind === "wait") {
+      this.activeGoal.wait = request.wait;
+      this.activeGoal.safetyPauseCause = undefined;
+    }
     if (terminalReason !== undefined) this.setTerminalReason(this.activeGoal.id, terminalReason);
     const stoppedGoal = this.activeGoal;
     this.persistGoal(stoppedGoal);
@@ -675,6 +730,8 @@ export class GoalRuntime {
 
   clearSettledSafetyTracking() {
     this.guardAbortGoalId = undefined;
+    this.pendingStoppedUsageGoalId = undefined;
+    this.pendingReplacementUsage = undefined;
     this.pendingNonGoalInputs = [];
     this.claimedGoalPromptMarkers.clear();
     this.claimedContinuationMarkers.clear();
@@ -736,14 +793,47 @@ export class GoalRuntime {
    */
   onGoalWaitElapsed?: (ctx: StatusContext, goalId: string) => void;
 
-  scheduleGoalWaitWake(ctx: StatusContext, goalId: string, resumeAt: number): void {
-    this.goalWaitTimer.schedule(resumeAt, () => {
-      // Re-checked at fire time, not at schedule time: the goal may have been
-      // completed, cleared, or replaced during the wait, and waking a goal that
-      // is no longer the active one would resume the wrong work.
-      if (this.activeGoal?.id !== goalId || this.activeGoal.status !== "paused") return;
-      this.onGoalWaitElapsed?.(ctx, goalId);
+  scheduleGoalWaitWake(ctx: StatusContext, recheckAt?: number): void {
+    this.clearGoalWaitWake();
+    const goal = this.activeGoal;
+    if (this.queueFrozen || this.pendingQueueAction || goal?.status !== "paused" || !goal.wait) return;
+    const resumeAt = goal.wait.resumeAt;
+    if (resumeAt === undefined) return;
+    const generation = this.menuGeneration;
+    this.goalWaitTimer.schedule(recheckAt ?? resumeAt, () => {
+      if (
+        generation !== this.menuGeneration ||
+        this.activeGoal?.id !== goal.id ||
+        this.activeGoal.wait?.resumeAt !== resumeAt
+      )
+        return;
+      this.dispatchGoalWaitIfDue(ctx);
     });
+  }
+
+  dispatchGoalWaitIfDue(ctx: StatusContext): void {
+    const goal = this.activeGoal;
+    if (
+      this.queueFrozen ||
+      this.pendingQueueAction ||
+      goal?.status !== "paused" ||
+      goal.wait?.resumeAt === undefined ||
+      goal.wait.resumeAt > Date.now()
+    )
+      return;
+    const pendingRealInput =
+      this.ambiguousWaitInputGoalId === goal.id ||
+      this.pendingInputWake?.waitingGoal === goal ||
+      this.pendingDirectInputs.some((pending) => pending.realInput && pending.waiting && pending.goalId === goal.id);
+    if (pendingRealInput || !this.toolPolicy.toolsAvailable() || ctx.isIdle?.() !== true || hasPendingMessages(ctx)) {
+      // Input preflight and tool-loadout changes need not emit agent_settled.
+      // Never infer rejection from elapsed time: a slow accepted input could
+      // otherwise race a second prompt. Explicit /goal resume remains available.
+      this.scheduleGoalWaitWake(ctx, Date.now() + WAIT_WAKE_RECHECK_MS);
+      return;
+    }
+    this.clearGoalWaitWake();
+    this.onGoalWaitElapsed?.(ctx, goal.id);
   }
 
   clearGoalWaitWake(): void {
@@ -751,6 +841,7 @@ export class GoalRuntime {
   }
 
   cancelContinuationWork() {
+    this.pendingInputWake = undefined;
     this.clearGoalWaitWake();
     this.clearContinuationDispatchTimer();
     if (this.continuationDelivery) {
@@ -821,11 +912,110 @@ export class GoalRuntime {
     return true;
   }
 
-  noteQueuedNonGoalInput(prompt: string, behavior: "steer" | "followUp", resetSafetyEpoch = false) {
+  noteDirectInput(prompt: string, realInput: boolean) {
+    const goal = this.activeGoal;
+    if (this.queueFrozen || !goal || (goal.status !== "active" && (goal.status !== "paused" || !goal.wait))) return;
+    // Only the latest real idle attempt can be awaiting delivery; an earlier
+    // handled or rejected prompt must not make a transformed successor ambiguous.
+    if (realInput) {
+      this.pendingInputWake = undefined;
+      this.pendingDirectInputs = this.pendingDirectInputs.filter((pending) => !pending.realInput);
+    }
+    this.pendingDirectInputs.push({
+      goalId: goal.id,
+      fingerprint: inputFingerprint(prompt),
+      realInput,
+      waiting: goal.status === "paused",
+    });
+    if (this.pendingDirectInputs.length > MAX_PENDING_NON_GOAL_INPUTS) this.pendingDirectInputs.shift();
+  }
+
+  hasDirectInputCandidate(prompt: string) {
+    if (this.pendingDirectInputs.length === 0) return false;
+    const fingerprint = inputFingerprint(prompt);
+    return this.pendingDirectInputs.some((pending) => pending.fingerprint === fingerprint);
+  }
+
+  hasQueuedInputCandidate(prompt: string) {
+    if (this.pendingNonGoalInputs.length === 0) return false;
+    const fingerprint = inputFingerprint(prompt);
+    return this.pendingNonGoalInputs.some((pending) => pending.fingerprint === fingerprint);
+  }
+
+  consumeDirectInput(prompt: unknown, allowFallback = true) {
+    if (typeof prompt !== "string" || this.pendingDirectInputs.length === 0) return undefined;
+    const fingerprint = inputFingerprint(prompt);
+    const matches = this.pendingDirectInputs.filter((pending) => pending.fingerprint === fingerprint);
+    if (matches.length > 0) {
+      // Identical real and extension prompts have no source at this boundary.
+      // Drop ambiguous candidates rather than claiming another extension's turn.
+      if (matches.some((pending) => pending.realInput) && matches.some((pending) => !pending.realInput)) {
+        this.markAmbiguousWaitInput();
+        this.pendingDirectInputs = this.pendingDirectInputs.filter((pending) => pending.fingerprint !== fingerprint);
+        return { ...matches[0], realInput: false };
+      }
+      const index = this.pendingDirectInputs.findIndex((pending) => pending.fingerprint === fingerprint);
+      const [pending] = this.pendingDirectInputs.splice(index, 1);
+      return this.currentDirectInput(pending);
+    }
+    // Pi can expand templates or another input handler can transform the text.
+    // Without an exact match, only one pending candidate proves provenance.
+    if (!allowFallback || this.pendingDirectInputs.length !== 1) return undefined;
+    return this.currentDirectInput(this.pendingDirectInputs.shift());
+  }
+
+  private currentDirectInput(pending: PendingDirectInput | undefined) {
+    const goal = this.activeGoal;
+    if (
+      !pending ||
+      goal?.id !== pending.goalId ||
+      (goal.status !== "active" && !(goal.status === "paused" && goal.wait))
+    ) {
+      return undefined;
+    }
+    pending = { ...pending, waiting: goal.status === "paused" };
+    // A different extension input may be transformed to the same delivered text.
+    if (pending.realInput && this.hasUnresolvedExtensionInput()) {
+      this.markAmbiguousWaitInput();
+      return { ...pending, realInput: false };
+    }
+    return pending;
+  }
+
+  private markAmbiguousWaitInput() {
+    const goal = this.activeGoal;
+    if (goal?.status === "paused" && goal.wait) this.ambiguousWaitInputGoalId = goal.id;
+  }
+
+  private hasUnresolvedRealInput() {
+    return (
+      this.pendingDirectInputs.some((pending) => pending.realInput) ||
+      this.pendingNonGoalInputs.some((pending) => pending.realInput)
+    );
+  }
+
+  private hasUnresolvedExtensionInput() {
+    return (
+      this.pendingDirectInputs.some((pending) => !pending.realInput) ||
+      this.pendingNonGoalInputs.some((pending) => !pending.realInput)
+    );
+  }
+
+  noteQueuedNonGoalInput(prompt: string, behavior: "steer" | "followUp", realInput = false) {
+    const fingerprint = inputFingerprint(prompt);
+    if (!realInput) {
+      // Pi does not attach input provenance to message_start. An extension
+      // message with identical text must not inherit a prior real-input wake.
+      for (const pending of this.pendingNonGoalInputs) {
+        if (pending.behavior === behavior && pending.fingerprint === fingerprint) {
+          pending.realInput = false;
+        }
+      }
+    }
     this.pendingNonGoalInputs.push({
       behavior,
-      fingerprint: inputFingerprint(prompt),
-      resetSafetyEpoch,
+      fingerprint,
+      realInput,
     });
     if (this.pendingNonGoalInputs.length > MAX_PENDING_NON_GOAL_INPUTS) {
       this.pendingNonGoalInputs.shift();
@@ -833,10 +1023,18 @@ export class GoalRuntime {
   }
 
   consumeQueuedNonGoalInput(prompt: string, allowDeliveryFallback = true) {
-    if (typeof prompt !== "string") return undefined;
+    if (typeof prompt !== "string" || this.pendingNonGoalInputs.length === 0) return undefined;
     const fingerprint = inputFingerprint(prompt);
-    // Pi delivers steers before follow-ups. Prefer a matching steer even when an
-    // identical follow-up was queued first so it cannot steal follow-up ownership.
+    const matching = this.pendingNonGoalInputs.filter((pending) => pending.fingerprint === fingerprint);
+    if (matching.some((pending) => pending.realInput) && matching.some((pending) => !pending.realInput)) {
+      // A follow-up may already be draining when a same-text steer arrives.
+      // Without delivery identity, either lane can own this message.
+      this.markAmbiguousWaitInput();
+      this.pendingNonGoalInputs = this.pendingNonGoalInputs.filter((pending) => pending.fingerprint !== fingerprint);
+      return { ...matching[0], realInput: false };
+    }
+    // Pi normally delivers steers before follow-ups. Prefer a matching steer
+    // only when the candidates agree on real-input provenance.
     const steerIndex = this.pendingNonGoalInputs.findIndex(
       (pending) => pending.behavior === "steer" && pending.fingerprint === fingerprint,
     );
@@ -846,7 +1044,15 @@ export class GoalRuntime {
         : this.pendingNonGoalInputs.findIndex(
             (pending) => pending.behavior === "followUp" && pending.fingerprint === fingerprint,
           );
-    if (exactIndex >= 0) return this.pendingNonGoalInputs.splice(exactIndex, 1)[0];
+    if (exactIndex >= 0) {
+      const [pending] = this.pendingNonGoalInputs.splice(exactIndex, 1);
+      if (pending?.realInput && this.hasUnresolvedExtensionInput()) {
+        this.markAmbiguousWaitInput();
+        return { ...pending, realInput: false };
+      }
+      if (pending && !pending.realInput && this.hasUnresolvedRealInput()) this.markAmbiguousWaitInput();
+      return pending;
+    }
     if (!allowDeliveryFallback) return undefined;
 
     // Skills, templates, and later input handlers can transform the raw text after
@@ -858,7 +1064,16 @@ export class GoalRuntime {
         ? fallbackSteerIndex
         : this.pendingNonGoalInputs.findIndex((pending) => pending.behavior === "followUp");
     if (fallbackIndex < 0) return undefined;
-    return this.pendingNonGoalInputs.splice(fallbackIndex, 1)[0];
+    const fallback = this.pendingNonGoalInputs.splice(fallbackIndex, 1)[0];
+    // A transformed input can still own its wake when it is the only pending
+    // candidate. With multiple inputs Pi exposes no source at delivery, so do
+    // not attribute an unmatched message to a real user.
+    const unambiguousRealInput = Boolean(
+      fallback?.realInput &&
+        this.pendingNonGoalInputs.every((pending) => pending.realInput) &&
+        this.pendingDirectInputs.every((pending) => pending.realInput),
+    );
+    return fallback ? { ...fallback, realInput: unambiguousRealInput } : undefined;
   }
 
   consumeQueuedNonGoalFollowUpForAgentStart() {
@@ -866,7 +1081,7 @@ export class GoalRuntime {
     // follow-up suppress cleanup until all earlier-priority steers have started.
     if (this.pendingNonGoalInputs.some((pending) => pending.behavior === "steer")) return false;
     const index = this.pendingNonGoalInputs.findIndex((pending) => pending.behavior === "followUp");
-    if (index < 0) return false;
+    if (index < 0 || (this.activeGoal?.wait && this.pendingNonGoalInputs[index]?.realInput)) return false;
     this.pendingNonGoalInputs.splice(index, 1);
     return true;
   }
@@ -874,6 +1089,9 @@ export class GoalRuntime {
   markContinuationStarted(prompt: string) {
     const marker = extractContinuationMarker(prompt);
     if (!marker) {
+      // A paused wait is not continuation work. An unrelated prompt can fail
+      // before agent_settled, so its deadline must remain armed.
+      if (this.activeGoal?.status === "paused" && this.activeGoal.wait) return undefined;
       // A user, retry, or another extension started newer work. Cancel both an
       // unsent intent and a delivery that may have lost the non-atomic idle race;
       // the newer work's agent_end will record a fresh intent.
@@ -910,6 +1128,9 @@ export class GoalRuntime {
 
   clearActiveGoal(ctx: StatusContext, reason = "goal cleared") {
     const clearedGoal = this.activeGoal;
+    this.ambiguousWaitInputGoalId = undefined;
+    this.pendingStoppedUsageGoalId = undefined;
+    this.pendingReplacementUsage = undefined;
     this.cancelContinuationWork();
     this.clearGoalRecovery();
     this.clearBudgetWrapUp();
@@ -936,6 +1157,9 @@ export class GoalRuntime {
       goalRecovery: this.goalRecovery ? structuredClone(this.goalRecovery) : undefined,
       budgetWrapUp: this.budgetWrapUp ? structuredClone(this.budgetWrapUp) : undefined,
       guardAbortGoalId: this.guardAbortGoalId,
+      pendingStoppedUsageGoalId: this.pendingStoppedUsageGoalId,
+      pendingReplacementUsage: this.pendingReplacementUsage ? { ...this.pendingReplacementUsage } : undefined,
+      ambiguousWaitInputGoalId: this.ambiguousWaitInputGoalId,
       staleGoalToolCallsBlocked: this.staleGoalToolCallsBlocked,
       cancelledContinuationMarkers: [...this.cancelledContinuationMarkers],
       terminalDetails: this.terminalDetails ? structuredClone(this.terminalDetails) : undefined,
@@ -955,6 +1179,11 @@ export class GoalRuntime {
     this.goalRecovery = snapshot.goalRecovery ? structuredClone(snapshot.goalRecovery) : undefined;
     this.budgetWrapUp = snapshot.budgetWrapUp ? structuredClone(snapshot.budgetWrapUp) : undefined;
     this.guardAbortGoalId = snapshot.guardAbortGoalId;
+    this.pendingStoppedUsageGoalId = snapshot.pendingStoppedUsageGoalId;
+    this.pendingReplacementUsage = snapshot.pendingReplacementUsage
+      ? { ...snapshot.pendingReplacementUsage }
+      : undefined;
+    this.ambiguousWaitInputGoalId = snapshot.ambiguousWaitInputGoalId;
     this.staleGoalToolCallsBlocked = snapshot.staleGoalToolCallsBlocked;
     this.cancelledContinuationMarkers = new Set(snapshot.cancelledContinuationMarkers);
     this.terminalDetails = snapshot.terminalDetails ? structuredClone(snapshot.terminalDetails) : undefined;
@@ -1069,7 +1298,7 @@ export function transitionGoal(goal: ActiveGoal, requestedStatus: GoalStatus): A
     requestedStatus === "active" && goal.tokenBudget !== undefined && goal.tokensUsed >= goal.tokenBudget
       ? "budget_limited"
       : requestedStatus;
-  const next = { ...goal, status, updatedAt: now };
+  const next = { ...goal, status, updatedAt: now, wait: undefined };
   checkpointGoalActiveTime(next, now, status === "active");
   return next;
 }
@@ -1105,6 +1334,7 @@ export function formatStatus(
     }
     return `paused · automatic limit ${goal.automaticModelTurns}/${automaticTurnLimit}`;
   }
+  if (goal.status === "paused" && goal.wait) return `waiting · ${automatic}`;
   if (goal.status === "paused") return `paused · ${automatic}`;
   if (goal.status === "blocked") return `blocked · ${automatic}`;
   if (goal.status === "usage_limited") return `usage · ${automatic}`;
@@ -1135,6 +1365,10 @@ export function goalSummary(
     `Active elapsed: ${formatDuration(goal.timeUsedSeconds)}`,
     `Tokens: ${goal.tokenBudget === undefined ? formatTokenCount(goal.tokensUsed) : formatBudget(goal)}`,
   ];
+  if (goal.wait) {
+    summary.push(`Waiting: ${goal.wait.reason}`);
+    if (goal.wait.resumeAt !== undefined) summary.push(`Wake deadline: ${new Date(goal.wait.resumeAt).toISOString()}`);
+  }
   if (goal.safetyPauseCause) {
     summary.push(
       goal.safetyPauseCause === "continuation_limit"
