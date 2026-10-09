@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type ExtensionContext, SessionManager } from "@earendil-works/pi-coding-agent";
-import type { TUI } from "@earendil-works/pi-tui";
+import { Key, matchesKey, type TUI } from "@earendil-works/pi-tui";
 import { afterEach, test, vi } from "vitest";
 import history, { HistoryPopupComponent } from "../src/index.js";
 
@@ -175,12 +175,14 @@ function setupSessionScans() {
   } as unknown as ExtensionContext;
   const lifecycle = new Map<string, (event: never, ctx: ExtensionContext) => void>();
   let shortcut: ((ctx: ExtensionContext) => Promise<void>) | undefined;
+  const shortcuts = new Map<string, (ctx: ExtensionContext) => Promise<void>>();
   history({
     on(event: string, handler: (event: never, ctx: ExtensionContext) => void) {
       lifecycle.set(event, handler);
     },
-    registerShortcut(_key: string, registered: { handler: (ctx: ExtensionContext) => Promise<void> }) {
+    registerShortcut(key: string, registered: { handler: (ctx: ExtensionContext) => Promise<void> }) {
       shortcut = registered.handler;
+      shortcuts.set(key, registered.handler);
     },
   } as never);
 
@@ -209,6 +211,12 @@ function setupSessionScans() {
     beforeTree,
     commitTree,
     trigger,
+    triggerInput: (data: string) => {
+      for (const [key, handler] of shortcuts) {
+        if (matchesKey(data, key as Parameters<typeof matchesKey>[1])) return handler(ctx);
+      }
+      return undefined;
+    },
     finishScan,
     setBranch: (messages: string[]) => {
       branch = messages;
@@ -247,7 +255,7 @@ test("a live native history addition during a scan prevents deferred seeding but
   assert.equal(fixture.getEditorText(), "cached prompt");
 });
 
-test("Ctrl+R repeats during a scan select older entries in one popup", async () => {
+test("Ctrl+Alt+R repeats during a scan select older entries in one popup", async () => {
   const fixture = setupSessionScans();
   fixture.start();
   const first = fixture.trigger();
@@ -270,6 +278,73 @@ test("Ctrl+R repeats during a scan select older entries in one popup", async () 
   await reopened;
   assert.equal(fixture.getEditorText(), "cached prompt");
   assert.equal(fixture.getClosedPopups(), 2);
+});
+
+test("Ctrl+Alt+R terminal input queues repeats during a scan and navigates the opened popup", async () => {
+  const fixture = setupSessionScans();
+  fixture.start();
+  fixture.setBranch(["oldest branch", "middle branch", "newest branch"]);
+  const running = fixture.triggerInput("\x1b[114;7u"); // Kitty: Ctrl+Alt+R.
+  assert.ok(running, "Ctrl+Alt+R must own the opening shortcut");
+  assert.equal(fixture.triggerInput("\x12"), undefined, "Ctrl+R must remain available to Pi");
+  await fixture.triggerInput("\x1b\x12"); // Legacy Alt prefix + Ctrl+R.
+  await fixture.triggerInput("\x1b[27;7;114~"); // xterm modifyOtherKeys.
+  assert.equal(fixture.popups.length, 0);
+
+  fixture.finishScan(fixture.oldScan, "cached prompt");
+  await vi.waitFor(() => assert.equal(fixture.popups.length, 1));
+  const popup = fixture.popups[0];
+  assert.ok(popup);
+  assert.ok(popup.render(100).some((line) => line.includes("3/4")));
+  popup.handleInput("\x1b[114;7u"); // Once mounted, Pi routes input to the popup.
+  assert.ok(popup.render(100).some((line) => line.includes("4/4")));
+  popup.handleInput("\r");
+  await running;
+  assert.equal(fixture.getEditorText(), "cached prompt");
+  assert.equal(fixture.popups.length, 1);
+});
+
+for (const [protocol, data] of [
+  ["legacy", "\x1b\x12"],
+  ["Kitty", "\x1b[114;7u"],
+  ["modifyOtherKeys", "\x1b[27;7;114~"],
+] as const) {
+  test(`Ctrl+Alt+R repeats navigate older popup entries via ${protocol} without changing the filter`, () => {
+    assert.equal(Key.ctrlAlt("r"), "ctrl+alt+r");
+    assert.ok(matchesKey(data, Key.ctrlAlt("r")));
+    assert.equal(matchesKey(data, Key.ctrl("r")), false);
+    const selected: (string | null)[] = [];
+    const tui = { requestRender: vi.fn() } as unknown as TUI;
+    const theme = { fg: (_color: string, text: string) => text, bg: (_color: string, text: string) => text };
+    const popup = new HistoryPopupComponent(
+      tui,
+      theme as never,
+      [{ text: "newest match" }, { text: "middle match" }, { text: "oldest match" }],
+      (result) => selected.push(result),
+    );
+    popup.handleInput("match");
+    popup.handleInput(data);
+    assert.ok(popup.render(100).some((line) => line.includes("2/3")));
+    popup.handleInput(data);
+    assert.ok(popup.render(100).some((line) => line.includes("3/3")));
+    popup.handleInput(data); // Clamp at the oldest match.
+    popup.handleInput("\r");
+    assert.deepEqual(selected, ["oldest match"]);
+  });
+}
+
+test("Ctrl+R remains a compatible older-entry alias only inside the popup", async () => {
+  const fixture = setupSessionScans();
+  fixture.start();
+  fixture.finishScan(fixture.oldScan, "cached prompt");
+  const running = fixture.trigger();
+  await vi.waitFor(() => assert.equal(fixture.popups.length, 1));
+  const popup = fixture.popups[0];
+  assert.ok(popup);
+  popup.handleInput("\x12");
+  popup.handleInput("\r");
+  await running;
+  assert.equal(fixture.getEditorText(), "cached prompt");
 });
 
 test("queued repeat presses have a finite navigation cap", async () => {

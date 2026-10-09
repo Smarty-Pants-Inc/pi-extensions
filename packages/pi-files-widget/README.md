@@ -12,7 +12,7 @@ Directory symlinks are shown with a `↗` marker and can be expanded like normal
 pi install npm:@signalridge/pi-files-widget
 ```
 
-Required deps (needed for /readfiles):
+Optional tools (for richer rendering; `/readfiles` also works without them):
 
 ```bash
 # macOS (Homebrew)
@@ -67,13 +67,13 @@ Then reference it in your settings:
 }
 ```
 
-## Dependencies (required)
+## Optional rendering tools
 
 - `bat`: syntax highlighting
 - `delta`: formatted diffs
 - `glow`: markdown rendering
 
-The `/readfiles` browser requires these tools and will refuse to open until they are installed.
+These tools are optional. If any are missing, the widget shows one warning per extension load in TUI mode, but `/readfiles` still opens. Without `bat`, files display as plain text with line numbers. Without `delta`, diffs use raw Git output (`git` is needed for Git status and diffs). Without `glow`, Markdown displays as source text, highlighted by `bat` when available. Installed tools continue to provide their richer rendering.
 
 ## Commands
 

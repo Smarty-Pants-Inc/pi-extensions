@@ -1,7 +1,7 @@
 # Editor Extension - Implementation Checklist
 
 ## Pre-requisites
-- [x] Check for required tools (`bat`, `delta`, `glow`, `fd`) and document install commands
+- [x] Check for optional rendering tools (`bat`, `delta`, `glow`) and document install commands
 - [ ] Verify pi-tui capabilities for widget sizing and keyboard handling
 
 ## Phase 1: File Browser Widget
