@@ -4,9 +4,7 @@
  * Loads CLAUDE.md, CODEX.md, or GEMINI.md based on current model provider,
  * supplementing Pi Core's AGENTS.md loading.
  *
- * Deduplication:
- * - Skips if core already loaded the file (CLAUDE.md fallback case)
- * - Skips if AGENTS.md has identical content
+ * Deduplication uses the host's actual context files, by resolved path or content.
  */
 
 import * as fs from "node:fs";
@@ -56,30 +54,43 @@ function getCandidateFiles(modelId: string | undefined, provider: string, config
   return config.providers?.[provider] ?? PROVIDER_FILES[provider] ?? [];
 }
 
-function shouldLoad(dir: string, providerFile: string): boolean {
-  const providerPath = path.join(dir, providerFile);
-  if (!fs.existsSync(providerPath)) return false;
+interface ContextFile {
+  path: string;
+  content: string;
+}
 
-  const agentsPath = path.join(dir, "AGENTS.md");
-  const agentsExists = fs.existsSync(agentsPath);
-  const claudeExists = fs.existsSync(path.join(dir, "CLAUDE.md"));
-
-  // What did core load? (prefers AGENTS.md, falls back to CLAUDE.md)
-  const coreLoaded = agentsExists ? "AGENTS.md" : claudeExists ? "CLAUDE.md" : null;
-  if (coreLoaded === providerFile) return false;
-
-  // Skip if identical to AGENTS.md
-  if (agentsExists) {
-    try {
-      const agentsContent = fs.readFileSync(agentsPath, "utf-8");
-      const providerContent = fs.readFileSync(providerPath, "utf-8");
-      if (agentsContent === providerContent) return false;
-    } catch {
-      // Proceed with loading
-    }
+function readContextFile(filePath: string): ContextFile | undefined {
+  try {
+    if (!fs.statSync(filePath).isFile()) return undefined;
+    return { path: filePath, content: fs.readFileSync(filePath, "utf-8").replace(/^\uFEFF/u, "") };
+  } catch {
+    return undefined;
   }
+}
 
-  return true;
+function resolvedPath(filePath: string): string {
+  try {
+    return fs.realpathSync(filePath);
+  } catch {
+    return path.resolve(filePath);
+  }
+}
+
+// Older hosts do not expose systemPromptOptions. Match core selection, including
+// unreadable/non-file candidates, rather than inferring selection from existence.
+function legacyContextFiles(directories: string[]): ContextFile[] {
+  return directories.flatMap((dir) => {
+    for (const name of ["AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"]) {
+      const file = readContextFile(path.join(dir, name));
+      if (file) return [file];
+    }
+    return [];
+  });
+}
+
+function shouldLoad(file: ContextFile, contextFiles: readonly ContextFile[]): boolean {
+  const candidatePath = resolvedPath(file.path);
+  return !contextFiles.some((loaded) => resolvedPath(loaded.path) === candidatePath || loaded.content === file.content);
 }
 
 function getDirectories(cwd: string, agentDir: string): string[] {
@@ -120,18 +131,14 @@ export default function agentGuidance(pi: ExtensionAPI) {
     const candidates = getCandidateFiles(ctx.model?.id, provider, config);
     if (candidates.length === 0) return;
 
-    const files: Array<{ path: string; content: string }> = [];
+    const directories = getDirectories(ctx.cwd, agentDir);
+    const contextFiles = event.systemPromptOptions?.contextFiles ?? legacyContextFiles(directories);
+    const files: ContextFile[] = [];
 
-    for (const dir of getDirectories(ctx.cwd, agentDir)) {
+    for (const dir of directories) {
       for (const filename of candidates) {
-        if (shouldLoad(dir, filename)) {
-          const filePath = path.join(dir, filename);
-          try {
-            files.push({ path: filePath, content: fs.readFileSync(filePath, "utf-8") });
-          } catch {
-            // Skip unreadable files
-          }
-        }
+        const file = readContextFile(path.join(dir, filename));
+        if (file && shouldLoad(file, contextFiles)) files.push(file);
       }
     }
 

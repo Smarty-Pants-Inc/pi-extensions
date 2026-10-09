@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.2.6
+### Patch Changes
+
+- 3364cc0: Replace POSIX clipboard pipeline shells with argument-safe exec redirection so cancellation terminates the clipboard utility itself, while preserving private-file cleanup and platform fallbacks.
+  
+  Omit unchanged dry-run LSP file text and independently bound result details. Spill oversized edits and diagnostics to private files instead of retaining full payloads in session history, preserving compact fix outcome metadata and bounded notices.
+- 3364cc0: Close snippet and run-output custom dialogs synchronously when their session ownership retires, before navigation replaces the draft. Cancel action selection and clipboard utilities with the operation signal, ignore retained callbacks, and clean private clipboard files without starting delayed fallbacks.
+- 3364cc0: Adopt Pi 1.0.4's host-provided dependency contract: declare imported Pi and TypeBox modules as `*` peers rather than installing duplicate runtime modules, and align Pi development pins with the repository's tested 1.0.4 baseline. The wildcard identifies host module ownership; it does not promise compatibility with every Pi version.
+- 3364cc0: Protect clipboard transcripts with private isolated temporary files, decode Kitty printable filter input, and confirm RPC draft replacement with cancellable session/branch ownership so retired confirmations cannot overwrite a replacement draft. Escape unsafe recalled quote controls without changing stored text. Bound LSP tool output with private full-output spills and preserve concurrent per-session status ownership.
+
 ## 1.2.5
 ### Patch Changes
 

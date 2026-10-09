@@ -12,6 +12,7 @@ import {
 import { defineMenu, runMenu } from "@narumitw/pi-tui-kit";
 import { withBorderedCustomUi } from "@signalridge/pi-ui";
 import { completeStatuslineArguments } from "./command-contract.js";
+import { type CommandOwner, isOwnerCurrent, ownedCustom, ownedEditor } from "./command-owner.js";
 import {
   INFORMATION_PROFILE_NAMES,
   INFORMATION_PROFILES,
@@ -60,7 +61,8 @@ export interface StatuslineCommandOptions {
   apply(loaded: LoadedStatuslineSettings, ctx: ExtensionCommandContext): void;
   preview?(palettePreset: PalettePreset | undefined, ctx: ExtensionCommandContext): void;
   save?: (settingsPath: string, rawDocument: string) => LoadedStatuslineSettings;
-  getMenuOwner?(): { signal: AbortSignal; isCurrent(): boolean };
+  getMenuOwner?(): CommandOwner;
+  getExternalEditorCommand?(): string | undefined;
   /**
    * Whether `ctx` belongs to the session this runtime is currently drawing.
    *
@@ -84,7 +86,13 @@ export function registerStatuslineCommand(pi: ExtensionAPI, options: StatuslineC
     getArgumentCompletions: completeStatuslineArguments,
     handler: async (args, ctx) => {
       if (options.isCurrentSession?.(ctx) === false) return;
-      await handleStatuslineCommand(args, ctx, options);
+      await handleStatuslineCommand(args, ctx, {
+        ...options,
+        getExternalEditorCommand: () => {
+          const configured = pi.getSettings().externalEditor;
+          return typeof configured === "string" && configured.trim() !== "" ? configured : undefined;
+        },
+      });
     },
   });
 }
@@ -94,6 +102,45 @@ export async function handleStatuslineCommand(
   ctx: ExtensionCommandContext,
   options: StatuslineCommandOptions,
 ) {
+  // Capture once, including direct `settings`, not only the outer menu.
+  const originalCtx = ctx;
+  const originalOptions = options;
+  const owner = originalOptions.getMenuOwner?.() ?? {
+    signal: new AbortController().signal,
+    isCurrent: () => originalOptions.isCurrentSession?.(originalCtx) !== false,
+  };
+  const current = () => isOwnerCurrent(owner) && originalOptions.isCurrentSession?.(originalCtx) !== false;
+  const requireCurrent = () => {
+    if (!current()) throw new DOMException("Statusline command cancelled", "AbortError");
+  };
+  if (!current()) return;
+  options = {
+    ...originalOptions,
+    getMenuOwner: () => owner,
+    save: (path, document) => {
+      requireCurrent();
+      return (originalOptions.save ?? saveStatuslineSettingsDocument)(path, document);
+    },
+    apply: (loaded) => {
+      requireCurrent();
+      originalOptions.apply(loaded, originalCtx);
+    },
+    preview: (preset) => {
+      if (current()) originalOptions.preview?.(preset, originalCtx);
+    },
+  };
+  ctx = {
+    ...originalCtx,
+    ui: {
+      ...originalCtx.ui,
+      custom: ownedCustom(originalCtx, owner),
+      editor: (title, prefill) =>
+        ownedEditor(originalCtx, owner, title, prefill, originalOptions.getExternalEditorCommand?.()),
+      notify: (message, level) => {
+        if (current()) originalCtx.ui.notify(message, level);
+      },
+    },
+  };
   const normalized = args.trim();
   if (!normalized) {
     await showMainMenu(ctx, options);

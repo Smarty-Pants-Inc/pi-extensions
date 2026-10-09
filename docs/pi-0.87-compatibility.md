@@ -1,6 +1,6 @@
 # Pi 0.87.1 compatibility and upstream review
 
-Historical snapshot completed: 2026-09-30. This review covers all 27 extensions and two shared libraries against the released Pi 0.87.1 host, not Pi `main`. The current npm `latest` is 0.99.1; see the [0.99.1 compatibility review](pi-0.99-compatibility.md). The earlier [0.85.1 audit](pi-0.85-compatibility.md) and [September 13 upstream snapshot](upstream-refresh.md) are also historical records.
+Historical snapshot completed: 2026-09-30. This review covers all 27 extensions and two shared libraries against the released Pi 0.87.1 host, not Pi `main`. See the [Pi 1.0 compatibility review](pi-1.0-compatibility.md) for the current tested host and the [0.99.1 compatibility review](pi-0.99-compatibility.md) for the intervening snapshot. The earlier [0.85.1 audit](pi-0.85-compatibility.md) and [September 13 upstream snapshot](upstream-refresh.md) are also historical records.
 
 ## Released-host changes
 

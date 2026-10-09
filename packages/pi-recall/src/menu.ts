@@ -42,7 +42,10 @@ const SCOPE_LABELS: Record<RecallScope, string> = {
   session: "Current session",
 };
 
-export function createRecallMenu(source: RecallMenuSource, ownership: { isCurrent?: () => boolean } = {}) {
+export function createRecallMenu(
+  source: RecallMenuSource,
+  ownership: { isCurrent?: () => boolean; mode?: ExtensionCommandContext["mode"] } = {},
+) {
   let selectedRecordId: string | undefined;
   let selectedScope: RecallScope = "cwd";
   let pickerSelectedId: string | undefined;
@@ -97,7 +100,7 @@ export function createRecallMenu(source: RecallMenuSource, ownership: { isCurren
         hint: "close",
       }),
       save: ({ state }) => saveScreen(state),
-      selected: ({ state }) => selectedScreen(state),
+      selected: ({ state }) => selectedScreen(state, ownership.mode),
       preview: ({ state }) => ({
         kind: "review",
         title: "Saved message preview",
@@ -274,9 +277,24 @@ export function createRecallMenu(source: RecallMenuSource, ownership: { isCurren
         selectedRecordId = result.recordId;
         return { kind: "to", screen: "selected" };
       },
-      quote: ({ ctx, state }) => {
+      quote: async ({ ctx, state, signal }) => {
         if (!state.selected) return { kind: "rejected", error: new Error("Saved message is unavailable") };
-        ctx.ui.pasteToEditor(formatRecallQuote(state.selected));
+        if (signal.aborted || !isCurrent(ownership)) return { kind: "close" };
+        const quote = formatRecallQuote(state.selected);
+        if (ctx.mode === "rpc") {
+          const confirmed = await ctx.ui.confirm(
+            "Replace client draft with quote?",
+            "RPC cannot read or append to the client draft. This will replace the entire draft with the recalled quote.",
+            { signal },
+          );
+          if (signal.aborted || !isCurrent(ownership)) return { kind: "close" };
+          if (!confirmed) return { kind: "stay" };
+          ctx.ui.setEditorText(quote);
+        } else if (ctx.mode === "tui") {
+          ctx.ui.pasteToEditor(quote);
+        } else {
+          return { kind: "stay" };
+        }
         return { kind: "close" };
       },
       deleteMessage: async ({ ctx, state, signal }) => {
@@ -308,7 +326,7 @@ export async function showRecallMenu(
 ): Promise<void> {
   const { runMenu } = await import("@narumitw/pi-tui-kit");
   if (ownership.signal.aborted || !ownership.isCurrent()) return;
-  const controller = createRecallMenu(source, ownership);
+  const controller = createRecallMenu(source, { ...ownership, mode: ctx.mode });
   await runMenu(withBorderedCustomUi(ctx), controller.menu, {
     getState: controller.getState,
     signal: ownership.signal,
@@ -348,7 +366,7 @@ function saveScreen(state: RecallMenuState) {
   };
 }
 
-function selectedScreen(state: RecallMenuState) {
+function selectedScreen(state: RecallMenuState, mode?: ExtensionCommandContext["mode"]) {
   return {
     kind: "actions" as const,
     title: "Saved message",
@@ -358,7 +376,11 @@ function selectedScreen(state: RecallMenuState) {
     items: state.selected
       ? [
           { id: "preview", label: "Preview", to: "preview" as const },
-          { id: "quote", label: "Quote into draft", action: "quote" as const },
+          {
+            id: "quote",
+            label: mode === "rpc" ? "Replace client draft with quote" : "Quote into draft",
+            action: "quote" as const,
+          },
           { id: "delete", label: "Delete…", to: "delete" as const },
           {
             id: "back-to-saved",

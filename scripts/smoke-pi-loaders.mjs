@@ -6,6 +6,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -13,6 +14,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
 import {
   createAgentSession,
@@ -22,6 +24,7 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import { createResponseRendezvous, queueAdmissionReady } from "./smoke-response-rendezvous.mjs";
 
 const root = resolve(new URL("..", import.meta.url).pathname);
 const packagesRoot = join(root, "packages");
@@ -164,7 +167,7 @@ async function activatePackage(
   );
 }
 
-async function activateRoots(
+export async function activateRoots(
   roots,
   consumer,
   agentDir,
@@ -179,8 +182,13 @@ async function activateRoots(
     return manifest;
   });
   const settingsManager = SettingsManager.create(consumer, agentDir);
+  // Settings-backed packages retain packageRoot metadata through loader.reload.
+  // CLI resource paths (even package directories) lose it on this host, hiding
+  // warnings about dependencies that must be supplied by Pi instead.
+  settingsManager.setPackages(roots);
+  await settingsManager.flush();
   const packageManager = new DefaultPackageManager({ cwd: consumer, agentDir, settingsManager });
-  const resolved = await packageManager.resolveExtensionSources(roots, { temporary: true });
+  const resolved = await packageManager.resolve();
   assert.equal(
     resolved.extensions.length,
     expectedResourceCount,
@@ -195,7 +203,8 @@ async function activateRoots(
     cwd: consumer,
     agentDir,
     settingsManager,
-    additionalExtensionPaths: extensionPaths,
+    // Only standalone event fixtures belong on the CLI resource surface.
+    additionalExtensionPaths: options.extensionPaths ?? [],
     noSkills: true,
     noPromptTemplates: true,
     noThemes: true,
@@ -212,6 +221,13 @@ async function activateRoots(
     loadedExtensions.errors.length,
     0,
     `${label} resource errors: ${loadedExtensions.errors.map((error) => error.error).join("; ")}`,
+  );
+
+  const warnings = loadedExtensions.warnings ?? [];
+  assert.equal(
+    warnings.length,
+    0,
+    `${label} resource warnings: ${warnings.map(({ path, warning }) => `${path}: ${warning}`).join("; ")}`,
   );
 
   const errors = [];
@@ -338,12 +354,17 @@ async function runRealPiWorkflowIntegration(session, faux) {
 
   let activeResponses = 0;
   let maxActiveResponses = 0;
-  const response = (text) => async () => {
+  const dagResponses = createResponseRendezvous("real Pi DAG", ["task A", "task B"]);
+  const response = (text, rendezvous) => async () => {
     activeResponses += 1;
     maxActiveResponses = Math.max(maxActiveResponses, activeResponses);
-    await new Promise((resolve) => setTimeout(resolve, 25));
-    activeResponses -= 1;
-    return fauxAssistantMessage(text);
+    try {
+      if (rendezvous) await rendezvous.enter(text);
+      else await new Promise((resolve) => setTimeout(resolve, 25));
+      return fauxAssistantMessage(text);
+    } finally {
+      activeResponses -= 1;
+    }
   };
   const isolatedResponse = async (context) => {
     assert.ok(
@@ -353,8 +374,8 @@ async function runRealPiWorkflowIntegration(session, faux) {
     return response("isolated task")();
   };
   faux.setResponses([
-    response("task A"),
-    response("task B"),
+    response("task A", dagResponses),
+    response("task B", dagResponses),
     response("task C"),
     isolatedResponse,
     response("synthesis output"),
@@ -367,16 +388,24 @@ const results = await parallel([
 const c = await agent("Return C.", { label: "c" });
 const isolated = await agent("Return isolated.", { label: "isolated", agentType: "isolated" });
 return "synthesis output";`;
-  const completed = await workflow.execute(
-    "real-dag",
-    {
-      script: dagScript,
-      background: false,
-    },
-    undefined,
-    undefined,
-    undefined,
-  );
+  let completed;
+  try {
+    completed = await workflow.execute(
+      "real-dag",
+      {
+        script: dagScript,
+        background: false,
+      },
+      undefined,
+      undefined,
+      undefined,
+    );
+    // Faux-provider failures can be returned as a failed workflow result. Keep
+    // the rendezvous timeout explicit instead of hiding it in a status mismatch.
+    dagResponses.assertReleased();
+  } finally {
+    dagResponses.dispose();
+  }
   assert.match(toolText(completed), /status=completed/);
   assert.match(toolText(completed), /synthesis output/);
   const completedRunId = completed.details?.runId;
@@ -404,36 +433,94 @@ return "synthesis output";`;
     ),
   );
 
-  // Force a real managed queue with the temporary maxConcurrent=2 setting and
-  // ensure every queued response drains instead of being lost at the terminal
-  // boundary.
+  // Force a real shared-manager queue with two independent workflows. A
+  // single three-call workflow caps its own dispatch at the host pool size,
+  // before a third managed request can allocate. Hold one workflow's pair,
+  // then submit the third task from another workflow and verify queue drainage.
   let queuedActive = 0;
   let queuedMaxActive = 0;
   let queuedStarts = 0;
-  const queuedResponse = (text) => async () => {
+  const previousManagedIds = new Set(
+    session.sessionManager
+      .getBranch()
+      .filter((entry) => entry.type === "custom" && entry.customType === "subagents:managed-spawn")
+      .map((entry) => entry.data?.id),
+  );
+  let queueAdmissionObserved = false;
+  const queueResponses = createResponseRendezvous("real Pi queue", ["queue 1", "queue 2"], 5_000, () => {
+    const latest = new Map();
+    for (const entry of session.sessionManager.getBranch()) {
+      const data = entry.data;
+      if (
+        entry.type === "custom" &&
+        entry.customType === "subagents:managed-spawn" &&
+        typeof data?.id === "string" &&
+        !previousManagedIds.has(data.id) &&
+        data.owner?.extension === "pi-workflows"
+      ) {
+        latest.set(data.id, data.state);
+      }
+    }
+    const ready = queueAdmissionReady([...latest.values()]);
+    if (ready) queueAdmissionObserved = true;
+    return ready;
+  });
+  const queuedResponse = (text, rendezvous) => async () => {
     queuedStarts += 1;
     queuedActive += 1;
     queuedMaxActive = Math.max(queuedMaxActive, queuedActive);
-    await new Promise((resolve) => setTimeout(resolve, 30));
-    queuedActive -= 1;
-    return fauxAssistantMessage(text);
+    try {
+      if (rendezvous) await rendezvous.enter(text);
+      else await new Promise((resolve) => setTimeout(resolve, 30));
+      return fauxAssistantMessage(text);
+    } finally {
+      queuedActive -= 1;
+    }
   };
-  faux.setResponses([queuedResponse("queue 1"), queuedResponse("queue 2"), queuedResponse("queue 3")]);
-  const queueScript = `export const meta = { name: "real Pi queue", description: "Queue" };
-await parallel(Array.from({ length: 3 }, (_, i) => () => agent("Return queue " + (i + 1) + ".", { label: "q" + (i + 1) })));
+  faux.setResponses([
+    queuedResponse("queue 1", queueResponses),
+    queuedResponse("queue 2", queueResponses),
+    queuedResponse("queue 3"),
+  ]);
+  const queueScript = `export const meta = { name: "real Pi queue pair", description: "Hold the manager pool" };
+await parallel(Array.from({ length: 2 }, (_, i) => () => agent("Return queue " + (i + 1) + ".", { label: "q" + (i + 1) })));
 return 0;`;
-  const queued = await workflow.execute(
-    "real-queue",
-    {
-      script: queueScript,
-      background: false,
-    },
+  const thirdQueueScript = `export const meta = { name: "real Pi queued task", description: "Wait for the manager pool" };
+await agent("Return queue 3.", { label: "q3" });
+return 0;`;
+  let queued;
+  let queuedThird;
+  const pair = workflow.execute(
+    "real-queue-pair",
+    { script: queueScript, background: false },
     undefined,
     undefined,
     undefined,
   );
+  void pair.catch(() => {});
+  try {
+    await waitFor(() => queuedStarts === 2, "both held queue callbacks");
+    [queued, queuedThird] = await Promise.all([
+      pair,
+      workflow.execute(
+        "real-queue-third",
+        { script: thirdQueueScript, background: false },
+        undefined,
+        undefined,
+        undefined,
+      ),
+    ]);
+    queueResponses.assertReleased();
+  } finally {
+    queueResponses.dispose();
+  }
   assert.match(toolText(queued), /status=completed/);
+  assert.match(toolText(queuedThird), /status=completed/);
   assert.equal(queuedStarts, 3);
+  assert.ok(
+    queueAdmissionObserved,
+    "real Pi queue did not record two running tasks and one queued task before release",
+  );
   assert.equal(queuedMaxActive, 2, "real Pi queue did not enforce maxConcurrent");
 
   // Exercise Pi's public tree navigation. The workflow and subagent lifecycle
@@ -535,111 +622,112 @@ return 0;`;
   assert.equal(afterLate.details?.run?.status, "stopped");
 }
 
-const temp = mkdtempSync(join(tmpdir(), "pi-independent-package-smoke-"));
-const previousHome = process.env.HOME;
-const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
-process.env.HOME = join(temp, "home");
-process.env.PI_CODING_AGENT_DIR = join(temp, "agent");
-mkdirSync(process.env.HOME, { recursive: true });
-mkdirSync(process.env.PI_CODING_AGENT_DIR, { recursive: true });
-try {
-  const tarballs = new Map();
-  for (const directory of packageDirs()) tarballs.set(directory, pack(directory, temp));
+async function main() {
+  const temp = mkdtempSync(join(tmpdir(), "pi-independent-package-smoke-"));
+  const previousHome = process.env.HOME;
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.HOME = join(temp, "home");
+  process.env.PI_CODING_AGENT_DIR = join(temp, "agent");
+  mkdirSync(process.env.HOME, { recursive: true });
+  mkdirSync(process.env.PI_CODING_AGENT_DIR, { recursive: true });
+  try {
+    const tarballs = new Map();
+    for (const directory of packageDirs()) tarballs.set(directory, pack(directory, temp));
 
-  const reports = [];
-  for (const directory of extensionDirs()) {
-    const packageTemp = mkdtempSync(join(temp, `${directory}-`));
+    const reports = [];
+    for (const directory of extensionDirs()) {
+      const packageTemp = mkdtempSync(join(temp, `${directory}-`));
+      try {
+        run("tar", ["-xzf", tarballs.get(directory), "-C", packageTemp]);
+        const packageRoot = join(packageTemp, "package");
+        const manifest = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
+        const consumer = join(packageTemp, "consumer");
+        const agentDir = join(packageTemp, "agent");
+        mkdirSync(consumer, { recursive: true });
+        mkdirSync(agentDir, { recursive: true });
+        const packedDependencyRoots = extractPackedDependencies(packageTemp, manifest, tarballs);
+        const report = await activatePackage(
+          packageRoot,
+          manifest,
+          consumer,
+          agentDir,
+          join(packagesRoot, directory),
+          packedDependencyRoots,
+        );
+        reports.push({ directory, ...report });
+        console.log(`smoke: ${manifest.name} (${report.resourceCount} resource, ${report.toolCount} tools)`);
+        // Independent sessions are intentionally created in one Node process. Pi's
+        // extension lifecycle normally clears this singleton on shutdown, but the
+        // loader smoke disposes an in-memory session directly; clear the fixture's
+        // process-global manager before the next package can claim root ownership.
+        if (manifest.name === "@signalridge/pi-subagents") {
+          delete globalThis[Symbol.for("pi-subagents:manager")];
+          delete globalThis[Symbol.for("pi-subagents:rpc-owner")];
+          delete globalThis[Symbol.for("pi-subagents:manager-active")];
+        }
+      } finally {
+        rmSync(packageTemp, { recursive: true, force: true });
+      }
+    }
+
+    // The two protocol peers must also activate together through package-manager
+    // resource resolution. This catches duplicate registration and ordering bugs
+    // without loading monorepo source paths or a root aggregate manifest.
+    const stablePairTemp = mkdtempSync(join(temp, "stable-pair-"));
     try {
-      run("tar", ["-xzf", tarballs.get(directory), "-C", packageTemp]);
-      const packageRoot = join(packageTemp, "package");
-      const manifest = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
-      const consumer = join(packageTemp, "consumer");
-      const agentDir = join(packageTemp, "agent");
+      const roots = [];
+      const fallbackRoots = [];
+      const packedDependencyRoots = new Map();
+      const protocolDirectory = "pi-subagents-protocol";
+      const protocolExtracted = join(stablePairTemp, "packed-dependencies", protocolDirectory);
+      mkdirSync(protocolExtracted, { recursive: true });
+      run("tar", ["-xzf", tarballs.get(protocolDirectory), "-C", protocolExtracted]);
+      packedDependencyRoots.set("@signalridge/pi-subagents-protocol", join(protocolExtracted, "package"));
+      for (const directory of ["pi-subagents", "pi-workflows"]) {
+        const extracted = join(stablePairTemp, directory);
+        mkdirSync(extracted, { recursive: true });
+        run("tar", ["-xzf", tarballs.get(directory), "-C", extracted]);
+        const packageRoot = join(extracted, "package");
+        const manifest = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
+        linkPackedDependencies(packageRoot, manifest, packedDependencyRoots);
+        roots.push(packageRoot);
+        fallbackRoots.push(join(packagesRoot, directory));
+      }
+      const consumer = join(stablePairTemp, "consumer");
+      const agentDir = join(stablePairTemp, "agent");
       mkdirSync(consumer, { recursive: true });
       mkdirSync(agentDir, { recursive: true });
-      const packedDependencyRoots = extractPackedDependencies(packageTemp, manifest, tarballs);
-      const report = await activatePackage(
-        packageRoot,
-        manifest,
-        consumer,
-        agentDir,
-        join(packagesRoot, directory),
-        packedDependencyRoots,
-      );
-      reports.push({ directory, ...report });
-      console.log(`smoke: ${manifest.name} (${report.resourceCount} resource, ${report.toolCount} tools)`);
-      // Independent sessions are intentionally created in one Node process. Pi's
-      // extension lifecycle normally clears this singleton on shutdown, but the
-      // loader smoke disposes an in-memory session directly; clear the fixture's
-      // process-global manager before the next package can claim root ownership.
-      if (manifest.name === "@signalridge/pi-subagents") {
-        delete globalThis[Symbol.for("pi-subagents:manager")];
-        delete globalThis[Symbol.for("pi-subagents:rpc-owner")];
-        delete globalThis[Symbol.for("pi-subagents:manager-active")];
-      }
-    } finally {
-      rmSync(packageTemp, { recursive: true, force: true });
-    }
-  }
-
-  // The two protocol peers must also activate together through package-manager
-  // resource resolution. This catches duplicate registration and ordering bugs
-  // without loading monorepo source paths or a root aggregate manifest.
-  const stablePairTemp = mkdtempSync(join(temp, "stable-pair-"));
-  try {
-    const roots = [];
-    const fallbackRoots = [];
-    const packedDependencyRoots = new Map();
-    const protocolDirectory = "pi-subagents-protocol";
-    const protocolExtracted = join(stablePairTemp, "packed-dependencies", protocolDirectory);
-    mkdirSync(protocolExtracted, { recursive: true });
-    run("tar", ["-xzf", tarballs.get(protocolDirectory), "-C", protocolExtracted]);
-    packedDependencyRoots.set("@signalridge/pi-subagents-protocol", join(protocolExtracted, "package"));
-    for (const directory of ["pi-subagents", "pi-workflows"]) {
-      const extracted = join(stablePairTemp, directory);
-      mkdirSync(extracted, { recursive: true });
-      run("tar", ["-xzf", tarballs.get(directory), "-C", extracted]);
-      const packageRoot = join(extracted, "package");
-      const manifest = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
-      linkPackedDependencies(packageRoot, manifest, packedDependencyRoots);
-      roots.push(packageRoot);
-      fallbackRoots.push(join(packagesRoot, directory));
-    }
-    const consumer = join(stablePairTemp, "consumer");
-    const agentDir = join(stablePairTemp, "agent");
-    mkdirSync(consumer, { recursive: true });
-    mkdirSync(agentDir, { recursive: true });
-    mkdirSync(join(consumer, ".pi"), { recursive: true });
-    writeFileSync(
-      join(consumer, ".pi", "subagents.json"),
-      JSON.stringify({
-        maxConcurrent: 2,
-        schedulingEnabled: false,
-        agentTiers: {
-          defaultTier: "medium",
-          profiles: {
-            low: { model: "inherit", thinking: "inherit" },
-            medium: { model: "inherit", thinking: "inherit" },
-            high: { model: "inherit", thinking: "inherit" },
+      mkdirSync(join(consumer, ".pi"), { recursive: true });
+      writeFileSync(
+        join(consumer, ".pi", "subagents.json"),
+        JSON.stringify({
+          maxConcurrent: 2,
+          schedulingEnabled: false,
+          agentTiers: {
+            defaultTier: "medium",
+            profiles: {
+              low: { model: "inherit", thinking: "inherit" },
+              medium: { model: "inherit", thinking: "inherit" },
+              high: { model: "inherit", thinking: "inherit" },
+            },
           },
-        },
-      }),
-    );
-    mkdirSync(join(consumer, ".pi", "agents"), { recursive: true });
-    writeFileSync(
-      join(consumer, ".pi", "agents", "isolated.md"),
-      "---\ndescription: Real Pi worktree isolation smoke\nisolation: worktree\n---\nreal-pi-isolated-agent-marker\n",
-    );
-    writeFileSync(join(consumer, "README.md"), "real Pi workflow smoke\n");
-    run("git", ["init", "--quiet"], { cwd: consumer });
-    run("git", ["config", "user.email", "smoke@example.invalid"], { cwd: consumer });
-    run("git", ["config", "user.name", "Pi smoke"], { cwd: consumer });
-    run("git", ["add", "."], { cwd: consumer });
-    run("git", ["commit", "--quiet", "-m", "initial smoke fixture"], { cwd: consumer });
-    const eventFixture = join(stablePairTemp, "smoke-events.mjs");
-    writeFileSync(
-      eventFixture,
-      `export default function smokeEvents(pi) {
+        }),
+      );
+      mkdirSync(join(consumer, ".pi", "agents"), { recursive: true });
+      writeFileSync(
+        join(consumer, ".pi", "agents", "isolated.md"),
+        "---\ndescription: Real Pi worktree isolation smoke\nisolation: worktree\n---\nreal-pi-isolated-agent-marker\n",
+      );
+      writeFileSync(join(consumer, "README.md"), "real Pi workflow smoke\n");
+      run("git", ["init", "--quiet"], { cwd: consumer });
+      run("git", ["config", "user.email", "smoke@example.invalid"], { cwd: consumer });
+      run("git", ["config", "user.name", "Pi smoke"], { cwd: consumer });
+      run("git", ["add", "."], { cwd: consumer });
+      run("git", ["commit", "--quiet", "-m", "initial smoke fixture"], { cwd: consumer });
+      const eventFixture = join(stablePairTemp, "smoke-events.mjs");
+      writeFileSync(
+        eventFixture,
+        `export default function smokeEvents(pi) {
   pi.registerTool({
     name: "smoke_emit_event",
     label: "Emit smoke event",
@@ -660,168 +748,171 @@ try {
   });
 }
 `,
-    );
+      );
 
-    // Use Pi's built-in faux provider so this is a real pinned Pi AgentSession and
-    // event bus test without credentials or network access.
-    const faux = fauxProvider({
-      provider: "signalridge-pi-smoke",
-      models: [{ id: "smoke-model", name: "Signalridge smoke", reasoning: false }],
-    });
-    const modelRuntime = await ModelRuntime.create({
-      authPath: join(agentDir, "auth.json"),
-      modelsPath: null,
-      refreshOnCreate: false,
-    });
-    modelRuntime.registerNativeProvider(faux.provider);
-    const previousCwd = process.cwd();
-    process.chdir(consumer);
-    const flaky = createFlakySessionManager(consumer, 2);
-    try {
-      const pair = await activateRoots(
-        roots,
-        consumer,
-        agentDir,
-        2,
-        "stable pi-subagents + pi-workflows",
-        fallbackRoots,
-        {
-          keepSession: true,
-          model: faux.getModel(),
-          modelRuntime,
-          extensionPaths: [eventFixture],
-          sessionManager: flaky.sessionManager,
-        },
-      );
-      console.log(`smoke: stable pi-subagents + pi-workflows ordering (${pair.toolCount} tools)`);
-      await runRealPiWorkflowIntegration(pair.session, faux);
-      assert.equal(flaky.state.remaining, 0, "journal retry fixture was not exercised");
-      pair.session.dispose();
-      delete globalThis[Symbol.for("pi-subagents:manager")];
-      delete globalThis[Symbol.for("pi-subagents:rpc-owner")];
-      delete globalThis[Symbol.for("pi-subagents:manager-active")];
+      // Use Pi's built-in faux provider so this is a real pinned Pi AgentSession and
+      // event bus test without credentials or network access.
+      const faux = fauxProvider({
+        provider: "signalridge-pi-smoke",
+        models: [{ id: "smoke-model", name: "Signalridge smoke", reasoning: false }],
+      });
+      const modelRuntime = await ModelRuntime.create({
+        authPath: join(agentDir, "auth.json"),
+        modelsPath: null,
+        refreshOnCreate: false,
+      });
+      modelRuntime.registerNativeProvider(faux.provider);
+      const previousCwd = process.cwd();
+      process.chdir(consumer);
+      const flaky = createFlakySessionManager(consumer, 2);
+      try {
+        const pair = await activateRoots(
+          roots,
+          consumer,
+          agentDir,
+          2,
+          "stable pi-subagents + pi-workflows",
+          fallbackRoots,
+          {
+            keepSession: true,
+            model: faux.getModel(),
+            modelRuntime,
+            extensionPaths: [eventFixture],
+            sessionManager: flaky.sessionManager,
+          },
+        );
+        console.log(`smoke: stable pi-subagents + pi-workflows ordering (${pair.toolCount} tools)`);
+        await runRealPiWorkflowIntegration(pair.session, faux);
+        assert.equal(flaky.state.remaining, 0, "journal retry fixture was not exercised");
+        pair.session.dispose();
+        delete globalThis[Symbol.for("pi-subagents:manager")];
+        delete globalThis[Symbol.for("pi-subagents:rpc-owner")];
+        delete globalThis[Symbol.for("pi-subagents:manager-active")];
 
-      // Re-open the same independently packaged pair with a seeded active
-      // journal branch. Pi's real session_start recovery must rotate it to an
-      // interrupted attempt, and workflow_control resume must dispatch it over
-      // the same event bus.
-      faux.setResponses([fauxAssistantMessage("recovered result")]);
-      const recoveryPair = await activateRoots(
-        roots,
-        consumer,
-        agentDir,
-        2,
-        "stable pi-subagents + pi-workflows recovery",
-        fallbackRoots,
-        {
-          keepSession: true,
-          model: faux.getModel(),
-          modelRuntime,
-          extensionPaths: [eventFixture],
-          beforeBind: seedInterruptedWorkflow,
-        },
-      );
-      const recoveryControl = recoveryPair.session.getToolDefinition("workflow_control");
-      assert.ok(recoveryControl, "Pi did not expose recovery workflow_control");
-      const recovered = await recoveryControl.execute(
-        "recovery-get",
-        { action: "get", run_id: "real-pi-recovery" },
-        undefined,
-        undefined,
-        undefined,
-      );
-      assert.equal(recovered.details?.run?.status, "interrupted");
-      await recoveryControl.execute(
-        "recovery-resume",
-        { action: "resume", run_id: "real-pi-recovery" },
-        undefined,
-        undefined,
-        undefined,
-      );
-      let recoveryStatus;
-      for (let attempt = 0; attempt < 100; attempt += 1) {
-        const current = await recoveryControl.execute(
-          "recovery-poll",
+        // Re-open the same independently packaged pair with a seeded active
+        // journal branch. Pi's real session_start recovery must rotate it to an
+        // interrupted attempt, and workflow_control resume must dispatch it over
+        // the same event bus.
+        faux.setResponses([fauxAssistantMessage("recovered result")]);
+        const recoveryPair = await activateRoots(
+          roots,
+          consumer,
+          agentDir,
+          2,
+          "stable pi-subagents + pi-workflows recovery",
+          fallbackRoots,
+          {
+            keepSession: true,
+            model: faux.getModel(),
+            modelRuntime,
+            extensionPaths: [eventFixture],
+            beforeBind: seedInterruptedWorkflow,
+          },
+        );
+        const recoveryControl = recoveryPair.session.getToolDefinition("workflow_control");
+        assert.ok(recoveryControl, "Pi did not expose recovery workflow_control");
+        const recovered = await recoveryControl.execute(
+          "recovery-get",
           { action: "get", run_id: "real-pi-recovery" },
           undefined,
           undefined,
           undefined,
         );
-        recoveryStatus = current.details?.run?.status;
-        if (recoveryStatus === "completed") break;
-        await new Promise((resolve) => setTimeout(resolve, 10));
+        assert.equal(recovered.details?.run?.status, "interrupted");
+        await recoveryControl.execute(
+          "recovery-resume",
+          { action: "resume", run_id: "real-pi-recovery" },
+          undefined,
+          undefined,
+          undefined,
+        );
+        let recoveryStatus;
+        for (let attempt = 0; attempt < 100; attempt += 1) {
+          const current = await recoveryControl.execute(
+            "recovery-poll",
+            { action: "get", run_id: "real-pi-recovery" },
+            undefined,
+            undefined,
+            undefined,
+          );
+          recoveryStatus = current.details?.run?.status;
+          if (recoveryStatus === "completed") break;
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        assert.equal(recoveryStatus, "completed");
+        recoveryPair.session.dispose();
+        delete globalThis[Symbol.for("pi-subagents:manager")];
+        delete globalThis[Symbol.for("pi-subagents:rpc-owner")];
+        delete globalThis[Symbol.for("pi-subagents:manager-active")];
+      } finally {
+        process.chdir(previousCwd);
       }
-      assert.equal(recoveryStatus, "completed");
-      recoveryPair.session.dispose();
-      delete globalThis[Symbol.for("pi-subagents:manager")];
-      delete globalThis[Symbol.for("pi-subagents:rpc-owner")];
-      delete globalThis[Symbol.for("pi-subagents:manager-active")];
     } finally {
-      process.chdir(previousCwd);
+      rmSync(stablePairTemp, { recursive: true, force: true });
     }
-  } finally {
-    rmSync(stablePairTemp, { recursive: true, force: true });
-  }
 
-  // All stable packages must coexist in one isolated Pi resource loader. This
-  // is intentionally a tarball-only activation: it catches package `files`
-  // omissions and duplicate public tool names without using a root manifest or
-  // the live settings directory.
-  const stableDirectories = packageDirs().filter((directory) => {
-    const manifest = JSON.parse(readFileSync(join(packagesRoot, directory, "package.json"), "utf8"));
-    return manifest.signalridgePackage?.kind !== "library" && manifest.piExtension?.lifecycle === "stable";
-  });
-  const stableAllTemp = mkdtempSync(join(temp, "stable-all-"));
-  try {
-    const roots = [];
-    const fallbackRoots = [];
-    let expectedResources = 0;
-    for (const directory of stableDirectories) {
-      const extracted = join(stableAllTemp, directory);
-      mkdirSync(extracted, { recursive: true });
-      run("tar", ["-xzf", tarballs.get(directory), "-C", extracted]);
-      const packageRoot = join(extracted, "package");
-      const manifest = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
-      roots.push(packageRoot);
-      fallbackRoots.push(join(packagesRoot, directory));
-      expectedResources += manifest.pi.extensions.length;
+    // All stable packages must coexist in one isolated Pi resource loader. This
+    // is intentionally a tarball-only activation: it catches package `files`
+    // omissions and duplicate public tool names without using a root manifest or
+    // the live settings directory.
+    const stableDirectories = packageDirs().filter((directory) => {
+      const manifest = JSON.parse(readFileSync(join(packagesRoot, directory, "package.json"), "utf8"));
+      return manifest.signalridgePackage?.kind !== "library" && manifest.piExtension?.lifecycle === "stable";
+    });
+    const stableAllTemp = mkdtempSync(join(temp, "stable-all-"));
+    try {
+      const roots = [];
+      const fallbackRoots = [];
+      let expectedResources = 0;
+      for (const directory of stableDirectories) {
+        const extracted = join(stableAllTemp, directory);
+        mkdirSync(extracted, { recursive: true });
+        run("tar", ["-xzf", tarballs.get(directory), "-C", extracted]);
+        const packageRoot = join(extracted, "package");
+        const manifest = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
+        roots.push(packageRoot);
+        fallbackRoots.push(join(packagesRoot, directory));
+        expectedResources += manifest.pi.extensions.length;
+      }
+      const consumer = join(stableAllTemp, "consumer");
+      const agentDir = join(stableAllTemp, "agent");
+      mkdirSync(consumer, { recursive: true });
+      mkdirSync(agentDir, { recursive: true });
+      const allStable = await activateRoots(
+        roots,
+        consumer,
+        agentDir,
+        expectedResources,
+        `all stable packages (${stableDirectories.length})`,
+        fallbackRoots,
+        { keepSession: true },
+      );
+      console.log(
+        `smoke: all stable packages (${stableDirectories.length} packages, ${allStable.resourceCount} resources, ${allStable.toolCount} tools)`,
+      );
+    } finally {
+      rmSync(stableAllTemp, { recursive: true, force: true });
     }
-    const consumer = join(stableAllTemp, "consumer");
-    const agentDir = join(stableAllTemp, "agent");
-    mkdirSync(consumer, { recursive: true });
-    mkdirSync(agentDir, { recursive: true });
-    const allStable = await activateRoots(
-      roots,
-      consumer,
-      agentDir,
-      expectedResources,
-      `all stable packages (${stableDirectories.length})`,
-      fallbackRoots,
-      { keepSession: true },
-    );
+
+    assert.equal(reports.length, extensionDirs().length, "not every extension package was independently activated");
     console.log(
-      `smoke: all stable packages (${stableDirectories.length} packages, ${allStable.resourceCount} resources, ${allStable.toolCount} tools)`,
+      `smoke-pi-loaders: activated ${reports.length} independent package tarballs, the stable pair, and ${stableDirectories.length} stable packages together`,
     );
   } finally {
-    rmSync(stableAllTemp, { recursive: true, force: true });
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    // Background session_start work may still be winding down after SDK dispose
+    // (which does not emit session_shutdown). Retry ENOTEMPTY while it releases
+    // its temporary resources instead of treating a cleanup race as a loader failure.
+    rmSync(temp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   }
 
-  assert.equal(reports.length, extensionDirs().length, "not every extension package was independently activated");
-  console.log(
-    `smoke-pi-loaders: activated ${reports.length} independent package tarballs, the stable pair, and ${stableDirectories.length} stable packages together`,
-  );
-} finally {
-  if (previousHome === undefined) delete process.env.HOME;
-  else process.env.HOME = previousHome;
-  if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-  else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
-  // Background session_start work may still be winding down after SDK dispose
-  // (which does not emit session_shutdown). Retry ENOTEMPTY while it releases
-  // its temporary resources instead of treating a cleanup race as a loader failure.
-  rmSync(temp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+  // Pi's public AgentSession.dispose invalidates extension contexts but does
+  // not emit session_shutdown; terminate only after every smoke assertion and
+  // cleanup above so extension-owned unref timers cannot outlive the temp tree.
+  process.exit(0);
 }
 
-// Pi's public AgentSession.dispose invalidates extension contexts but does
-// not emit session_shutdown; terminate only after every smoke assertion and
-// cleanup above so extension-owned unref timers cannot outlive the temp tree.
-process.exit(0);
+if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) await main();

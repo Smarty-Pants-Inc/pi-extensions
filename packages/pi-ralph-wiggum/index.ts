@@ -90,6 +90,8 @@ const STATUS_ICONS: Record<LoopStatus, string> = { active: "▶", paused: "⏸",
 
 export default function (pi: ExtensionAPI) {
   let currentLoop: string | null = null;
+  let sessionController = new AbortController();
+  let activeSessionId: string | undefined;
 
   // --- File helpers ---
 
@@ -397,7 +399,7 @@ export default function (pi: ExtensionAPI) {
 
   // --- Commands ---
 
-  const commands: Record<string, (rest: string, ctx: ExtensionContext) => void> = {
+  const commands: Record<string, (rest: string, ctx: ExtensionContext) => void | Promise<void>> = {
     start(rest, ctx) {
       const args = parseArgs(rest);
       if (!args.name) {
@@ -608,38 +610,53 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.notify(`${label}:\n${loops.map((l) => formatLoop(l)).join("\n")}`, "info");
     },
 
-    nuke(rest, ctx) {
+    async nuke(rest, ctx) {
       const force = rest.trim() === "--yes";
       const warning = "This deletes all .ralph state, task, and archive files. External task files are not removed.";
-
-      const run = () => {
-        const dir = ralphDir(ctx);
+      const controller = sessionController;
+      const owner = sessionId(ctx);
+      const dir = ralphDir(ctx);
+      // Test plain captured ownership before touching a possibly retired context.
+      const isCurrent = () =>
+        controller === sessionController && !controller.signal.aborted && owner === activeSessionId;
+      let onAbort: (() => void) | undefined;
+      try {
+        if (!isCurrent()) return;
+        if (!force) {
+          if (!ctx.hasUI) {
+            ctx.ui.notify(`Run /ralph nuke --yes to confirm. ${warning}`, "warning");
+            return;
+          }
+          const cancelled = new Promise<false>((resolve) => {
+            onAbort = () => resolve(false);
+            controller.signal.addEventListener("abort", onAbort, { once: true });
+          });
+          const confirmed = await Promise.race([
+            ctx.ui.confirm("Delete all Ralph loop files?", warning, { signal: controller.signal }),
+            cancelled,
+          ]);
+          if (!isCurrent() || !confirmed) return;
+        }
+        if (!isCurrent() || sessionId(ctx) !== owner) return;
+        if (force && ctx.hasUI) ctx.ui.notify(warning, "warning");
         if (!fs.existsSync(dir)) {
           if (ctx.hasUI) ctx.ui.notify("No .ralph directory found.", "info");
           return;
         }
-
         currentLoop = null;
         const ok = tryRemoveDir(dir);
         if (ctx.hasUI) {
           ctx.ui.notify(ok ? "Removed .ralph directory." : "Failed to remove .ralph directory.", ok ? "info" : "error");
         }
         updateUI(ctx);
-      };
-
-      if (!force) {
-        if (ctx.hasUI) {
-          void ctx.ui.confirm("Delete all Ralph loop files?", warning).then((confirmed) => {
-            if (confirmed) run();
-          });
-        } else {
-          ctx.ui.notify(`Run /ralph nuke --yes to confirm. ${warning}`, "warning");
+      } catch (error: unknown) {
+        // Even reporting an error through an invalid context can throw.
+        if (isCurrent()) {
+          console.warn(`[pi-ralph-wiggum] nuke failed: ${error instanceof Error ? error.message : String(error)}`);
         }
-        return;
+      } finally {
+        if (onAbort) controller.signal.removeEventListener("abort", onAbort);
       }
-
-      if (ctx.hasUI) ctx.ui.notify(warning, "warning");
-      run();
     },
   };
 
@@ -674,7 +691,7 @@ Examples:
       const [cmd] = args.trim().split(/\s+/);
       const handler = commands[cmd];
       if (handler) {
-        handler(args.slice(cmd.length).trim(), ctx);
+        await handler(args.slice(cmd.length).trim(), ctx);
       } else {
         ctx.ui.notify(HELP, "info");
       }
@@ -865,6 +882,10 @@ Examples:
 
     // Check for completion marker
     const lastAssistant = [...event.messages].reverse().find((m) => m.role === "assistant");
+    // Interrupted/failed turns and queued final prompts are not completed work.
+    // Keep the loop active so the owner can retry or deliver the final iteration.
+    if (!lastAssistant || lastAssistant.stopReason === "error" || lastAssistant.stopReason === "aborted") return;
+    if (ctx.hasPendingMessages()) return;
     const text =
       lastAssistant && Array.isArray(lastAssistant.content)
         ? lastAssistant.content
@@ -901,6 +922,10 @@ Examples:
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    sessionController.abort();
+    sessionController = new AbortController();
+    activeSessionId = sessionId(ctx);
+    currentLoop = null;
     const active = listLoops(ctx).filter((l) => l.status === "active");
     const owned = active.filter((state) => isOwnedByCurrentSession(ctx, state));
 
@@ -926,6 +951,8 @@ Examples:
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
+    sessionController.abort();
+    activeSessionId = undefined;
     const state = getCurrentOwnedState(ctx);
     if (state) saveState(ctx, state);
   });

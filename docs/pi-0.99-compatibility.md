@@ -1,6 +1,6 @@
 # Pi 0.99.1 compatibility
 
-Snapshot: 2026-09-30. The published `@earendil-works/pi-*` packages have `0.99.1` on npm's `latest` tag. The fork released [0.99.0](https://github.com/earendil-works/pi/releases/tag/v0.99.0) and [0.99.1](https://github.com/earendil-works/pi/releases/tag/v0.99.1) directly after [0.87.1](https://github.com/earendil-works/pi/releases/tag/v0.87.1); there are no published 0.88–0.98 release tags to imply support for. The [0.87.1 review](pi-0.87-compatibility.md) remains a historical baseline, not the latest-host claim.
+Historical snapshot: 2026-09-30. See the [Pi 1.0 compatibility review](pi-1.0-compatibility.md) for the current tested host and peer-dependency contract. At this snapshot, the published `@earendil-works/pi-*` packages have `0.99.1` on npm's `latest` tag. The fork released [0.99.0](https://github.com/earendil-works/pi/releases/tag/v0.99.0) and [0.99.1](https://github.com/earendil-works/pi/releases/tag/v0.99.1) directly after [0.87.1](https://github.com/earendil-works/pi/releases/tag/v0.87.1); there are no published 0.88–0.98 release tags to imply support for. The [0.87.1 review](pi-0.87-compatibility.md) remains a historical baseline, not the latest-host claim.
 
 ## Host boundary
 

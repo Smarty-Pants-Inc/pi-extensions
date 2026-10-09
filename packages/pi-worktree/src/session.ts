@@ -12,7 +12,9 @@ export async function switchToWorktree(
 ): Promise<WorktreeSwitchResult> {
   let sessionPath: string | undefined;
   try {
+    ctx.signal?.throwIfAborted();
     sessionPath = createTargetSession(ctx, targetPath);
+    ctx.signal?.throwIfAborted();
     const result = await ctx.switchSession(sessionPath, {
       withSession: async (replacementCtx) => {
         replacementCtx.ui.notify(stripTerminalControls(`Switched Pi workspace to ${targetPath}.`), "info");

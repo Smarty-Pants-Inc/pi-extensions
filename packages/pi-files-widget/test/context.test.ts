@@ -19,6 +19,7 @@ test("browser and modified paths follow command/session cwd; RPC never creates t
     render: () => [],
     handleInput: () => {},
     invalidate: () => {},
+    dispose: () => {},
   } as never);
   let customCalls = 0;
   let cleanup: (() => void) | undefined;
@@ -147,7 +148,12 @@ test("browser and modified paths follow command/session cwd; RPC never creates t
     await commands.get("readfiles")?.handler("", ctx as never);
     assert.equal(customCalls, 1);
     assert.match(notices.at(-1) ?? "", /requires TUI/);
+    const beforeSwitch = [...args[1]];
+    const observedBeforeSwitch = [...observed];
     await events.get("session_before_switch")?.({} as never, ctx as never);
+    assert.deepEqual([...args[1]], beforeSwitch);
+    assert.deepEqual([...observed], observedBeforeSwitch);
+    await events.get("session_start")?.({} as never, ctx as never);
     assert.equal(args[1].size, 0);
     assert.equal(observed.size, 0);
   } finally {

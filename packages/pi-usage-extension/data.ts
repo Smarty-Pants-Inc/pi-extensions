@@ -16,6 +16,9 @@ import { lstat, open, readdir, readFile, rename, stat, unlink, writeFile } from 
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
+
+export { getAgentDir };
 
 // =============================================================================
 // Types
@@ -252,11 +255,6 @@ export interface ParsedSessionFile {
 // Paths
 // =============================================================================
 
-export function getAgentDir(): string {
-  // Replicate Pi's logic: respect PI_CODING_AGENT_DIR env var
-  return process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
-}
-
 export function getSessionsDir(): string {
   return join(getAgentDir(), "sessions");
 }
@@ -332,6 +330,10 @@ const PATTERN_SUBAGENT_WAIT_TOOL_COMPACT = Buffer.from('"toolName":"subagent_wai
 const PATTERN_SUBAGENT_WAIT_TOOL_SPACED = Buffer.from('"toolName": "subagent_wait"');
 
 const PARSE_YIELD_EVERY_LINES = 2000;
+
+function isThinkingLevel(value: unknown): value is string {
+  return typeof value === "string" && ["off", "minimal", "low", "medium", "high", "xhigh"].includes(value);
+}
 
 function finiteNumber(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
@@ -442,12 +444,10 @@ function buildToolUsageRecord(
 }
 
 const LARGE_TOOL_RESULT_BYTES = 64 * 1024;
-const PROPERTY_ID = Buffer.from('"id":');
-const PROPERTY_TIMESTAMP = Buffer.from('"timestamp":');
-const PROPERTY_MESSAGE = Buffer.from('"message":');
-const PROPERTY_TOOL_NAME = Buffer.from('"toolName":');
-const PROPERTY_DETAILS = Buffer.from('"details":');
-const PROPERTY_USAGE = Buffer.from('"usage":');
+const DIRECT_ENTRY_PROPERTIES = new Set(["message", "id", "timestamp"]);
+const DIRECT_MESSAGE_PROPERTIES = new Set(["toolName", "details", "usage", "timestamp"]);
+const DIRECT_MESSAGE_ONLY = new Set(["message"]);
+const DIRECT_USAGE_ONLY = new Set(["usage"]);
 const DIRECT_CHILD_PROPERTIES = new Set(["usage", "sessionFile"]);
 
 function skipJsonWhitespace(buffer: Buffer, offset: number, limit: number): number {
@@ -498,29 +498,6 @@ function jsonValueEnd(buffer: Buffer, offset: number, limit: number): number {
   let end = offset;
   while (end < limit && buffer[end] !== 0x2c && buffer[end] !== 0x5d && buffer[end] !== 0x7d) end++;
   return end;
-}
-
-function parseJsonValueAt(buffer: Buffer, offset: number, limit: number): unknown {
-  const start = skipJsonWhitespace(buffer, offset, limit);
-  const end = jsonValueEnd(buffer, start, limit);
-  if (end <= start) return undefined;
-  try {
-    return JSON.parse(buffer.toString("utf8", start, end));
-  } catch {
-    return undefined;
-  }
-}
-
-function parsePropertyValue(buffer: Buffer, property: Buffer, from: number, to: number): unknown {
-  const propertyOffset = buffer.indexOf(property, from);
-  if (propertyOffset < 0 || propertyOffset >= to) return undefined;
-  return parseJsonValueAt(buffer, propertyOffset + property.length, to);
-}
-
-function parseLastPropertyValue(buffer: Buffer, property: Buffer, from: number, to: number): unknown {
-  const propertyOffset = buffer.lastIndexOf(property, to - 1);
-  if (propertyOffset < from) return undefined;
-  return parseJsonValueAt(buffer, propertyOffset + property.length, to);
 }
 
 interface DirectObjectScan {
@@ -648,34 +625,24 @@ function scanLargeDetails(buffer: Buffer, objectStart: number, limit: number): L
  * avoids UTF-8 decoding and JSON.parse allocation for multi-megabyte content.
  */
 function parseLargeToolResultLine(line: Buffer): ToolUsageRecord | null {
-  const messageOffset = line.indexOf(PROPERTY_MESSAGE);
-  if (messageOffset < 0) return null;
-  const detailsOffset = line.indexOf(PROPERTY_DETAILS, messageOffset);
-  let detailsEnd = -1;
-  let details: Record<string, unknown> | null = null;
-  if (detailsOffset >= 0) {
-    const detailsStart = skipJsonWhitespace(line, detailsOffset + PROPERTY_DETAILS.length, line.length);
-    if (line[detailsStart] === 0x7b) {
-      const scanned = scanLargeDetails(line, detailsStart, line.length);
-      detailsEnd = scanned.end;
-      details = scanned.details;
-    }
-  }
-
-  const reportedUsage =
-    detailsEnd >= 0
-      ? parsePropertyValue(line, PROPERTY_USAGE, detailsEnd, line.length)
-      : parseLastPropertyValue(line, PROPERTY_USAGE, messageOffset, line.length);
-  const sourceId = parsePropertyValue(line, PROPERTY_ID, 0, messageOffset);
-  const entryTimestamp = parsePropertyValue(line, PROPERTY_TIMESTAMP, 0, messageOffset);
-  const messageTimestamp = parseLastPropertyValue(line, PROPERTY_TIMESTAMP, messageOffset, line.length);
-  const toolName = parsePropertyValue(
-    line,
-    PROPERTY_TOOL_NAME,
-    messageOffset,
-    detailsOffset >= 0 ? detailsOffset : line.length,
+  const entryStart = skipJsonWhitespace(line, 0, line.length);
+  const entry = scanDirectObjectProperties(line, entryStart, line.length, DIRECT_ENTRY_PROPERTIES).values;
+  const messageRange = entry.get("message");
+  if (!messageRange || line[messageRange[0]] !== 0x7b) return null;
+  const message = scanDirectObjectProperties(line, messageRange[0], messageRange[1], DIRECT_MESSAGE_PROPERTIES).values;
+  const detailsRange = message.get("details");
+  const details =
+    detailsRange && line[detailsRange[0]] === 0x7b
+      ? scanLargeDetails(line, detailsRange[0], detailsRange[1]).details
+      : null;
+  return buildToolUsageRecord(
+    parseJsonRange(line, message.get("toolName")),
+    details,
+    parseJsonRange(line, message.get("usage")),
+    parseJsonRange(line, entry.get("id")),
+    parseJsonRange(line, message.get("timestamp")),
+    parseJsonRange(line, entry.get("timestamp")),
   );
-  return buildToolUsageRecord(toolName, details, reportedUsage, sourceId, messageTimestamp, entryTimestamp);
 }
 
 function lineMightBeRelevant(line: Buffer): boolean {
@@ -694,11 +661,20 @@ function lineMightBeRelevant(line: Buffer): boolean {
     ) {
       return true;
     }
-    // Pi serializes optional tool usage after content/details and immediately
-    // before the small isError/timestamp suffix. Checking the tail preserves
-    // the fast path for ordinary tool results, which dominate session bytes.
-    const tail = line.length > 4096 ? line.subarray(line.length - 4096) : line;
-    return tail.includes(PATTERN_USAGE_COMPACT) || tail.includes(PATTERN_USAGE_SPACED);
+    // Usage may precede large nestedCalls/args. Only a direct message.usage
+    // qualifies: content and nested tool arguments are not accounting records.
+    // The cheap byte check keeps ordinary output on the skipped-line fast path.
+    if (!line.includes(PATTERN_USAGE_COMPACT) && !line.includes(PATTERN_USAGE_SPACED)) return false;
+    const start = skipJsonWhitespace(line, 0, line.length);
+    if (line[start] !== 0x7b) return false;
+    const message = scanDirectObjectProperties(line, start, line.length, DIRECT_MESSAGE_ONLY, true).values.get(
+      "message",
+    );
+    return Boolean(
+      message &&
+        line[message[0]] === 0x7b &&
+        scanDirectObjectProperties(line, message[0], message[1], DIRECT_USAGE_ONLY, true).values.has("usage"),
+    );
   }
 
   return (
@@ -1190,7 +1166,9 @@ export async function parseSessionBuffer(buffer: Buffer, signal?: AbortSignal): 
       const relevant = lineMightBeRelevant(lineBuffer);
       const head = lineBuffer.subarray(0, Math.min(1024, lineBuffer.length));
       const largeToolResult =
-        relevant && lineBuffer.length > LARGE_TOOL_RESULT_BYTES && head.includes(PATTERN_TOOL_RESULT_COMPACT);
+        relevant &&
+        lineBuffer.length > LARGE_TOOL_RESULT_BYTES &&
+        (head.includes(PATTERN_TOOL_RESULT_COMPACT) || head.includes(PATTERN_TOOL_RESULT_SPACED));
       const lineageKeys = { ambiguous: false };
       const validLargeToolResult = largeToolResult && validLargeJsonLine(lineBuffer, lineageKeys);
       let entry: Record<string, unknown> | null = null;
@@ -1348,7 +1326,11 @@ export async function parseSessionBuffer(buffer: Buffer, signal?: AbortSignal): 
             provider: msg.provider,
             model: msg.model,
             ...(responseModel ? { responseModel } : {}),
-            thinkingLevel: hasParentLink ? branch.thinkingLevel : legacyThinkingLevel,
+            thinkingLevel: isThinkingLevel(msg.thinkingLevel)
+              ? msg.thinkingLevel
+              : hasParentLink
+                ? branch.thinkingLevel
+                : legacyThinkingLevel,
             source: "assistant",
             sourceId: id,
             cost: usage.cost?.total || 0,
@@ -1420,7 +1402,7 @@ export async function parseSessionBuffer(buffer: Buffer, signal?: AbortSignal): 
 // On-disk cache
 // =============================================================================
 
-const CACHE_VERSION = 11;
+const CACHE_VERSION = 12;
 
 type CachedMessageTuple = [
   providerIdx: number,

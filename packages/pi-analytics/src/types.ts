@@ -42,6 +42,7 @@ export interface ToolCallRecord {
   name: string;
   provider?: string;
   model?: string;
+  thinkingLevel?: string;
   startedAtMs: number;
   finishedAtMs?: number;
   durationMs?: number;
@@ -56,6 +57,7 @@ export interface SkillActivationRecord {
   occurredAtMs: number;
   provider?: string;
   model?: string;
+  thinkingLevel?: string;
 }
 
 export interface ProviderErrorRecord {
@@ -64,6 +66,7 @@ export interface ProviderErrorRecord {
   occurredAtMs: number;
   provider?: string;
   model?: string;
+  thinkingLevel?: string;
   category: ProviderErrorCategory;
   recovered: boolean;
   terminal: boolean;

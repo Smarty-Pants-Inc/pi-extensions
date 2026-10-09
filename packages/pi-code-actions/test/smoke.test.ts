@@ -4,6 +4,6 @@ import codeActions from "../index.js";
 
 test("registers the /code command", () => {
   const commands: string[] = [];
-  codeActions({ registerCommand: (name: string) => commands.push(name) } as never);
+  codeActions({ on: () => () => {}, registerCommand: (name: string) => commands.push(name) } as never);
   assert.deepEqual(commands, ["code"]);
 });

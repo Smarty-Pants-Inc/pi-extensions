@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { defineMenu, runMenu } from "@narumitw/pi-tui-kit";
 import { withBorderedCustomUi } from "@signalridge/pi-ui";
+import { assertOwner, ownedContext, type WorktreeMenuOwner } from "./command-owner.js";
 import {
   type AdministrativePruneCandidate,
   addWorktree,
@@ -28,6 +29,7 @@ import {
   unresolvableSymlinkAncestor,
   validateBranch,
   type WorktreeRecord,
+  WorktreeRecoveryError,
   withWorktreeMutationLock,
   worktreeAdministrativeDirectory,
   worktreeForBranch,
@@ -53,11 +55,6 @@ const ACTIONS = {
   prune: ACTION_PRUNE,
   configure: ACTION_CONFIGURE_ROOT,
 } as const;
-
-interface WorktreeMenuOwner {
-  signal: AbortSignal;
-  isCurrent(): boolean;
-}
 
 interface AdministrativeHistoryRisk {
   label: string;
@@ -90,19 +87,31 @@ export function registerWorktreeCommand(
         return;
       }
 
+      // Capture ownership before idle/Git preflight, not after it.
+      const owner = getMenuOwner();
+      const originalCtx = ctx;
+      if (owner.signal.aborted || !owner.isCurrent()) return;
+      ctx = ownedContext(ctx, owner);
       try {
         await ctx.waitForIdle();
         const records = await listWorktrees(pi, ctx.cwd, ctx.signal);
         const currentPath = await currentWorktreePath(pi, ctx.cwd, ctx.signal);
         const root = settings.get();
         const warning = root.warning ? " — settings warning" : "";
-        const owner = getMenuOwner();
-        if (owner.signal.aborted || !owner.isCurrent()) return;
-        const runFlow = async (flow: () => Promise<void>) => {
+        assertOwner(owner);
+        const runFlow = async (signal: AbortSignal, flow: (flowCtx: ExtensionCommandContext) => Promise<void>) => {
+          const actionOwner = { signal: AbortSignal.any([owner.signal, signal]), isCurrent: owner.isCurrent };
           try {
-            await flow();
+            assertOwner(actionOwner);
+            await flow(ownedContext(originalCtx, actionOwner));
           } catch (error) {
-            safeNotify(ctx, formatError(error), "error");
+            if (!actionOwner.signal.aborted && actionOwner.isCurrent()) {
+              safeNotify(ctx, formatError(error), "error");
+            } else if (error instanceof WorktreeRecoveryError) {
+              // Completed mutations, retained trees and unknown outcomes outlive their UI owner.
+              // Do not access a retired context, even to check whether it has UI.
+              console.error(stripTerminalControls(formatError(error)));
+            }
           }
           return { kind: "close" } as const;
         };
@@ -128,12 +137,15 @@ export function registerWorktreeCommand(
             }),
           },
           actions: {
-            add: async () => runFlow(() => addFlow(pi, ctx, records, root.effectiveRoot)),
-            switch: async ({ signal }) => runFlow(() => switchFlow(pi, ctx, records, currentPath, signal)),
-            remove: async ({ signal }) => runFlow(() => removeFlow(pi, ctx, records, currentPath, signal)),
-            status: async ({ signal }) => runFlow(() => statusFlow(pi, ctx, records, currentPath, signal)),
-            prune: async () => runFlow(() => pruneFlow(pi, ctx, records)),
-            configure: async () => runFlow(() => configureRootFlow(ctx, settings)),
+            add: async ({ signal }) => runFlow(signal, (flowCtx) => addFlow(pi, flowCtx, records, root.effectiveRoot)),
+            switch: async ({ signal }) =>
+              runFlow(signal, (flowCtx) => switchFlow(pi, flowCtx, records, currentPath, flowCtx.signal)),
+            remove: async ({ signal }) =>
+              runFlow(signal, (flowCtx) => removeFlow(pi, flowCtx, records, currentPath, flowCtx.signal)),
+            status: async ({ signal }) =>
+              runFlow(signal, (flowCtx) => statusFlow(pi, flowCtx, records, currentPath, flowCtx.signal)),
+            prune: async ({ signal }) => runFlow(signal, (flowCtx) => pruneFlow(pi, flowCtx, records)),
+            configure: async ({ signal }) => runFlow(signal, (flowCtx) => configureRootFlow(flowCtx, settings)),
           },
         });
         await runMenu(withBorderedCustomUi(ctx), menu, {
@@ -149,7 +161,8 @@ export function registerWorktreeCommand(
 }
 
 async function configureRootFlow(ctx: ExtensionCommandContext, settings: WorktreeSettingsRuntime): Promise<void> {
-  const current = await settings.reload();
+  const current = await settings.reload(ctx.signal);
+  ctx.signal?.throwIfAborted();
   if (!current.canSave) {
     throw new Error(current.warning ?? `Fix ${settings.getPath()} before changing pi-worktree settings.`);
   }
@@ -159,7 +172,9 @@ async function configureRootFlow(ctx: ExtensionCommandContext, settings: Worktre
   );
   if (requested === undefined) return;
   const configuredRoot = requested.trim() || undefined;
-  const updated = await settings.save(configuredRoot);
+  ctx.signal?.throwIfAborted();
+  const updated = await settings.save(configuredRoot, ctx.signal);
+  ctx.signal?.throwIfAborted();
   safeNotify(
     ctx,
     configuredRoot === undefined
@@ -294,39 +309,69 @@ async function addFlow(
         );
       }
 
-      await addWorktree(
-        pi,
-        ctx.cwd,
-        {
-          path: targetPath,
-          branch,
-          startOid: provenance.kind === "create" ? provenance.oid : undefined,
-        },
-        ctx.signal,
-      );
-
+      ctx.signal?.throwIfAborted();
+      let addFailure: string | undefined;
       try {
-        const updated = await listWorktrees(pi, ctx.cwd, ctx.signal);
-        const verified = updated.find((record) => pathsEqual(record.path, targetPath));
-        // branchRef is stricter than branch: a deleted branch shadowed by a same-named tag produces
-        // a detached record whose branchRef is undefined.
-        if (
-          !verified ||
-          verified.branchRef !== localBranchRef(branch) ||
-          !verified.head ||
-          !sameOid(verified.head, provenance.oid)
-        ) {
-          throw new Error("the expected path, branch, and base commit were not present in Git porcelain output");
-        }
-        return verified;
+        await addWorktree(
+          pi,
+          ctx.cwd,
+          {
+            path: targetPath,
+            branch,
+            startOid: provenance.kind === "create" ? provenance.oid : undefined,
+          },
+          ctx.signal,
+        );
       } catch (error) {
-        throw new Error(
-          `Git add completed, so the worktree was retained at ${targetPath}, but verification failed: ${formatError(error)}. Inspect git worktree list before retrying.`,
+        // Even a failed/interrupted Add can create a branch before checkout fails.
+        addFailure = formatError(error);
+      }
+
+      // Once Add has run, recovery outlives the UI owner. Each bounded read must
+      // finish even if the other fails; a branch can exist without a worktree.
+      const [inventory, branchState] = await Promise.allSettled([
+        listWorktrees(pi, ctx.cwd),
+        resolveCommit(pi, ctx.cwd, localBranchRef(branch)),
+      ]);
+      const verified =
+        inventory.status === "fulfilled"
+          ? inventory.value.find((record) => pathsEqual(record.path, targetPath))
+          : undefined;
+      // branchRef is stricter than branch: a deleted branch shadowed by a same-named tag produces
+      // a detached record whose branchRef is undefined.
+      if (
+        addFailure !== undefined ||
+        !verified ||
+        verified.branchRef !== localBranchRef(branch) ||
+        !verified.head ||
+        !sameOid(verified.head, provenance.oid) ||
+        branchState.status !== "fulfilled" ||
+        !sameOid(branchState.value, provenance.oid)
+      ) {
+        const pathState =
+          inventory.status === "rejected"
+            ? `worktree inventory unavailable: ${formatError(inventory.reason)}`
+            : verified
+              ? `path registered with branch ${verified.branchRef ?? "(detached)"} at ${verified.head ?? "(unknown)"}`
+              : "path not registered";
+        const refState =
+          branchState.status === "fulfilled"
+            ? `branch ${localBranchRef(branch)} at ${branchState.value}`
+            : `branch ${localBranchRef(branch)} verification unavailable: ${formatError(branchState.reason)}`;
+        throw new WorktreeRecoveryError(
+          `Git add ${addFailure === undefined ? "completed" : `failed: ${addFailure}`}; any created worktree was retained at ${targetPath}, but verification failed: ${pathState}; ${refState}. Any created branch was retained. Inspect git worktree list and git show-ref before retrying.`,
         );
       }
+      return verified;
     },
     ctx.signal,
+    `Git add completed; verified and retained worktree ${targetPath} on branch ${branch} at ${provenance.oid}`,
   );
+  if (ctx.signal?.aborted) {
+    throw new WorktreeRecoveryError(
+      `Git add completed despite cancellation; verified and retained worktree ${targetPath} on branch ${branch} at ${provenance.oid}. Inspect git worktree list before retrying.`,
+    );
+  }
   safeNotify(ctx, `Created worktree ${targetPath} on branch ${branch} at ${provenance.oid}.`, "info");
 
   if (
@@ -631,6 +676,7 @@ async function pruneFlow(
       return output;
     },
     ctx.signal,
+    "Pruned stale worktree metadata",
   );
   safeNotify(ctx, output ? `Pruned stale worktree metadata:\n${output}` : "Pruned stale worktree metadata.", "info");
 }
@@ -859,10 +905,15 @@ async function selectWorktree(
 }
 
 function safeNotify(ctx: ExtensionCommandContext, message: string, level: "info" | "warning" | "error"): void {
+  const sanitized = stripTerminalControls(message);
+  if (!ctx.hasUI) {
+    console.error(sanitized);
+    return;
+  }
   try {
-    ctx.ui.notify(stripTerminalControls(message), level);
+    ctx.ui.notify(sanitized, level);
   } catch {
-    console.error(message);
+    console.error(sanitized);
   }
 }
 

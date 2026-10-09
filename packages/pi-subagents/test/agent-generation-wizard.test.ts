@@ -42,6 +42,7 @@ function makePi() {
 
 function sessionContext(cwd: string) {
   return {
+    isProjectTrusted: () => true,
     hasUI: true,
     ui: { setStatus: vi.fn(), setWidget: vi.fn(), notify: vi.fn() },
     cwd,
@@ -166,7 +167,7 @@ describe("AI-generated agent wizard", () => {
     expect(readdirSync(result.targetDir)).toEqual(["generated.md"]);
     expect(getAgentConfig("generated")?.sourcePath).toBe(realpathSync(result.targetPath));
     expect(getAllTypes().some(name => name.includes("staging"))).toBe(false);
-    expect(result.ui.notify).toHaveBeenCalledWith(`Created ${result.targetPath}`, "info");
+    expect(result.ui.notify).toHaveBeenCalledWith(`Created ${realpathSync(result.targetPath)}`, "info");
   });
 
   it("loads the committed target without staging artifacts", async () => {

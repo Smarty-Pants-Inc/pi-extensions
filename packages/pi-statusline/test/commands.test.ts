@@ -864,8 +864,9 @@ test("settings edits raw JSON transactionally and applies it immediately", async
       },
     });
     await mock.commands.get("statusline")?.handler("settings", context.ctx);
-    assert.equal(initial, DEFAULT_STATUSLINE_DOCUMENT);
-    assert.equal(readFileSync(path, "utf8"), edited);
+    // Pi's public Editor expands tabs and trims trailing whitespace on submit.
+    assert.equal(initial, DEFAULT_STATUSLINE_DOCUMENT.replaceAll("\t", "    "));
+    assert.equal(readFileSync(path, "utf8"), edited.replaceAll("\t", "    ").trimEnd());
     assert.deepEqual(loaded.config.segments, ["model"]);
     assert.equal(loaded.config.segmentText.model.prefix, "Model: ");
     assert.equal(renders, 1);

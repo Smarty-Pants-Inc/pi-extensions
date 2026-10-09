@@ -322,8 +322,14 @@ test("active Plan mode blocks update_plan and blocked built-ins at the tool hook
     activeTools: ["read", "bash", "update_plan", "danger"],
     allTools: [builtinTool("read"), builtinTool("bash"), builtinTool("danger"), extensionTool("edit")],
   });
-  planMode(mock.pi);
+  planMode(mock.pi, {
+    readSettings: async () => ({
+      kind: "loaded",
+      settings: { thinkingLevel: "inherit", defaultPlanTools: ["read", "bash", "edit"] },
+    }),
+  });
   const context = createMockContext();
+  await mock.events.get("session_start")?.[0]?.({}, context.ctx);
   await mock.commands.get("plan")?.handler("start", context.ctx);
   const hook = mock.events.get("tool_call")?.[0];
   const blocked = await hook?.({ toolName: "update_plan", input: {} }, context.ctx);

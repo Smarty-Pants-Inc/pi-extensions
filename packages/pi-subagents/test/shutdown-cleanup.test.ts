@@ -29,6 +29,8 @@ vi.mock("../src/agent-runner.js", () => ({
   getGraceTurns: vi.fn(() => 1),
   getDefaultMaxTokens: vi.fn(() => 0),
   getDefaultMaxToolCalls: vi.fn(() => 0),
+  getDefaultToolTimeoutMs: vi.fn(() => 0),
+  setDefaultToolTimeoutMs: vi.fn(),
   normalizeMaxTurns: vi.fn((n: number | undefined) => n),
   resolveConfiguredDefaultModel: vi.fn(() => undefined),
   setDefaultMaxTurns: vi.fn(),

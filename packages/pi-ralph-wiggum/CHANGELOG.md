@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.6
+### Patch Changes
+
+- 3364cc0: Declare `@sinclair/typebox` as a host-provided peer dependency with a `*` range instead of a runtime dependency, avoiding duplicate runtime modules and Pi extension-loader warnings.
+- 3364cc0: Adopt Pi 1.0.4's host-provided dependency contract: declare imported Pi and TypeBox modules as `*` peers rather than installing duplicate runtime modules, and align Pi development pins with the repository's tested 1.0.4 baseline. The wildcard identifies host module ownership; it does not promise compatibility with every Pi version.
+- 3364cc0: Await destructive confirmation and cancel it when its session retires. Keep interrupted or failed final iterations and queued final prompts resumable, and correct the task-file creation instructions.
+
 ## 1.2.5
 ### Patch Changes
 

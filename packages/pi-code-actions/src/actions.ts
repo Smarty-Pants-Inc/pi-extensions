@@ -5,50 +5,72 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { Container, matchesKey, Text, truncateToWidth } from "@earendil-works/pi-tui";
 
-export async function copyToClipboard(pi: ExtensionAPI, content: string): Promise<boolean> {
-  const tmpPath = path.join(os.tmpdir(), `pi-code-${Date.now()}.txt`);
-  fs.writeFileSync(tmpPath, content, "utf8");
+import { type ActionOwnership, ownedCustom } from "./owned-custom.js";
 
-  const commands: Array<{ command: string; args: string[] }> = [];
-  if (process.platform === "darwin") {
-    commands.push({ command: "sh", args: ["-c", `cat "${tmpPath}" | pbcopy`] });
-  } else if (process.platform === "win32") {
-    commands.push({
-      command: "powershell",
-      args: ["-NoProfile", "-Command", `Get-Content -Raw "${tmpPath}" | Set-Clipboard`],
-    });
-  } else {
-    commands.push({ command: "sh", args: ["-c", `cat "${tmpPath}" | wl-copy`] });
-    commands.push({ command: "sh", args: ["-c", `cat "${tmpPath}" | xclip -selection clipboard`] });
-    commands.push({ command: "sh", args: ["-c", `cat "${tmpPath}" | xsel --clipboard --input`] });
-  }
+export type { ActionOwnership } from "./owned-custom.js";
 
-  let success = false;
-  for (const cmd of commands) {
-    try {
-      const result = await pi.exec(cmd.command, cmd.args);
-      if (result.code === 0) {
-        success = true;
-        break;
-      }
-    } catch {
-      // Try next command
-    }
-  }
-
+export async function copyToClipboard(pi: ExtensionAPI, content: string, ownership: ActionOwnership): Promise<boolean> {
+  if (!ownership.isCurrent() || ownership.signal.aborted) return false;
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-code-"));
   try {
-    fs.unlinkSync(tmpPath);
-  } catch {
-    // Ignore cleanup errors
-  }
+    fs.chmodSync(tmpDir, 0o700);
+    const tmpPath = path.join(tmpDir, "clipboard.txt");
+    fs.writeFileSync(tmpPath, content, { encoding: "utf8", flag: "wx", mode: 0o600 });
 
-  return success;
+    const commands: Array<{ command: string; args: string[] }> = [];
+    if (process.platform === "darwin") {
+      commands.push({ command: "sh", args: ["-c", 'exec pbcopy < "$1"', "pi-clipboard", tmpPath] });
+    } else if (process.platform === "win32") {
+      commands.push({
+        command: "powershell",
+        args: ["-NoProfile", "-Command", `Get-Content -Raw "${tmpPath}" | Set-Clipboard`],
+      });
+    } else {
+      // Replace the shell so Pi's cancellation targets the utility, not a pipeline parent.
+      // Pass the private path as data: temporary-directory names can contain shell syntax.
+      commands.push({ command: "sh", args: ["-c", 'exec wl-copy < "$1"', "pi-clipboard", tmpPath] });
+      commands.push({ command: "sh", args: ["-c", 'exec xclip -selection clipboard < "$1"', "pi-clipboard", tmpPath] });
+      commands.push({ command: "sh", args: ["-c", 'exec xsel --clipboard --input < "$1"', "pi-clipboard", tmpPath] });
+    }
+
+    for (const cmd of commands) {
+      if (!ownership.isCurrent() || ownership.signal.aborted) return false;
+      try {
+        const result = await pi.exec(cmd.command, cmd.args, { signal: ownership.signal });
+        if (!ownership.isCurrent() || ownership.signal.aborted) return false;
+        if (result.code === 0 && !result.killed) return true;
+      } catch {
+        if (!ownership.isCurrent() || ownership.signal.aborted) return false;
+        // Try the next utility only while this operation still owns the clipboard action.
+      }
+    }
+
+    return false;
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 }
 
-export function insertIntoEditor(ctx: ExtensionCommandContext, content: string): void {
+export async function insertIntoEditor(
+  ctx: ExtensionCommandContext,
+  content: string,
+  ownership: ActionOwnership,
+): Promise<boolean> {
+  if (!ownership.isCurrent()) return false;
+  if (ctx.mode === "rpc") {
+    const confirmed = await ctx.ui.confirm(
+      "Replace client draft with snippet?",
+      "RPC cannot read or append to the client draft. This will replace the entire draft with the selected snippet.",
+      { signal: ownership.signal },
+    );
+    if (!ownership.isCurrent() || !confirmed) return false;
+    ctx.ui.setEditorText(content);
+    return true;
+  }
   const existing = ctx.ui.getEditorText();
   const next = existing ? `${existing}\n${content}` : content;
   ctx.ui.setEditorText(next);
+  return true;
 }
 
 function formatOutput(command: string, result: { stdout: string; stderr: string; code: number }): string {
@@ -78,12 +100,18 @@ function truncateLines(text: string, maxLines: number): string {
   return `${truncated}\n\n[Output truncated to ${maxLines} lines]`;
 }
 
-export async function runSnippet(pi: ExtensionAPI, ctx: ExtensionCommandContext, snippet: string): Promise<void> {
+export async function runSnippet(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  snippet: string,
+  ownership: ActionOwnership,
+): Promise<void> {
   const isWindows = process.platform === "win32";
   const command = isWindows ? "powershell" : "bash";
   const args = isWindows ? ["-NoProfile", "-Command", snippet] : ["-lc", snippet];
 
-  const result = await pi.exec(command, args, { cwd: ctx.cwd });
+  const result = await pi.exec(command, args, { cwd: ctx.cwd, signal: ownership.signal });
+  if (!ownership.isCurrent()) return;
   const output = truncateLines(formatOutput(`${command} ${args.join(" ")}`, result), 200);
 
   if (ctx.mode !== "tui") {
@@ -91,7 +119,7 @@ export async function runSnippet(pi: ExtensionAPI, ctx: ExtensionCommandContext,
     return;
   }
 
-  await ctx.ui.custom<void>((_tui, theme, _kb, done) => {
+  await ownedCustom<void>(ctx, ownership, (_tui, theme, _kb, done) => {
     const container = new Container();
     container.addChild(new DynamicBorder((s: string) => theme.fg("borderAccent", s)));
     container.addChild(new Text(theme.fg("accent", theme.bold("Command Output")), 1, 0));

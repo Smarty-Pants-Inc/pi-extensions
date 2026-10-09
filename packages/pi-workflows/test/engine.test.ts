@@ -184,7 +184,10 @@ function makeClient(bus: WorkflowEventBus, opts: FakeClientOptions = {}): FakeCl
   };
 }
 
-function makeEngine(opts: FakeClientOptions = {}): {
+function makeEngine(
+  opts: FakeClientOptions = {},
+  cwd?: string,
+): {
   engine: WorkflowEngine;
   client: FakeClient;
   entries: unknown[];
@@ -193,11 +196,18 @@ function makeEngine(opts: FakeClientOptions = {}): {
   const bus = makeBus();
   const client = makeClient(bus, opts);
   const entries: unknown[] = [];
-  const engine = new WorkflowEngine(bus, client, {
-    append(event: JournalEvent) {
-      entries.push(event);
+  const engine = new WorkflowEngine(
+    bus,
+    client,
+    {
+      append(event: JournalEvent) {
+        entries.push(event);
+      },
     },
-  });
+    undefined,
+    undefined,
+    cwd,
+  );
   return { engine, client, entries, bus };
 }
 
@@ -218,6 +228,41 @@ async function completeAllInflight(client: FakeClient): Promise<void> {
 }
 
 describe("workflow engine", () => {
+  it("keeps the session cwd for control and automatic provider resumes, including nested frames", async () => {
+    const cwd = "/session-project-b";
+    expect(process.cwd()).not.toBe(cwd);
+    const opts: FakeClientOptions = { spawnError: "rate limit; try again in 1 seconds" };
+    const { engine, client, entries } = makeEngine(opts, cwd);
+    const child = 'export const meta = { name: "cwd-child", description: "test" }; return [cwd, process.cwd()];';
+    const script = `export const meta = { name: "cwd-resume", description: "test" };
+const child = await workflow(${JSON.stringify(child)});
+return await agent(JSON.stringify({ local: [cwd, process.cwd()], child }));`;
+    const expected = JSON.stringify({ local: [cwd, cwd], child: [cwd, cwd] });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      const started = await engine.start(script, { background: true });
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(engine.getRun(started.runId)?.status).toBe("paused");
+      expect(client.spawned[0]?.task.prompt).toBe(expected);
+      // The timer's resume has no caller supplying execution options.
+      opts.spawnError = undefined;
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(client.spawned.at(-1)?.task.prompt).toBe(expected);
+      await engine.control("pause", started.runId);
+      // Nor does the control-command resume. Both replay the cached child.
+      await engine.control("resume", started.runId, (entries as JournalEvent[]).map(asSessionEntry));
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(client.spawned).toHaveLength(3);
+      expect(client.spawned.at(-1)?.task.prompt).toBe(expected);
+      client.complete(client.spawned.at(-1)?.id ?? "", "done");
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(engine.getRun(started.runId)?.status).toBe("completed");
+    } finally {
+      engine.dispose();
+      vi.useRealTimers();
+    }
+  });
+
   it("gates start and resume through the managed protocol check", async () => {
     let protocolAvailable = false;
     const { engine, client } = makeEngine({
