@@ -1,9 +1,12 @@
 # pi-welcome
 
 TUI-only Signalridge startup card: one rounded panel with the current
-repository, model, context budget, key hints, and the inventory of what Pi loaded. It
-uses the active Pi theme, persists a bounded custom entry so a resumed session
-redraws it, and collapses to a width-safe compact summary on narrow terminals.
+repository, model, context budget, key hints, and a live resource inventory. It
+uses the active Pi theme, persists workspace facts in a bounded custom entry,
+and collapses to a width-safe compact summary on narrow terminals. Resume keeps
+the original workspace facts but refreshes inventory when creating the renderer.
+A card summarized by compaction is restored from the active branch, never from
+an abandoned branch.
 
 ```
 ╭─────────────────────────────────────────────────────────────────────────╮
@@ -15,24 +18,24 @@ redraws it, and collapses to a width-safe compact summary on narrow terminals.
 │  Session:    (new)                                                      │
 │  Model:      openai-codex / gpt-5.6-luna · thinking max                 │
 │  Budget:     400K · compacts at 270K                                    │
-│  Version:    0.87.1                                                     │
+│  pi v1.0.4                                                             │
 │                                                                         │
+│  Inventory:  live at render                                            │
 │  Context:    AGENTS.md                                                  │
 │  Skills:     commit, release, review +12                                │
 │  Prompts:    /plan, /ship +4                                            │
-│  Extensions: btw, code-actions, goal, gpt-fast, statusline +18          │
-│  Themes:     catppuccin-mocha +2                                        │
+│  Configured packages: btw, goal, statusline +18                         │
+│  Available themes: dark, light, system +2                              │
 │  Tools:      18 active of 42                                            │
 │                                                                         │
 ╰─────────────────────────────────────────────────────────────────────────╯
 ```
 
-No logo and no wordmark: the card exists to say what this session is, and a
-brand line says nothing a returning user does not already know.
+The card leads with a compact Pi mark and the running host version.
 
 ## Install
 
-The declared Pi peer range covers `0.84.x`–`0.87.x` and `0.99.1+` within the 0.99 minor; the current development host is `0.99.1`. See the [compatibility review](https://github.com/signalridge/pi-extensions/blob/main/docs/pi-0.99-compatibility.md) for verification details.
+The current tested host is Pi `1.0.4`. Host-provided dependencies use `"*"` peers to identify module ownership, not to guarantee compatibility with every Pi version. See the [compatibility review](https://github.com/signalridge/pi-extensions/blob/main/docs/pi-1.0-compatibility.md) for verification details.
 
 ```bash
 pi install npm:@signalridge/pi-welcome
@@ -76,13 +79,26 @@ Skills and prompts come from `getCommands()`, **not** from `loadSkills()`. An
 extension may contribute skill paths through `resources_discover`, which is
 where most of them come from in practice, and the standalone loader cannot see
 those: on a session showing dozens of skills it returns zero. `getCommands()`
-reports what Pi actually registered.
+reports what Pi actually registered. Collection happens at renderer component
+creation, after `bindExtensions()` finishes `resources_discover`, not during
+`session_start` before discovery. The inventory is labeled **live at render**;
+it is not a persisted startup snapshot.
 
-Extensions and themes are read from the same settings files and directories Pi
-reads. Context files come from `loadProjectContextFiles`, and tool counts from
-`getAllTools()` / `getActiveTools()`. Nothing here constructs a second resource
-loader: its `reload()` re-executes every extension factory and would duplicate
-tools, listeners, timers, and child processes.
+**Configured packages** comes from `pi.getSettings()`, which already resolves
+project trust and merges configuration. Packages filtered to no resources are
+omitted; skills-only packages may appear. This is configuration, not evidence
+that a package's extensions loaded, and does not enumerate standalone extension
+files. **Available themes** comes from `ctx.ui.getAllThemes()` in the TUI,
+including built-in and discovered themes rather than only a user themes folder.
+Context filenames come from `loadProjectContextFiles`, and tool counts from
+`getAllTools()` / `getActiveTools()`. Nothing here constructs or reloads a second
+resource loader: its `reload()` re-executes every extension factory and would
+duplicate tools, listeners, timers, and child processes.
+
+The persisted Budget row uses effective trusted settings, resolving the exact
+`provider/modelId` compaction override, ordinary reserve, then Pi's default
+reserve. Zero is valid; invalid settings do not produce a guessed threshold.
+When automatic compaction is disabled, there is no **compacts at** suffix.
 
 ## Untrusted text
 

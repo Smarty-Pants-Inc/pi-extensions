@@ -13,6 +13,7 @@ for (const [shell, failed] of [
       cwd: "/tmp/demo",
       isIdle: () => true,
       hasUI: true,
+      mode: "tui",
       ui: { setTitle: (title: string) => titles.push(title) },
     };
     tabStatus({
@@ -23,7 +24,12 @@ for (const [shell, failed] of [
     await emit("tool_call", { toolName: shell, toolCallId: "commit", input: { command: "git commit -m done" } });
     await emit("tool_call", { toolName: "bash", toolCallId: "other", input: { command: "pwd" } });
     await emit("tool_result", { toolCallId: "other", isError: false });
-    await emit("tool_result", { toolCallId: "commit", isError: failed });
+    await emit("tool_result", {
+      toolName: shell,
+      toolCallId: "commit",
+      input: { command: "git commit -m done" },
+      isError: failed,
+    });
     await emit("tool_result", { toolCallId: "other", isError: true });
     await emit("agent_end", { messages: [] });
     await emit("agent_settled");

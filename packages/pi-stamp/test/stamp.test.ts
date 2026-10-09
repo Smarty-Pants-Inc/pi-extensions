@@ -466,6 +466,32 @@ test("opt-in assistant metadata persists a sanitized version-4 snapshot with mea
   ]);
 });
 
+test("opted-in deferred terminal metadata is sanitized and never persists deferred handles or provider payloads", async () => {
+  const mock = createMockPi();
+  stamp(mock.pi, {
+    settingsRuntime: settingsRuntimeWith({ assistantMetadata: "expanded" }),
+    now: () => ASSISTANT_TIMESTAMP + 100,
+  });
+  const { ctx } = createMockContext({ mode: "tui" });
+  const assistant = {
+    ...assistantMessage(ASSISTANT_TIMESTAMP),
+    stopReason: "deferred",
+    model: "reported\u001b\nmodel",
+    deferred: { handle: "secret-handle", providerPayload: { token: "secret-token" } },
+    providerPayload: "raw-secret-payload",
+  };
+  await emit(mock, "session_start", { reason: "startup" }, ctx);
+  await emit(mock, "message_start", { message: assistant }, ctx);
+  await emit(mock, "message_end", { message: assistant }, ctx);
+  await emit(mock, "turn_end", { message: assistant, toolResults: [] }, ctx);
+  const data = mock.entries[0]?.data;
+  assert.ok(isMessageStampData(data) && data.version === 4);
+  assert.equal(data.metadata.stopReason, "deferred");
+  assert.equal(data.metadata.model, "reported model");
+  assert.doesNotMatch(JSON.stringify(data), /handle|providerPayload|secret|\\u001b/);
+  assert.equal(captureAssistantMetadata({ ...assistant, stopReason: "pending" }), undefined);
+});
+
 test("thinking, completed blocks, and tool calls can be the first meaningful assistant content", async () => {
   const events = [
     { type: "thinking_delta", delta: "reasoning" },

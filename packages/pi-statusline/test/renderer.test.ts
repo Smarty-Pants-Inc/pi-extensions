@@ -519,7 +519,10 @@ test("usage segments match native cache, context-window, and subscription presen
   ];
   const context = createMockContext({
     model: { id: "gpt-5", provider: "openai", contextWindow: 272_000 },
-    modelRegistry: { isUsingOAuth: () => true },
+    modelRegistry: {
+      isUsingOAuth: () => true,
+      getProvider: () => ({ auth: { oauth: { isSubscription: true } } }),
+    },
     getContextUsage: () => ({ percent: 2.4, tokens: 6528, contextWindow: 272_000 }),
     sessionManager: { getEntries: () => entries, getBranch: () => [latest] },
   });
@@ -602,10 +605,13 @@ test("subscription-backed cost is marked while API-key cost is unchanged", () =>
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.01 },
   };
   runtime.footerUsage = summarizeFooterUsage([{ type: "message", message: { role: "assistant", usage } }]);
-  const renderCost = (provider: string, oauth: boolean) => {
+  const renderCost = (provider: string, oauth: boolean, subscription?: boolean) => {
     const context = createMockContext({
       model: { id: "model", provider },
-      modelRegistry: { isUsingOAuth: () => oauth },
+      modelRegistry: {
+        isUsingOAuth: () => oauth,
+        getProvider: () => ({ auth: { oauth: subscription === undefined ? {} : { isSubscription: subscription } } }),
+      },
       sessionManager: {
         getEntries: () => [{ type: "message", message: { role: "assistant", usage } }],
         getBranch: () => [],
@@ -615,7 +621,10 @@ test("subscription-backed cost is marked while API-key cost is unchanged", () =>
   };
 
   assert.match(renderCost("kimi-coding", false), /\$0\.010 \(sub\)/u);
-  assert.doesNotMatch(renderCost("anthropic", false), /\(sub\)/u);
+  assert.doesNotMatch(renderCost("anthropic", false, true), /\(sub\)/u);
+  assert.match(renderCost("openai", true, true), /\(sub\)/u);
+  assert.doesNotMatch(renderCost("openai", true, false), /\(sub\)/u);
+  assert.doesNotMatch(renderCost("openai", true), /\(sub\)/u);
 });
 
 test("segment presentation wraps canonical dynamic values with configured text", () => {

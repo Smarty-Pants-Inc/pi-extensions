@@ -30,37 +30,48 @@ export interface PreloadedSkill {
   content: string;
 }
 
-export function preloadSkills(skillNames: string[], cwd: string): PreloadedSkill[] {
-  return skillNames.map((name) => ({ name, content: loadSkillContent(name, cwd) }));
+export interface PreloadSkillsOptions {
+  /** Denied/unknown project trust excludes both project roots; user skills remain available. */
+  projectTrusted: boolean;
+  /** Preserve denied source provenance even through aliases of user skill roots. */
+  deniedResource?: (path: string) => boolean;
 }
 
-function loadSkillContent(name: string, cwd: string): string {
+export function preloadSkills(skillNames: string[], cwd: string, options: PreloadSkillsOptions): PreloadedSkill[] {
+  return skillNames.map((name) => ({ name, content: loadSkillContent(name, cwd, options) }));
+}
+
+function loadSkillContent(name: string, cwd: string, options: PreloadSkillsOptions): string {
   if (isUnsafeName(name)) {
     return `(Skill "${name}" skipped: name contains path traversal characters)`;
   }
   const roots = [
-    join(cwd, ".pi", "skills"), // project — Pi standard
-    join(cwd, ".agents", "skills"), // project — Agent Skills spec
+    ...(options.projectTrusted === true ? [
+      join(cwd, ".pi", "skills"), // project — Pi standard
+      join(cwd, ".agents", "skills"), // project — Agent Skills spec
+    ] : []),
     join(getAgentDir(), "skills"), // user — Pi standard
     join(homedir(), ".agents", "skills"), // user — Agent Skills spec
     join(homedir(), ".pi", "skills"), // legacy global, pre-Pi
   ];
   for (const root of roots) {
-    const content = findInRoot(root, name);
+    if (options.deniedResource?.(root)) continue;
+    const content = findInRoot(root, name, options.deniedResource);
     if (content !== undefined) return content;
   }
   return `(Skill "${name}" not found in .pi/skills/, .agents/skills/, or global skill locations)`;
 }
 
-function findInRoot(root: string, name: string): string | undefined {
+function findInRoot(root: string, name: string, deniedResource?: (path: string) => boolean): string | undefined {
   if (isSymlink(root)) return undefined; // reject symlinked roots entirely
-  const flat = safeReadFile(join(root, `${name}.md`))?.trim();
+  const flatPath = join(root, `${name}.md`);
+  const flat = deniedResource?.(flatPath) ? undefined : safeReadFile(flatPath)?.trim();
   if (flat !== undefined) return flat;
-  return findSkillDirectory(root, name);
+  return findSkillDirectory(root, name, deniedResource);
 }
 
 /** BFS under `root` for a directory named `name` containing `SKILL.md`. Pi-conforming filters. */
-function findSkillDirectory(root: string, name: string): string | undefined {
+function findSkillDirectory(root: string, name: string, deniedResource?: (path: string) => boolean): string | undefined {
   if (!existsSync(root)) return undefined;
   const queue: string[] = [root];
 
@@ -85,6 +96,7 @@ function findSkillDirectory(root: string, name: string): string | undefined {
       // Symlinked dirs already filtered by entry.isDirectory() — Dirent uses lstat semantics.
       const path = join(current, entry.name);
       const skillMd = join(path, "SKILL.md");
+      if (deniedResource?.(skillMd)) continue;
       const isSkillDir = existsSync(skillMd);
 
       if (isSkillDir) {

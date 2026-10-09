@@ -69,6 +69,7 @@ function makeCtx(script: Answer[]) {
 
   return {
     ctx: {
+      isProjectTrusted: () => true,
       hasUI: true,
       cwd,
       model: undefined,

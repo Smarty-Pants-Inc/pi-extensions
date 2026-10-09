@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.5.1
+### Patch Changes
+
+- 3364cc0: Use patched Vitest 4.1.11 for development and regression testing without moving to a new major version. Refresh compatible transitive dependencies to include fixed source-map and brace-expansion releases.
+- 3364cc0: Preserve valid prototype-named agent tiers during routing-policy validation so their canonical fingerprints and managed dispatch identities survive protocol round trips.
+
 ## 1.5.0
 ### Minor Changes
 

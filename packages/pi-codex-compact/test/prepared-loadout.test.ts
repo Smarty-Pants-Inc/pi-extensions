@@ -2,14 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import {
-  type Context,
-  createAssistantMessageEventStream,
-  getCurrentTools,
-  type Model,
-  type Provider,
-  Type,
-} from "@earendil-works/pi-ai";
+import { type Context, getCurrentTools, type Model, type Provider, Type } from "@earendil-works/pi-ai";
 import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
 import {
   type AgentSession,
@@ -101,34 +94,32 @@ async function withPreparedLoadout(
         remoteContexts.push(context);
         return provider.stream(requestModel, context, options);
       },
-      streamSimple() {
-        const stream = createAssistantMessageEventStream();
-        const message = {
-          role: "assistant" as const,
-          content: [{ type: "text" as const, text: "Fixture answer or native summary" }],
-          api: model.api,
-          provider: model.provider,
-          model: model.id,
-          usage: {
-            input: 20,
-            output: 1,
-            cacheRead: 0,
-            cacheWrite: 0,
-            totalTokens: 21,
-            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      streamSimple(requestModel, context, options) {
+        // Use the real serializer and provider callback so normal turns establish
+        // fresh wire evidence; an event-stream stub bypasses that safety boundary.
+        return provider.streamSimple(requestModel, context, {
+          ...options,
+          transport: "sse",
+          fetch: async () => {
+            const item = {
+              type: "message",
+              id: "fixture-answer",
+              role: "assistant",
+              content: [{ type: "output_text", text: "Fixture answer or native summary" }],
+            };
+            return new Response(
+              `data: ${JSON.stringify({ type: "response.output_item.done", item })}\n\ndata: ${JSON.stringify({ type: "response.completed", response: { status: "completed", output: [item] } })}\n\n`,
+              { status: 200, headers: { "content-type": "text/event-stream" } },
+            );
           },
-          stopReason: "stop" as const,
-          timestamp: Date.now(),
-        };
-        stream.push({ type: "done", reason: "stop", message });
-        stream.end(message);
-        return stream;
+        });
       },
     };
     const modelRuntime = await ModelRuntime.create({
       authPath: join(directory, "unused-auth.json"),
       modelsPath: null,
       refreshOnCreate: false,
+      allowModelNetwork: false,
     });
     modelRuntime.registerNativeProvider(testProvider);
     const settingsManager = SettingsManager.inMemory({

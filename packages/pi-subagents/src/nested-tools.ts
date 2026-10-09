@@ -27,6 +27,7 @@ import {
   streamToOutputFile,
   writeInitialEntry,
 } from "./output-file.js";
+import { configurationContext, type ProjectTrust } from "./project-trust.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
 import type {
   AgentConfig,
@@ -104,6 +105,8 @@ export interface NestedToolContext {
   allowedSubagents: "all" | string[];
   /** Root used for agent/config discovery; may differ from the agent's working directory. */
   configCwd: string;
+  /** Immutable configuration authority captured by the runner, including ancestor denials. */
+  projectTrust: ProjectTrust;
 }
 
 function textResult(text: string, isError = false) {
@@ -152,7 +155,9 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
   // Agents resolve from a registry built for THIS branch's config root (under
   // worktree isolation, the copy). Never via registerAgents — that is
   // process-global state shared with the main session and every other agent.
-  const loadRegistry = () => buildAgentRegistry(loadCustomAgents(context.configCwd));
+  const loadRegistry = () => buildAgentRegistry(loadCustomAgents(
+    context.configCwd, false, context.projectTrust.trusted, context.projectTrust.deniedRoots,
+  ));
   const allowedTypesIn = (registry: Map<string, AgentConfig>): Set<string> | undefined =>
     context.allowedSubagents === "all"
       ? undefined
@@ -250,6 +255,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         const scopeVerdict = checkModelScope({
           model,
           cwd: context.configCwd,
+          authority: context.projectTrust,
           modelRegistry: ctx.modelRegistry,
           callerSupplied: invocation.modelFromParams,
           agentLabel: config?.displayName ?? resolvedType,
@@ -339,7 +345,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         }
       };
 
-      // `ctx` is forwarded to the manager unmodified, never captured at tool-build
+      // `ctx` is forwarded with configuration-root provenance, never captured at tool-build
       // time: each AgentSession builds its own ExtensionRunner from that session's
       // cwd/sessionManager/modelRegistry, so this is the CHILD's context. Capturing
       // one earlier would silently give a grandchild the wrong worktree base, the
@@ -350,7 +356,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       // letting it escape into the child's turn.
       try {
         if (invocation.runInBackground) {
-          const id = context.manager.spawn(context.pi, ctx, resolvedType, params.prompt, {
+          const id = context.manager.spawn(context.pi, configurationContext(ctx, context.configCwd, context.projectTrust), resolvedType, params.prompt, {
             ...options,
             isBackground: true,
           });
@@ -362,7 +368,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
 
         const { record } = await context.manager.spawnAndWait(
           context.pi,
-          ctx,
+          configurationContext(ctx, context.configCwd, context.projectTrust),
           resolvedType,
           params.prompt,
           { ...options, signal },

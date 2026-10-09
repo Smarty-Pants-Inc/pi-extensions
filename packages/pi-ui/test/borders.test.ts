@@ -4,13 +4,14 @@ import {
   type Component,
   Container,
   Editor,
+  Input,
   MouseRegion,
   SelectList,
   TuiAltScreen,
   type TuiMouseEvent,
 } from "@earendil-works/pi-tui";
 import { test } from "vitest";
-import { borderedComponent, hasBorderRules, withBorderedCustomUi } from "../src/index.js";
+import { borderedComponent, hasBorderRules, withBorderedCustomUi, wrapCustomUi } from "../src/index.js";
 
 test("frames an unbordered component and preserves width", () => {
   const component = {
@@ -49,7 +50,7 @@ test("forwards input, focus, invalidation, and disposal", () => {
   const framed = borderedComponent(component, (text) => text);
 
   framed.focused = true;
-  framed.handleInput("enter");
+  framed.handleInput?.("enter");
   framed.invalidate();
   framed.dispose();
 
@@ -69,6 +70,7 @@ test("keeps passive components passive and forwards pending work", async () => {
   const framed = borderedComponent(component, (text) => text);
 
   assert.equal("focused" in framed, false);
+  assert.equal(framed.handleInput, undefined);
   await framed.waitForPending?.();
   assert.equal(pendingFinished, true);
 });
@@ -313,6 +315,80 @@ test("native editor autocomplete retains overlay keyboard ownership", async () =
   assert.equal(click?.focus, true);
   assert.ok(target);
   assert.equal(tui.focusTarget(target), framed);
+});
+
+test("native non-overlay Container + Input retains descendant mouse focus and typing", () => {
+  class Host extends TuiAltScreen {
+    focusTarget(component: Component) {
+      return this.resolveMouseFocusTarget(component);
+    }
+  }
+  const tui = new Host({ columns: 40, rows: 20, hideCursor() {} } as never);
+  const input = new Input();
+  const inner = new Container();
+  inner.addChild(input);
+  const framed = borderedComponent(inner, (s) => s);
+  tui.addChild(framed);
+  framed.render(40);
+  const result = framed.handleMouse?.({ ...mouse("press", 1), width: 40, height: 3 });
+  const target = (result as { focusTarget?: Component })?.focusTarget;
+  assert.equal(target, input);
+  assert.ok(target);
+  tui.setFocus(tui.focusTarget(target));
+  tui.getFocusedComponent()?.handleInput?.("typed");
+  assert.equal(input.getValue(), "typed");
+  assert.equal(input.focused, true);
+});
+
+test("overlay component width is live and the host's explicit options win", async () => {
+  class Host extends TuiAltScreen {
+    composite() {
+      return this.compositeOverlays([], 80, 24);
+    }
+  }
+  const tui = new Host({ columns: 80, rows: 24, hideCursor() {} } as never);
+  const renderedWidths: number[] = [];
+  let componentWidth = 40;
+  let widthReads = 0;
+  const component = {
+    get width() {
+      widthReads++;
+      return componentWidth;
+    },
+    render(width: number) {
+      renderedWidths.push(width);
+      return ["content"];
+    },
+    invalidate() {},
+  };
+  const framed = borderedComponent(component, (s) => s);
+  assert.equal(widthReads, 0);
+  assert.equal(framed.width, 40);
+  componentWidth = 42;
+  assert.equal(framed.width, 42);
+  componentWidth = 40;
+  // The extension custom host uses component.width only when no explicit
+  // overlayOptions were supplied; drive that contract through the UI wrapper.
+  const ui = wrapCustomUi({
+    custom: async (factory, options) => {
+      const created = await factory(
+        tui,
+        { fg: (_color: string, text: string) => text } as never,
+        {} as never,
+        () => {},
+      );
+      const explicit = options?.overlayOptions;
+      const opts = typeof explicit === "function" ? explicit() : explicit;
+      const handle = tui.showOverlay(created, opts ?? { width: (created as typeof framed).width });
+      tui.composite();
+      handle.hide();
+      return undefined;
+    },
+  } as ExtensionUIContext);
+  await ui.custom(() => component, { overlay: true });
+  assert.equal(renderedWidths.at(-1), 40);
+  await ui.custom(() => component, { overlay: true, overlayOptions: { width: 60 } });
+  assert.equal(renderedWidths.at(-1), 60);
 });
 
 test("mouse forwarding follows the latest border detection and empty content", () => {

@@ -85,6 +85,29 @@ test("standalone usage is picked up once and survives navigation without leaking
   assert.equal(accumulator.snapshot().cost, 0.05);
 });
 
+test("polling picks up boundary compaction and branch receipts once without message double counting", () => {
+  const accumulator = new FooterUsageAccumulator();
+  accumulator.reset([]);
+  const assistant = { role: "assistant", responseId: "r1", usage: usage(10, 2, 3, 0, 0.1) } as const;
+  accumulator.updateMessage(assistant as never);
+  const entries = [
+    entry({ id: "m1", type: "message", message: assistant }),
+    entry({ id: "c1", type: "compaction", usage: usage(2, 1, 0, 1, 0.03) }),
+    entry({ id: "b1", type: "branch_summary", usage: usage(1, 1, 1, 0, 0.04) }),
+    entry({ id: "w1", type: "usage", usage: usage(1, 0, 2, 0, 0.05) }),
+  ];
+  assert.equal(accumulator.updateUsageEntries(entries), true);
+  const polled = accumulator.snapshot();
+  assert.equal(polled.input, 14);
+  assert.equal(polled.output, 4);
+  assert.equal(polled.cacheRead, 6);
+  assert.equal(polled.cacheWrite, 1);
+  assert.equal(accumulator.updateUsageEntries(entries), false);
+  assert.equal(accumulator.updateUsageEntries([...entries, entries[1]]), false);
+  accumulator.reset(entries);
+  assert.deepEqual(accumulator.snapshot(), polled);
+});
+
 test("new usage checks inspect only entries appended since the last rebuild", () => {
   const accumulator = new FooterUsageAccumulator();
   const old = entry({ id: "old", type: "usage", usage: usage(10, 1, 0, 0, 0.1) });

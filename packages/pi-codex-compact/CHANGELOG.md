@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.3.3
+### Patch Changes
+
+- 3364cc0: Prevent provider, transport, inspection, and authentication errors from exposing credentials in remote compaction errors or native fallback warnings. Preserve cancellation with a safe AbortError and omit raw error causes.
+  
+  Finish SSE inspection at the terminal response and coordinate tee cancellation. Apply an extension-owned deadline across the entire operation, including stalled injected response bodies, with abort and timer cleanup.
+  
+  Use full retained-message provenance on canonical Pi hosts where recovery omissions are persisted before compaction. Limit the runtime-tail compatibility bridge to legacy projectionless hosts, and document conservative native fallback for prepareLoadout/codemode tool rewrites.
+- 701382c: Require fresh agent-context preparation and matching provider declarations before accepting transformed tool descriptions. Cached provider callbacks cannot approve unsent registry edits, hidden declarations use native compaction, and remote serialization must match frozen wire tools before transport. Preserve unchanged codemode-on compaction/replay and reconcile the documented limitations.
+- 3364cc0: Include credential resolution in the Codex compaction deadline and promptly stop waiting on cancellation without interrupting host-owned token persistence. Preserve configured-package inventory for default-autoload exclusion-only resource filters.
+- 69a5bed: Recognize already-dispatched model-facing tool descriptions transformed by codemode or other loadout hooks instead of comparing them with raw registry descriptions. Preserve native fallback for unobserved transformations and genuine prompt, registry, schema, or branch changes, including changes during remote requests. Scope dispatch evidence to the active session and clear it on reload or tree navigation.
+- 3364cc0: Adopt Pi 1.0.4's host-provided dependency contract: declare imported Pi and TypeBox modules as `*` peers rather than installing duplicate runtime modules, and align Pi development pins with the repository's tested 1.0.4 baseline. The wildcard identifies host module ownership; it does not promise compatibility with every Pi version.
+- Updated dependencies [3364cc0]
+- Updated dependencies [3364cc0]
+- Updated dependencies [3364cc0]
+  - @signalridge/pi-ui@1.3.3
+
 ## 1.3.2
 ### Patch Changes
 

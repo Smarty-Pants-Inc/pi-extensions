@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.4.3
+### Patch Changes
+
+- 3364cc0: Use patched Vitest 4.1.11 for development and regression testing without moving to a new major version. Refresh compatible transitive dependencies to include fixed source-map and brace-expansion releases.
+- 3364cc0: Resume a surviving terminal when a pending external settings editor exits after session replacement or reload, without restoring retired command state or restarting after quit. Dispose BTW credential loaders on every completion, cancellation, and error path, including immediate resolution before the host mounts the component.
+- 3364cc0: Adopt Pi 1.0.4's host-provided dependency contract: declare imported Pi and TypeBox modules as `*` peers rather than installing duplicate runtime modules, and align Pi development pins with the repository's tested 1.0.4 baseline. The wildcard identifies host module ownership; it does not promise compatibility with every Pi version.
+- 3364cc0: Cancel credential loaders, settings dialogs, and worktree operations when their owning session or branch retires, and ignore late results. Include boundary-generated usage receipts in statusline polling, mark only subscription-backed OAuth costs, and report headless worktree rejection on stderr.
+- 3364cc0: Close the settings JSON editor synchronously before tree navigation or shutdown, preserving Pi's native editing, configured external editor, and focus behavior without allowing late callbacks to dismiss a replacement dialog or apply retired settings. Prevent a pending native external editor from restarting the terminal after shutdown.
+- Updated dependencies [3364cc0]
+- Updated dependencies [3364cc0]
+- Updated dependencies [3364cc0]
+  - @signalridge/pi-ui@1.3.3
+
 ## 1.4.2
 ### Patch Changes
 

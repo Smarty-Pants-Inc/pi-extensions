@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.7.5
+### Patch Changes
+
+- 3364cc0: Declare `@sinclair/typebox` as a host-provided peer dependency with a `*` range instead of a runtime dependency, avoiding duplicate runtime modules and Pi extension-loader warnings.
+- 3364cc0: Adopt Pi 1.0.4's host-provided dependency contract: declare imported Pi and TypeBox modules as `*` peers rather than installing duplicate runtime modules, and align Pi development pins with the repository's tested 1.0.4 baseline. The wildcard identifies host module ownership; it does not promise compatibility with every Pi version.
+- 3364cc0: Bind code-review discovery and workflow executions (including resumes and nested scripts) to the session working directory. Preserve structured user content when deduplicating the workflow directive.
+- Updated dependencies [3364cc0]
+- Updated dependencies [3364cc0]
+  - @signalridge/pi-subagents-protocol@1.5.1
+
 ## 1.7.4
 ### Patch Changes
 

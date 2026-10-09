@@ -46,7 +46,7 @@ pi -e ./packages/pi-recall
 3. In any later session, run `/recall` and choose **Recall a saved message**.
 4. In TUI mode, type to fuzzy-search or press `Tab` / `Shift+Tab` to change scope. RPC mode asks for scope explicitly.
 5. Press `Enter` to open the selected message, or press `Ctrl+D` to review and confirm its deletion directly from the TUI picker.
-6. Preview the message or choose **Quote into draft**.
+6. Preview the message or choose **Quote into draft** in TUI. In RPC, choose **Replace client draft with quote** and confirm replacement.
 7. Add your question or instruction, then submit the draft normally.
 
 A quoted draft uses this form:
@@ -59,7 +59,7 @@ Original message text
 The user intentionally recalled and quoted the saved message above.
 ```
 
-The quote sent to the editor omits cwd, session IDs, entry IDs, session files, and other local paths.
+The quote sent to the editor omits cwd, session IDs, entry IDs, session files, and other local paths. ESC and XML-forbidden controls are encoded visibly (for example, `\u001b`), so saved text cannot terminate a bracketed paste. Multiline quote text and raw stored content remain intact.
 
 ## Commands
 
@@ -67,7 +67,7 @@ The quote sent to the editor omits cwd, session IDs, entry IDs, session files, a
 | --- | --- | --- |
 | `/recall` | TUI, RPC | Open the Pi Recall manager. Arguments are rejected. |
 
-Print and JSON modes reject `/recall` before opening an interactive flow. TUI and RPC expose the same save, preview, quote, delete, status, and help capabilities; RPC uses explicit dialogs instead of terminal shortcuts. In RPC, quoting emits Pi's `set_editor_text` extension UI request.
+Print and JSON modes reject `/recall` before opening an interactive flow. TUI and RPC expose the same save, preview, quote, delete, status, and help capabilities; RPC uses explicit dialogs instead of terminal shortcuts. RPC cannot read or append to the client draft. After explicit confirmation, quoting emits Pi's `set_editor_text` extension UI request to replace the entire draft; cancellation leaves it untouched.
 
 ## Recall scopes
 

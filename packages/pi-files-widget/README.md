@@ -80,7 +80,7 @@ The `/readfiles` browser requires these tools and will refuse to open until they
 - `/readfiles` - open the file browser in the current directory
 - `/readfiles <path>` - open the file browser rooted at `<path>` (absolute, relative, or `~`-prefixed)
 
-Diff viewing is built into the file viewer: open a changed tracked file and press `d` to toggle the git diff view.
+Diff viewing is built into the file viewer: changed tracked files open in diff mode by default; press `d` to toggle between diff and full-file view. Selection and comments are disabled in diff mode. Press `d` for the full file before selecting source lines.
 
 ## Browser keybindings
 
@@ -105,7 +105,7 @@ Diff viewing is built into the file viewer: open a changed tracked file and pres
 - `m`: toggle rendered/raw view for Markdown files
 - `/`: search (type to search)
 - `n` / `N`: next/prev match
-- `v`: select mode (line selection)
+- `v`: source-line selection from the top of the file (not available in diff mode)
 - `c`: comment on selected lines (inline prompt)
 - `Enter`: new line in the comment editor
 - `Ctrl+Enter` or `Ctrl+D`: send the comment (`Alt+Enter` also works when supported)
@@ -116,7 +116,8 @@ Diff viewing is built into the file viewer: open a changed tracked file and pres
 ## Notes
 
 - Untracked files show as `[UNTRACKED]` and open in normal view.
-- Searching in rendered Markdown switches to raw mode first, and selecting from rendered Markdown first switches you back to raw so line-based matches and comments stay aligned with the source file.
+- Searching in rendered Markdown switches to raw mode first. In rendered Markdown, the first `v` switches to raw; press `v` again to select source lines.
+- Ordinary full-file viewing remains syntax-highlighted and may wrap long lines. Selection uses an unhighlighted source snapshot with exactly one source line per row, starting at line 1 rather than reusing rendered-row scroll positions. Long lines are clipped to the terminal width, not wrapped; comments include the entire selected source lines. The displayed line numbers, selected range, and comment snippet use the same source indices. Resizing or disk edits do not change an active selection/comment snapshot. Cancelling or sending restores ordinary viewing.
 - When you browse outside the current project directory, inline comments on those files use absolute paths so the agent can still locate them. Files inside the project continue to use project-relative paths.
 - Folder LOCs are shown only when the folder is collapsed (expanded folders would duplicate counts).
 - Line counts load asynchronously; the header shows activity while counts are computed.

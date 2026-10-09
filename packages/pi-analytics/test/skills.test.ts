@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { test } from "vitest";
 import { explicitSkillName, SkillTracker } from "../src/skills.js";
 
@@ -54,6 +55,33 @@ test("successful canonical built-in reads match discovered skill paths", async (
   );
   assert.equal(
     await tracker.matchSuccessfulRead({ toolName: "bash", input: { path: file }, isError: false }),
+    undefined,
+  );
+});
+
+test("read spellings normalize @, home and file URLs before absolute canonical lookup", async () => {
+  const skillFile = path.join(homedir(), "skills", "a skill", "SKILL.md");
+  const paths: string[] = [];
+  const tracker = new SkillTracker("/workspace", async (value) => {
+    paths.push(value);
+    return value;
+  });
+  await tracker.setAvailableSkills([{ name: "example", filePath: skillFile }]);
+  for (const spelling of [
+    skillFile,
+    "~/skills/a skill/SKILL.md",
+    "@~/skills/a skill/SKILL.md",
+    pathToFileURL(skillFile).href,
+    `@${pathToFileURL(skillFile).href}`,
+  ]) {
+    assert.equal(
+      await tracker.matchSuccessfulRead({ toolName: "read", input: { path: spelling }, isError: false }),
+      "example",
+    );
+    assert.equal(paths.at(-1), skillFile);
+  }
+  assert.equal(
+    await tracker.matchSuccessfulRead({ toolName: "read", input: { path: "file://%invalid" }, isError: false }),
     undefined,
   );
 });

@@ -17,6 +17,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { after, describe, test } from "node:test";
+import { ExtensionRunner } from "@earendil-works/pi-coding-agent";
 import ralphExtension from "../index.ts";
 
 function makeCtx(cwd, sessionId = "fresh-session") {
@@ -188,6 +189,9 @@ describe("loop ownership across sessions", () => {
       .execute("call", { name: "started-loop", taskContent: "# Task\n", maxIterations: 3 }, undefined, undefined, ctx);
 
     assert.equal(readLoop(cwd, "started-loop").ownerSessionId, "starter-session");
+    assert.equal(fs.readFileSync(path.join(cwd, ".ralph", "started-loop.md"), "utf8"), "# Task\n");
+    assert.equal(pi.sentUserMessages.length, 1);
+    assert.equal(pi.sentUserMessages[0].options.deliverAs, "followUp");
   });
 });
 
@@ -243,6 +247,128 @@ describe("after ownership transfers away", () => {
 });
 
 describe("loop lifecycle", () => {
+  for (const stopReason of ["error", "aborted"]) {
+    test(`${stopReason} at the maximum retains resumability, even with a partial completion marker`, async () => {
+      const cwd = makeTempDir("ralph-max-interrupted-");
+      writeLoop(cwd, {
+        ...baseState,
+        name: "final",
+        taskFile: ".ralph/final.md",
+        iteration: 3,
+        maxIterations: 3,
+        ownerSessionId: "owner",
+      });
+      const { pi, ctx } = await boot(cwd, "owner");
+      await pi.events.get("agent_end")(
+        {
+          messages: [
+            {
+              role: "assistant",
+              stopReason,
+              content: [{ type: "text", text: "<promise>COMPLETE</promise>" }],
+            },
+          ],
+        },
+        ctx,
+      );
+      assert.equal(readLoop(cwd, "final").status, "active");
+      assert.equal(readLoop(cwd, "final").completedAt, undefined);
+      assert.equal(pi.sentUserMessages.length, 0, "sent a completed banner");
+      assert.match((await inject(pi, ctx)).systemPrompt, /Iteration 3\/3/);
+      // A subsequent successful retry can still finish the loop.
+      await pi.events.get("agent_end")({ messages: [{ role: "assistant", stopReason: "stop", content: [] }] }, ctx);
+      assert.equal(readLoop(cwd, "final").status, "completed");
+    });
+  }
+
+  test("ralph_done's queued final iteration is not completed until delivered", async () => {
+    const cwd = makeTempDir("ralph-max-queued-");
+    writeLoop(cwd, {
+      ...baseState,
+      name: "final",
+      taskFile: ".ralph/final.md",
+      iteration: 2,
+      maxIterations: 3,
+      ownerSessionId: "owner",
+    });
+    const { pi, ctx } = await boot(cwd, "owner");
+    await pi.tools.get("ralph_done").execute("advance", {}, undefined, undefined, ctx);
+    assert.equal(readLoop(cwd, "final").iteration, 3);
+    assert.equal(pi.sentUserMessages.length, 1);
+    ctx.hasPendingMessages = () => true;
+    await pi.events.get("agent_end")({ messages: [{ role: "assistant", stopReason: "stop", content: [] }] }, ctx);
+    assert.equal(readLoop(cwd, "final").status, "active");
+    assert.equal(pi.sentUserMessages.length, 1, "queued a premature terminal banner");
+    ctx.hasPendingMessages = () => false;
+    await pi.events.get("agent_end")({ messages: [{ role: "assistant", stopReason: "stop", content: [] }] }, ctx);
+    assert.equal(readLoop(cwd, "final").status, "completed");
+    assert.equal(pi.sentUserMessages.length, 2);
+  });
+
+  test("a deferred RPC nuke settles on session abort and ignores a late yes without accessing the retired ctx", async () => {
+    const cwd = makeTempDir("ralph-nuke-replaced-");
+    const { pi, ctx } = await boot(cwd, "old-owner");
+    const runner = new ExtensionRunner([], {}, cwd, {}, {});
+    let answer;
+    let dialogSignal;
+    runner.setUIContext(
+      {
+        ...ctx.ui,
+        confirm: (_title, _message, options) => {
+          dialogSignal = options.signal;
+          return new Promise((resolve) => {
+            answer = resolve;
+          });
+        },
+      },
+      "rpc",
+    );
+    const rpcCtx = { ...ctx, mode: "rpc", ui: runner.getUIContext() };
+    let retired = false;
+    let retiredReads = 0;
+    const oldCtx = new Proxy(rpcCtx, {
+      get(target, key) {
+        if (retired) {
+          retiredReads++;
+          throw new Error("Session context is no longer valid");
+        }
+        return Reflect.get(target, key);
+      },
+    });
+    let settled = false;
+    const command = pi.commands
+      .get("ralph")
+      .handler("nuke", oldCtx)
+      .then(() => {
+        settled = true;
+      });
+    assert.ok(answer, "confirmation was not opened");
+    assert.equal(settled, false, "command detached its confirmation");
+    await pi.events.get("session_shutdown")({}, oldCtx);
+    retired = true;
+    await pi.events.get("session_start")({}, makeCtx(cwd, "new-owner"));
+    await command;
+    assert.equal(dialogSignal.aborted, true);
+    assert.equal(settled, true);
+    assert.equal(fs.existsSync(path.join(cwd, ".ralph")), true);
+    answer(true);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(fs.existsSync(path.join(cwd, ".ralph")), true);
+    assert.equal(retiredReads, 0);
+  });
+
+  test("nuke catches confirmation failure and still deletes only after an awaited yes", async () => {
+    const cwd = makeTempDir("ralph-nuke-confirm-");
+    const { pi, ctx } = await boot(cwd, "owner");
+    ctx.ui.confirm = async () => {
+      throw new Error("RPC disconnected");
+    };
+    await pi.commands.get("ralph").handler("nuke", ctx);
+    assert.equal(fs.existsSync(path.join(cwd, ".ralph")), true);
+    ctx.ui.confirm = async () => true;
+    await pi.commands.get("ralph").handler("nuke", ctx);
+    assert.equal(fs.existsSync(path.join(cwd, ".ralph")), false);
+  });
   test("`/ralph-stop` marks the owner's own loop completed", async () => {
     const cwd = makeTempDir("ralph-stop-");
     writeLoop(cwd, { ...baseState, name: "mine", taskFile: ".ralph/mine.md", ownerSessionId: "owner" });

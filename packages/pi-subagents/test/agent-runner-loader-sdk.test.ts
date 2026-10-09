@@ -78,7 +78,7 @@ export default function(pi) {
       },
     } as unknown as ExtensionContext["modelRegistry"];
     const ctx = {
-      cwd, getSystemPrompt: () => "PARENT", model, modelRegistry,
+      cwd, isProjectTrusted: () => true, getSystemPrompt: () => "PARENT", model, modelRegistry,
     } as unknown as ExtensionContext;
     const pi = { exec: async () => ({ code: 1, stdout: "", stderr: "" }) } as unknown as ExtensionAPI;
     const events: string[] = [];

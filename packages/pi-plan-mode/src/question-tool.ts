@@ -143,9 +143,14 @@ export function normalizePlanModeQuestionParams(input: unknown): NormalizePlanMo
 export async function answerPlanModeQuestions(
   questions: PlanModeQuestion[],
   ctx: ExtensionContext,
-  lifecycle: { isCurrent(): boolean; isEnabled(): boolean },
+  lifecycle: { signal?: AbortSignal; isCurrent(): boolean; isEnabled(): boolean },
 ) {
-  const answers = await askPlanModeQuestions(questions, ctx, () => lifecycle.isCurrent() && lifecycle.isEnabled());
+  const answers = await askPlanModeQuestions(
+    questions,
+    ctx,
+    () => lifecycle.isCurrent() && lifecycle.isEnabled(),
+    lifecycle.signal,
+  );
   if (!lifecycle.isCurrent()) {
     return planModeQuestionCancelled(
       questions,
@@ -160,7 +165,7 @@ export async function answerPlanModeQuestions(
       "Plan-mode question cancelled because Plan mode is no longer active.",
     );
   }
-  if (!answers) {
+  if (lifecycle.signal?.aborted || !answers) {
     return planModeQuestionCancelled(questions, "cancelled", "User cancelled the Plan-mode question prompt.");
   }
   return planModeQuestionAnswered(questions, answers);
@@ -189,6 +194,7 @@ export async function askPlanModeQuestions(
   questions: PlanModeQuestion[],
   ctx: ExtensionContext,
   shouldContinue: () => boolean = () => true,
+  signal?: AbortSignal,
 ): Promise<PlanModeQuestionAnswer[] | undefined> {
   const answers: (PlanModeQuestionAnswer | undefined)[] = new Array(questions.length).fill(undefined);
   // A single question has nothing to page through, so it keeps the plain title
@@ -197,14 +203,15 @@ export async function askPlanModeQuestions(
 
   let index = 0;
   while (index < questions.length) {
+    if (signal?.aborted || !shouldContinue()) return undefined;
     const question = questions[index];
     if (!question) return undefined;
     const choices = question.options.map(formatPlanModeQuestionChoice);
     const otherChoice = `${question.options.length + 1}. Other (free-form)`;
     const options = [...choices, otherChoice, ...(paged && index > 0 ? [BACK_CHOICE] : [])];
     const position = paged ? `[${index + 1}/${questions.length}] ` : "";
-    const choice = await ctx.ui.select(`${position}${question.header}: ${question.question}`, options);
-    if (!shouldContinue() || !choice) return undefined;
+    const choice = await ctx.ui.select(`${position}${question.header}: ${question.question}`, options, { signal });
+    if (signal?.aborted || !shouldContinue() || !choice) return undefined;
 
     if (choice === BACK_CHOICE) {
       // The answer being revised is dropped now rather than on re-answer, so a
@@ -215,8 +222,10 @@ export async function askPlanModeQuestions(
     }
 
     if (choice === otherChoice) {
-      const customAnswer = (await ctx.ui.editor(question.question, ""))?.trim();
-      if (!shouldContinue()) return undefined;
+      // editor() has no abort option. Use the cancellable dialog in both TUI
+      // and RPC so an abandoned workflow cannot leave a tool waiting forever.
+      const customAnswer = (await ctx.ui.input(question.question, "", { signal }))?.trim();
+      if (signal?.aborted || !shouldContinue()) return undefined;
       // An empty free-form answer returns to this question rather than
       // cancelling the batch: opening the editor and thinking better of it is
       // a correction, not a decision to abandon everything already answered.

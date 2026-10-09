@@ -18,6 +18,15 @@ export default function worktreeExtension(pi: ExtensionAPI, options: WorktreeExt
     };
   });
 
+  const closeCommands = () => {
+    sessionGeneration += 1;
+    menuController.abort(new DOMException("Worktree navigation started", "AbortError"));
+    menuController = new AbortController();
+  };
+  pi.on("session_before_switch", () => closeCommands());
+  pi.on("session_before_tree", () => closeCommands());
+  pi.on("session_tree", () => closeCommands());
+
   pi.on("session_start", async (_event, ctx) => {
     const generation = ++sessionGeneration;
     menuController.abort(new DOMException("Worktree session replaced", "AbortError"));
