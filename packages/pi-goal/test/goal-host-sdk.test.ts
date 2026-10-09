@@ -263,6 +263,44 @@ describe.skipIf(VERSION !== "1.0.4")("terminal goals on installed Pi 1.0.4", () 
     );
   }
 
+  it("wakes a due wait on the real host tool-loadout change without an idle polling timer", async () => {
+    vi.useFakeTimers();
+    const f = await fixture("on");
+    let requests = 0;
+    try {
+      faux.setResponses([
+        () => {
+          requests++;
+          return fauxAssistantMessage(fauxToolCall("goal_wait", { ...args("goal_wait"), resume_after_ms: 10_000 }), {
+            stopReason: "toolUse",
+          });
+        },
+        () => {
+          requests++;
+          return fauxAssistantMessage(fauxToolCall("goal_wait", args("goal_wait", f.state().goal?.id ?? "missing")), {
+            stopReason: "toolUse",
+          });
+        },
+      ]);
+      await f.session.prompt("wait once");
+      f.session.setActiveToolsByName(["substantive"]);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(f.state().goal).toMatchObject({ id: "current", status: "paused" });
+      expect(vi.getTimerCount()).toBe(0);
+      await vi.advanceTimersByTimeAsync(86_400_000);
+      expect(requests).toBe(1);
+      f.session.setActiveToolsByName([...terminals, "substantive"]);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(requests).toBe(2);
+      expect(f.state().goal?.id).not.toBe("current");
+      expect(f.state().goal?.wait?.resumeAt).toBeUndefined();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      f.session.dispose();
+      vi.useRealTimers();
+    }
+  });
+
   it("keeps the queued successor inactive until actual host settlement", async () => {
     let release: () => void = () => {};
     const barrier = new Promise<void>((resolve) => {

@@ -293,6 +293,7 @@ describe("goal_wait lifecycle", () => {
     await vi.advanceTimersByTimeAsync(9_000);
     await fixture.mock.events.get("input")?.[0]?.({ source: "interactive", text: "Slow auth" }, fixture.ctx);
     await vi.advanceTimersByTimeAsync(121_000);
+    assert.equal(vi.getTimerCount(), 0, "pending input must not arm timed rechecks");
     assert.equal(requireLastGoal(fixture.mock).status, "paused");
     assert.equal(fixture.mock.sentUserMessages.length, 0);
     await deliverPrompt(fixture, "Slow auth");
@@ -345,11 +346,13 @@ describe("goal_wait lifecycle", () => {
     const fixture = await waitingGoal(10_000, { isIdle: () => idle, hasPendingMessages: () => pending });
     idle = false;
     await vi.advanceTimersByTimeAsync(10_000);
+    assert.equal(vi.getTimerCount(), 0, "busy sessions must not arm timed rechecks");
     assert.equal(fixture.mock.sentUserMessages.length, 0);
     idle = true;
     pending = true;
     await fixture.mock.events.get("agent_settled")?.[0]?.({}, fixture.ctx);
     await vi.advanceTimersByTimeAsync(0);
+    assert.equal(vi.getTimerCount(), 0, "pending messages must not arm timed rechecks");
     assert.equal(fixture.mock.sentUserMessages.length, 0);
     pending = false;
     await fixture.mock.events.get("agent_settled")?.[0]?.({}, fixture.ctx);
@@ -1114,14 +1117,24 @@ describe("goal_wait lifecycle", () => {
     assert.equal(fixture.mock.sentUserMessages.length, 1);
   });
 
-  test("an overdue wait wakes after tools return without another agent event", async () => {
+  test("an overdue wait wakes on the tool-loadout event without polling or another agent event", async () => {
     const fixture = await waitingGoal(10_000);
     fixture.mock.rawPi.setActiveTools(["read"]);
     await vi.advanceTimersByTimeAsync(10_000);
     assert.equal(requireLastGoal(fixture.mock).status, "paused");
+    assert.equal(vi.getTimerCount(), 0, "unavailable tools must not arm timed rechecks");
+    await vi.advanceTimersByTimeAsync(86_400_000);
+    assert.equal(fixture.mock.sentUserMessages.length, 0, "idle time is not an unblocking event");
     fixture.mock.rawPi.setActiveTools(["read", "goal_complete", "goal_blocked", "goal_wait"]);
-    await vi.advanceTimersByTimeAsync(60_000);
+    const prepare = fixture.mock.tools.find((tool) => tool.name === "goal_complete")?.prepareLoadout;
+    assert.equal(typeof prepare, "function");
+    // The mock has no host loadout engine; invoke the public callback Pi fires on this change.
+    (prepare as () => undefined)();
+    await Promise.resolve();
     assert.equal(requireLastGoal(fixture.mock).status, "active");
+    assert.equal(fixture.mock.sentUserMessages.length, 1);
+    assert.equal(vi.getTimerCount(), 0);
+    await vi.advanceTimersByTimeAsync(86_400_000);
     assert.equal(fixture.mock.sentUserMessages.length, 1);
   });
 
@@ -1163,7 +1176,7 @@ describe("goal_wait lifecycle", () => {
     assert.equal(requireLastGoal(fixture.mock).status, "active");
   });
 
-  test("failed explicit resume rechecks an overdue wait once", async () => {
+  test("failed explicit resume leaves an overdue wait for the next unblocking event", async () => {
     let idle = true;
     const fixture = await waitingGoal(10_000, { isIdle: () => idle });
     idle = false;
@@ -1176,7 +1189,9 @@ describe("goal_wait lifecycle", () => {
     await fixture.mock.commands.get("goal")?.handler("resume", fixture.ctx);
     assert.equal(requireLastGoal(fixture.mock).status, "paused");
     fixture.mock.rawPi.sendUserMessage = send;
-    await vi.advanceTimersByTimeAsync(0);
+    assert.equal(vi.getTimerCount(), 0);
+    await fixture.mock.events.get("agent_settled")?.[0]?.({}, fixture.ctx);
+    await Promise.resolve();
     assert.equal(fixture.mock.sentUserMessages.length, 1);
     assert.equal(requireLastGoal(fixture.mock).status, "active");
   });

@@ -45,6 +45,23 @@ export function registerGoalLifecycle(
   runController: GoalRunController,
   options: GoalLifecycleOptions = {},
 ) {
+  function recheckWaitAfterCompaction(ctx: StatusContext) {
+    // Manual compaction has no agent_settled event, and its controller is still
+    // owned during this hook. One cancellable event-tail task observes release;
+    // if still blocked, it stops rather than scheduling a retry.
+    const generation = runtime.menuGeneration;
+    const signal = runtime.menuController.signal;
+    const cancel = () => {
+      clearImmediate(task);
+      signal.removeEventListener("abort", cancel);
+    };
+    const task = setImmediate(() => {
+      signal.removeEventListener("abort", cancel);
+      if (!signal.aborted && generation === runtime.menuGeneration) runtime.scheduleGoalWaitWake(ctx);
+    });
+    signal.addEventListener("abort", cancel, { once: true });
+  }
+
   function afterTreeNavigationSettles(ctx: StatusContext, ownsWork: () => boolean, work: () => Promise<unknown>) {
     const generation = runtime.menuGeneration;
     const signal = runtime.menuController.signal;
@@ -348,7 +365,7 @@ export function registerGoalLifecycle(
     if (runtime.activeGoal?.status !== "active") {
       runtime.clearGoalRecovery();
       if (runtime.pendingQueueAction) await commands.dispatchPendingQueueActionIfSettled(ctx);
-      runtime.scheduleGoalWaitWake(ctx);
+      recheckWaitAfterCompaction(ctx);
       return;
     }
 
@@ -385,7 +402,7 @@ export function registerGoalLifecycle(
   });
 
   pi.on("session_compact_failed", (_event, ctx) => {
-    runtime.scheduleGoalWaitWake(ctx);
+    recheckWaitAfterCompaction(ctx);
   });
 
   pi.on("input", (event, _ctx) => {

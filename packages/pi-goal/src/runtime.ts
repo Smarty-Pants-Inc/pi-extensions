@@ -188,7 +188,6 @@ export interface WaitingInputWake {
 const MAX_CANCELLED_CONTINUATION_PROMPTS = 20;
 const MAX_PENDING_GOAL_PROMPTS = 20;
 const MAX_PENDING_NON_GOAL_INPUTS = 20;
-const WAIT_WAKE_RECHECK_MS = 60_000;
 const BUDGET_WRAP_UP_MESSAGE_TYPE = "goal-budget-wrap-up";
 const BUDGET_WRAP_UP_PROMPT =
   "The active /goal token budget is exhausted. Stop substantive work and do not call substantive tools. Summarize progress, verified results, remaining work, and blockers concisely. Treat completion as unproven. Do not call goal_complete unless authoritative, requirement-by-requirement evidence already proves every requirement is complete. Weak, indirect, or missing evidence is not enough. Budget exhaustion is not completion.";
@@ -211,6 +210,7 @@ export class GoalRuntime {
   activeGoal?: ActiveGoal;
   /** The single `goal_wait` safety wake-up. Cancelled with continuation work. */
   private readonly goalWaitTimer = new GoalWaitTimer();
+  private goalWaitContext?: StatusContext;
   /** Terminal details captured for the matching persisted-state snapshot. */
   private terminalDetails?: GoalTerminalDetails;
   private goalStateSink?: (snapshot: GoalStateSnapshot) => void;
@@ -793,14 +793,38 @@ export class GoalRuntime {
    */
   onGoalWaitElapsed?: (ctx: StatusContext, goalId: string) => void;
 
-  scheduleGoalWaitWake(ctx: StatusContext, recheckAt?: number): void {
+  scheduleGoalWaitWake(ctx: StatusContext): void {
     this.clearGoalWaitWake();
     const goal = this.activeGoal;
     if (this.queueFrozen || this.pendingQueueAction || goal?.status !== "paused" || !goal.wait) return;
     const resumeAt = goal.wait.resumeAt;
     if (resumeAt === undefined) return;
+    this.goalWaitContext = ctx;
+    if (resumeAt <= Date.now()) {
+      this.recheckGoalWaitFromEvent();
+      return;
+    }
     const generation = this.menuGeneration;
-    this.goalWaitTimer.schedule(recheckAt ?? resumeAt, () => {
+    this.goalWaitTimer.schedule(resumeAt, () => {
+      if (
+        generation !== this.menuGeneration ||
+        this.activeGoal?.id !== goal.id ||
+        this.activeGoal.wait?.resumeAt !== resumeAt
+      )
+        return;
+      this.dispatchGoalWaitIfDue(ctx);
+    });
+  }
+
+  /** Event-owned microtask, not a timed retry. Recheck after a tool loadout finishes changing. */
+  recheckGoalWaitFromEvent(): void {
+    const ctx = this.goalWaitContext;
+    const goal = this.activeGoal;
+    if (!ctx || goal?.status !== "paused" || goal.wait?.resumeAt === undefined || goal.wait.resumeAt > Date.now())
+      return;
+    const generation = this.menuGeneration;
+    const resumeAt = goal.wait.resumeAt;
+    queueMicrotask(() => {
       if (
         generation !== this.menuGeneration ||
         this.activeGoal?.id !== goal.id ||
@@ -826,10 +850,9 @@ export class GoalRuntime {
       this.pendingInputWake?.waitingGoal === goal ||
       this.pendingDirectInputs.some((pending) => pending.realInput && pending.waiting && pending.goalId === goal.id);
     if (pendingRealInput || !this.toolPolicy.toolsAvailable() || ctx.isIdle?.() !== true || hasPendingMessages(ctx)) {
-      // Input preflight and tool-loadout changes need not emit agent_settled.
-      // Never infer rejection from elapsed time: a slow accepted input could
-      // otherwise race a second prompt. Explicit /goal resume remains available.
-      this.scheduleGoalWaitWake(ctx, Date.now() + WAIT_WAKE_RECHECK_MS);
+      // The deadline has fired once. Only an unblocking lifecycle/input/loadout
+      // event may recheck it; elapsed time cannot prove an input was rejected.
+      this.goalWaitTimer.clear();
       return;
     }
     this.clearGoalWaitWake();
@@ -838,6 +861,7 @@ export class GoalRuntime {
 
   clearGoalWaitWake(): void {
     this.goalWaitTimer.clear();
+    this.goalWaitContext = undefined;
   }
 
   cancelContinuationWork() {

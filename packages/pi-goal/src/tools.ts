@@ -62,6 +62,12 @@ export function registerGoalTools(pi: ExtensionAPI, runtime: GoalRuntime) {
     // Nested execution strips terminate; terminal transitions must be direct model calls.
     exposure: "model-only",
     label: "Goal Complete",
+    prepareLoadout: () => {
+      // Pi invokes this public hook when the active tool set changes, including
+      // restoring Goal tools while idle. It must not alter the loadout itself.
+      runtime.recheckGoalWaitFromEvent();
+      return undefined;
+    },
     description:
       "Mark the active /goal as complete after all required work is done and verified, using the current goal_id stale-turn guard. Do not use for partial progress, blockers, failing, or unverified work.",
     promptSnippet: "Mark the active /goal as complete after fully finishing and verifying it, with the current goal_id",

@@ -550,7 +550,13 @@ export class GoalCommandController {
           this.runtime.blockStaleGoalToolCalls();
         }
         this.runtime.toolPolicy.restore(goalToolVisibilityBeforeActivation);
-        if (source === "explicit" && stoppedGoal.wait?.resumeAt !== undefined) {
+        // A future persisted deadline still owns one wake. An overdue failed
+        // delivery must wait for an unblocking event, not immediately retry.
+        if (
+          source === "explicit" &&
+          stoppedGoal.wait?.resumeAt !== undefined &&
+          stoppedGoal.wait.resumeAt > Date.now()
+        ) {
           this.runtime.scheduleGoalWaitWake(ctx);
         }
       }
