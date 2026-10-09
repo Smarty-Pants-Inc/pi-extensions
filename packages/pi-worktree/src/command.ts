@@ -309,39 +309,68 @@ async function addFlow(
         );
       }
 
-      await addWorktree(
-        pi,
-        ctx.cwd,
-        {
-          path: targetPath,
-          branch,
-          startOid: provenance.kind === "create" ? provenance.oid : undefined,
-        },
-        ctx.signal,
-      );
-
+      ctx.signal?.throwIfAborted();
+      let addFailure: string | undefined;
       try {
-        const updated = await listWorktrees(pi, ctx.cwd, ctx.signal);
-        const verified = updated.find((record) => pathsEqual(record.path, targetPath));
-        // branchRef is stricter than branch: a deleted branch shadowed by a same-named tag produces
-        // a detached record whose branchRef is undefined.
-        if (
-          !verified ||
-          verified.branchRef !== localBranchRef(branch) ||
-          !verified.head ||
-          !sameOid(verified.head, provenance.oid)
-        ) {
-          throw new Error("the expected path, branch, and base commit were not present in Git porcelain output");
-        }
-        return verified;
+        await addWorktree(
+          pi,
+          ctx.cwd,
+          {
+            path: targetPath,
+            branch,
+            startOid: provenance.kind === "create" ? provenance.oid : undefined,
+          },
+          ctx.signal,
+        );
       } catch (error) {
+        // Even a failed/interrupted Add can create a branch before checkout fails.
+        addFailure = formatError(error);
+      }
+
+      // Once Add has run, recovery outlives the UI owner. Each bounded read must
+      // finish even if the other fails; a branch can exist without a worktree.
+      const [inventory, branchState] = await Promise.allSettled([
+        listWorktrees(pi, ctx.cwd),
+        resolveCommit(pi, ctx.cwd, localBranchRef(branch)),
+      ]);
+      const verified =
+        inventory.status === "fulfilled"
+          ? inventory.value.find((record) => pathsEqual(record.path, targetPath))
+          : undefined;
+      // branchRef is stricter than branch: a deleted branch shadowed by a same-named tag produces
+      // a detached record whose branchRef is undefined.
+      if (
+        addFailure !== undefined ||
+        !verified ||
+        verified.branchRef !== localBranchRef(branch) ||
+        !verified.head ||
+        !sameOid(verified.head, provenance.oid) ||
+        branchState.status !== "fulfilled" ||
+        !sameOid(branchState.value, provenance.oid)
+      ) {
+        const pathState =
+          inventory.status === "rejected"
+            ? `worktree inventory unavailable: ${formatError(inventory.reason)}`
+            : verified
+              ? `path registered with branch ${verified.branchRef ?? "(detached)"} at ${verified.head ?? "(unknown)"}`
+              : "path not registered";
+        const refState =
+          branchState.status === "fulfilled"
+            ? `branch ${localBranchRef(branch)} at ${branchState.value}`
+            : `branch ${localBranchRef(branch)} verification unavailable: ${formatError(branchState.reason)}`;
         throw new WorktreeRecoveryError(
-          `Git add completed, so the worktree was retained at ${targetPath}, but verification failed: ${formatError(error)}. Inspect git worktree list before retrying.`,
+          `Git add ${addFailure === undefined ? "completed" : `failed: ${addFailure}`}; any created worktree was retained at ${targetPath}, but verification failed: ${pathState}; ${refState}. Any created branch was retained. Inspect git worktree list and git show-ref before retrying.`,
         );
       }
+      return verified;
     },
     ctx.signal,
   );
+  if (ctx.signal?.aborted) {
+    throw new WorktreeRecoveryError(
+      `Git add completed despite cancellation; verified and retained worktree ${targetPath} on branch ${branch} at ${provenance.oid}. Inspect git worktree list before retrying.`,
+    );
+  }
   safeNotify(ctx, `Created worktree ${targetPath} on branch ${branch} at ${provenance.oid}.`, "info");
 
   if (

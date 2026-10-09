@@ -307,7 +307,9 @@ export async function addWorktree(
   input: AddArguments,
   signal?: AbortSignal,
 ): Promise<void> {
-  await runGit(pi, buildAddArguments(input), cwd, signal, GIT_MUTATION_TIMEOUT_MS);
+  // A completed Add may already have committed a path and a branch. Preserve
+  // its result even if the UI owner was cancelled, so the caller can reconcile.
+  await runGit(pi, buildAddArguments(input), cwd, signal, GIT_MUTATION_TIMEOUT_MS, false);
 }
 
 export async function moveWorktree(
@@ -1094,8 +1096,9 @@ async function runGit(
   cwd: string,
   signal?: AbortSignal,
   timeout = GIT_TIMEOUT_MS,
+  checkAfterAbort = true,
 ): Promise<ExecResult> {
-  const result = await runGitAllowFailure(pi, args, cwd, signal, timeout);
+  const result = await runGitAllowFailure(pi, args, cwd, signal, timeout, checkAfterAbort);
   if (result.killed) throw killedError(args);
   if (result.code !== 0) throw gitFailure(args, result);
   return result;
@@ -1107,11 +1110,12 @@ async function runGitAllowFailure(
   cwd: string,
   signal?: AbortSignal,
   timeout = GIT_TIMEOUT_MS,
+  checkAfterAbort = true,
 ): Promise<ExecResult> {
   try {
     signal?.throwIfAborted();
     const result = await pi.exec("git", args, { cwd, signal, timeout });
-    signal?.throwIfAborted();
+    if (checkAfterAbort) signal?.throwIfAborted();
     return result;
   } catch (error) {
     const message = formatError(error);

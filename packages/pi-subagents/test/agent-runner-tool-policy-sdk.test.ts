@@ -111,7 +111,7 @@ describe.skipIf(!VERSION.startsWith("0.99.") && !VERSION.startsWith("1."))("chil
     expect(first.responseText).toContain(`Acceptance gate \`check-${code}-${killed}\`: ${status}`);
     expect(exec.mock.calls.map(([file, args]) => [file, args])).toEqual([
       ["git", ["rev-parse", "--is-inside-work-tree"]],
-      ["git", ["rev-parse", "HEAD"]], ["git", ["status", "--porcelain", "--untracked-files=all"]],
+      ["git", ["rev-parse", "HEAD"]], ["git", ["status", "--porcelain", "--untracked-files=all", "--ignored=matching"]],
       ["git", ["diff", "--no-ext-diff", "--no-textconv", "--binary", "--full-index", "HEAD"]], ["sh", ["-c", `check-${code}-${killed}`]],
     ]);
     // A successful host-shaped git inspection establishes a reusable fingerprint.

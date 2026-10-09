@@ -82,7 +82,9 @@ test.skipIf(process.platform === "win32")(
         `#!/usr/bin/env node\n` +
           `const fs = require('node:fs');\n` +
           `fs.readFileSync(0, 'utf8');\n` +
-          `fs.writeFileSync(${JSON.stringify(log)}, String(process.pid));\n` +
+          `const log = ${JSON.stringify(log)};\n` +
+          `fs.writeFileSync(log + '.tmp', String(process.pid));\n` +
+          `fs.renameSync(log + '.tmp', log);\n` +
           `setInterval(() => {}, 1000);\n`,
         { mode: 0o700 },
       );
@@ -149,9 +151,17 @@ for (const platform of ["darwin", "linux"]) {
               `const fs = require('node:fs');\n` +
               `const log = ${JSON.stringify(log)};\n` +
               `const utility = ${JSON.stringify(utility)};\n` +
-              `fs.appendFileSync(log, JSON.stringify({ pid: process.pid, utility }) + '\\n');\n` +
+              // Publish complete snapshots: the parent polls while this process writes.
+              `const records = [];\n` +
+              `const temporary = log + '.' + process.pid + '.tmp';\n` +
+              `function record(entry) {\n` +
+              `  records.push(entry);\n` +
+              `  fs.writeFileSync(temporary, records.map(value => JSON.stringify(value)).join('\\n') + '\\n');\n` +
+              `  fs.renameSync(temporary, log);\n` +
+              `}\n` +
+              `record({ pid: process.pid, utility });\n` +
               `const input = fs.readFileSync(0, 'utf8');\n` +
-              `fs.appendFileSync(log, JSON.stringify({ pid: process.pid, utility, input }) + '\\n');\n` +
+              `record({ pid: process.pid, utility, input });\n` +
               `setInterval(() => {}, 1000);\n`,
             { mode: 0o700, flag: "wx" },
           );

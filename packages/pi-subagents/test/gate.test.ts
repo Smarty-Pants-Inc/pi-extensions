@@ -7,7 +7,7 @@
  * a workspace that has since changed.
  */
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -186,6 +186,55 @@ describe("memoization", () => {
 });
 
 describe("workspaceFingerprint", () => {
+  it.each(["gitignore", "exclude", "global"] as const)("reruns a gate when an input ignored through %s changes", async source => {
+    const root = mkdtempSync(join(tmpdir(), "gate-ignored-"));
+    const cwd = join(root, "repo");
+    mkdirSync(cwd);
+    const env = { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" };
+    const git = (...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", env }).trim();
+    const run = vi.fn(async (file: string, args: string[]) => {
+      try {
+        return { stdout: execFileSync(file, args, { cwd, encoding: "utf8", env }), exitCode: 0 };
+      } catch {
+        return { stdout: "", exitCode: 1 };
+      }
+    });
+    try {
+      git("init", "--quiet");
+      git("config", "status.showUntrackedFiles", "no");
+      if (source === "gitignore") writeFileSync(join(cwd, ".gitignore"), "inputs/\n");
+      else if (source === "exclude") writeFileSync(join(cwd, ".git", "info", "exclude"), "inputs/\n");
+      else {
+        const ignoreFile = join(root, "global-ignore");
+        writeFileSync(ignoreFile, "inputs/\n");
+        git("config", "core.excludesFile", ignoreFile);
+      }
+      writeFileSync(join(cwd, "check.js"), "process.exit(require('node:fs').readFileSync('inputs/config', 'utf8') === 'good' ? 0 : 1)\n");
+      git("add", ".");
+      const tree = git("write-tree");
+      const commit = execFileSync("git", ["commit-tree", tree, "-m", "fixture"], {
+        cwd, encoding: "utf8", env: { ...env, GIT_AUTHOR_NAME: "Fixture", GIT_AUTHOR_EMAIL: "fixture@example.invalid", GIT_COMMITTER_NAME: "Fixture", GIT_COMMITTER_EMAIL: "fixture@example.invalid" },
+      }).trim();
+      git("update-ref", "HEAD", commit);
+      mkdirSync(join(cwd, "inputs"));
+      const input = join(cwd, "inputs", "config");
+      writeFileSync(input, "good");
+      // The old fingerprint cannot see this input at all, even with all untracked files enabled.
+      expect(git("status", "--porcelain", "--untracked-files=all")).toBe("");
+      const command = `${JSON.stringify(process.execPath)} check.js`;
+      const firstFingerprint = await workspaceFingerprint(cwd, run);
+      const first = await runGate({ command, cwd, exec: run, fingerprint: firstFingerprint });
+      expect(first).toMatchObject({ passed: true, cached: false });
+      writeFileSync(input, "bad");
+      const second = await runGate({ command, cwd, exec: run, fingerprint: await workspaceFingerprint(cwd, run) });
+      expect(second).toMatchObject({ passed: false, cached: false });
+      expect(firstFingerprint).toBeUndefined();
+      expect(run.mock.calls.filter(([file]) => file === "sh")).toHaveLength(2);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("never reuses a passing gate after an untracked check.js is overwritten", async () => {
     const cwd = mkdtempSync(join(tmpdir(), "gate-untracked-"));
     const run = vi.fn(async (file: string, args: string[]) => {
@@ -313,6 +362,17 @@ describe("workspaceFingerprint", () => {
     expect(await workspaceFingerprint("/tmp", gitExec(responses))).toBe(
       await workspaceFingerprint("/tmp", gitExec(responses)),
     );
+  });
+
+  it.each(["?? untracked.txt", "!! ignored.txt", "!! ignored-directory/"])("disables caching for %s without reading a diff", async status => {
+    const run = gitExec({
+      "rev-parse": { stdout: "sha1", exitCode: 0 },
+      status: { stdout: `${status}\n`, exitCode: 0 },
+      diff: { stdout: "", exitCode: 0 },
+    });
+    expect(await workspaceFingerprint("/tmp", run)).toBeUndefined();
+    expect(run).toHaveBeenCalledWith("git", ["status", "--porcelain", "--untracked-files=all", "--ignored=matching"], { cwd: "/tmp" });
+    expect(run.mock.calls.some(([, args]) => args[0] === "diff")).toBe(false);
   });
 
   it("returns undefined outside a git repository, disabling the cache", async () => {
