@@ -108,7 +108,7 @@ export function registerWorktreeCommand(
             if (!actionOwner.signal.aborted && actionOwner.isCurrent()) {
               safeNotify(ctx, formatError(error), "error");
             } else if (error instanceof WorktreeRecoveryError) {
-              // Retained trees/unknown mutation outcomes outlive their UI owner.
+              // Completed mutations, retained trees and unknown outcomes outlive their UI owner.
               // Do not access a retired context, even to check whether it has UI.
               console.error(stripTerminalControls(formatError(error)));
             }
@@ -271,7 +271,6 @@ async function addFlow(
   // opened, so every pre-confirmation check above is stale by the whole menu lifetime. The lock
   // cannot stop an external `git branch -f` — that is what the base-OID check is for — but it does
   // shrink the window against this package's own flows, and it never spans a dialog.
-  let completed: WorktreeRecord | undefined;
   const created = await withWorktreeMutationLock(
     ctx.cwd,
     async () => {
@@ -363,18 +362,11 @@ async function addFlow(
           `Git add ${addFailure === undefined ? "completed" : `failed: ${addFailure}`}; any created worktree was retained at ${targetPath}, but verification failed: ${pathState}; ${refState}. Any created branch was retained. Inspect git worktree list and git show-ref before retrying.`,
         );
       }
-      completed = verified;
       return verified;
     },
     ctx.signal,
-  ).catch((error: unknown) => {
-    if (!completed) throw error;
-    // Only lock release can fail after verification. Its failure must not erase
-    // the completed Add, even when runFlow's owner has already retired.
-    throw new WorktreeRecoveryError(
-      `Git add completed; verified and retained worktree ${completed.path} on branch ${branch} at ${provenance.oid}. ${formatError(error)}. Inspect git worktree list and the mutation lock before retrying.`,
-    );
-  });
+    `Git add completed; verified and retained worktree ${targetPath} on branch ${branch} at ${provenance.oid}`,
+  );
   if (ctx.signal?.aborted) {
     throw new WorktreeRecoveryError(
       `Git add completed despite cancellation; verified and retained worktree ${targetPath} on branch ${branch} at ${provenance.oid}. Inspect git worktree list before retrying.`,
@@ -684,6 +676,7 @@ async function pruneFlow(
       return output;
     },
     ctx.signal,
+    "Pruned stale worktree metadata",
   );
   safeNotify(ctx, output ? `Pruned stale worktree metadata:\n${output}` : "Pruned stale worktree metadata.", "info");
 }

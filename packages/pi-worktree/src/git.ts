@@ -70,11 +70,20 @@ export class GitWorktreeError extends Error {
     this.args = args;
   }
 }
+export type WorktreeMutationOutcome<T = unknown> =
+  | { status: "fulfilled"; value: T }
+  | { status: "rejected"; reason: unknown };
+
 /** A mutation left retained data or an outcome that requires recovery inspection. */
 export class WorktreeRecoveryError extends GitWorktreeError {
-  constructor(message: string) {
+  readonly mutationOutcome?: WorktreeMutationOutcome;
+  readonly releaseError?: unknown;
+
+  constructor(message: string, mutationOutcome?: WorktreeMutationOutcome, releaseError?: unknown) {
     super(message);
     this.name = "WorktreeRecoveryError";
+    this.mutationOutcome = mutationOutcome;
+    this.releaseError = releaseError;
   }
 }
 
@@ -418,22 +427,42 @@ async function withMetadataPruneLock<T>(key: string, operation: () => Promise<T>
   }
 }
 
+/** Preserve a settled mutation's outcome even when filesystem lock cleanup fails. */
 export function withWorktreeMutationLock<T>(
   cwd: string,
   operation: () => Promise<T>,
   signal?: AbortSignal,
+  completionMessage = "Worktree mutation completed",
 ): Promise<T> {
   const key = worktreeMutationLockKey(cwd);
   return withMetadataPruneLock(
     key,
     async () => {
       const release = await acquireFilesystemMutationLock(key, signal);
+      let outcome: WorktreeMutationOutcome<T>;
       try {
         signal?.throwIfAborted();
-        return await operation();
-      } finally {
-        await release();
+        outcome = { status: "fulfilled", value: await operation() };
+      } catch (reason: unknown) {
+        outcome = { status: "rejected", reason };
       }
+      try {
+        await release();
+      } catch (releaseError: unknown) {
+        // Cleanup cannot undo the callback's effects or erase retained/unknown
+        // recovery details. Report both, independently of UI cancellation.
+        const detail =
+          outcome.status === "rejected"
+            ? `Worktree mutation failed: ${formatError(outcome.reason)}`
+            : `${completionMessage}${typeof outcome.value === "string" && outcome.value ? `:\n${outcome.value}` : "."}`;
+        throw new WorktreeRecoveryError(
+          `${detail} ${formatError(releaseError)}. Inspect git worktree list and the mutation lock before retrying.`,
+          outcome,
+          releaseError,
+        );
+      }
+      if (outcome.status === "rejected") throw outcome.reason;
+      return outcome.value;
     },
     signal,
   );
@@ -578,7 +607,7 @@ export async function removeWorktreeMetadata(
     }
   };
   if (lockHeld) await operation();
-  else await withWorktreeMutationLock(cwd, operation, signal);
+  else await withWorktreeMutationLock(cwd, operation, signal, `Worktree metadata removal completed for ${path}`);
 }
 
 export async function worktreeInventory(
@@ -1023,7 +1052,7 @@ export async function pruneWorktrees(
     for (const candidate of candidates) await removeAdministrativeRecord(candidate, signal);
     return candidates.map((candidate) => `Removed ${candidate.id}`).join("\n");
   };
-  return lockHeld ? operation() : withWorktreeMutationLock(cwd, operation, signal);
+  return lockHeld ? operation() : withWorktreeMutationLock(cwd, operation, signal, "Pruned stale worktree metadata");
 }
 
 export function formatWorktree(record: WorktreeRecord, currentPath?: string): string {

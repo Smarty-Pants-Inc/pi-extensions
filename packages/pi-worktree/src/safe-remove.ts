@@ -404,5 +404,6 @@ export async function removeWorktreeSafely(
       }
     },
     signal,
+    `Removed worktree ${path}. Its branch was preserved`,
   );
 }
