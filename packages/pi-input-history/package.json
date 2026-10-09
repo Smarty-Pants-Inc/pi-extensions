@@ -1,7 +1,7 @@
 {
   "name": "@signalridge/pi-input-history",
   "version": "1.2.8",
-  "description": "Cross-session prompt history with a full fzf/atuin-style Ctrl+R picker for Pi.",
+  "description": "Cross-session prompt history with a full fzf/atuin-style Ctrl+Alt+R picker for Pi.",
   "type": "module",
   "license": "MIT",
   "private": false,

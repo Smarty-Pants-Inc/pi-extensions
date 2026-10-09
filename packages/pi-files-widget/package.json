@@ -21,7 +21,7 @@
     "@earendil-works/pi-tui": "*"
   },
   "scripts": {
-    "postinstall": "node -e \"console.log('pi-files-widget: required deps: bat, delta, glow. Install with: brew install bat git-delta glow')\"",
+    "postinstall": "node -e \"console.log('pi-files-widget: optional rendering tools: bat, delta, glow. Plain-text fallbacks work without them. Install with: brew install bat git-delta glow')\"",
     "typecheck": "tsc --noEmit",
     "lint": "biome check .",
     "test": "bun test test",

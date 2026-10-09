@@ -6,7 +6,7 @@
  */
 
 import { statSync } from "node:fs";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createFileBrowser } from "./browser.js";
 import { formatCommentMessage } from "./comment.js";
 import { POLL_INTERVAL_MS } from "./constants.js";
@@ -44,8 +44,18 @@ export default function editorExtension(pi: ExtensionAPI): void {
   const observedChangedFiles = new Set<string>();
   const mutations = new Map<string, { cwd: string; path: string; before: string | undefined }>();
   let closeActiveInteraction: (() => void) | undefined;
-  const requiredDeps = ["bat", "delta", "glow"] as const;
-  const getMissingDeps = () => requiredDeps.filter((dep) => !hasCommand(dep));
+  const optionalDeps = ["bat", "delta", "glow"] as const;
+  let warnedMissingDeps = false;
+  const warnMissingDeps = (ctx: ExtensionContext): void => {
+    if (ctx.mode !== "tui" || !ctx.hasUI || warnedMissingDeps) return;
+    const missing = optionalDeps.filter((dep) => !hasCommand(dep));
+    if (missing.length === 0) return;
+    warnedMissingDeps = true;
+    ctx.ui.notify(
+      `files-widget: optional tools missing: ${missing.join(", ")}. Using plain-text fallbacks where needed. Install: brew install bat git-delta glow`,
+      "warning",
+    );
+  };
 
   pi.registerCommand("readfiles", {
     description: "Open file browser (optional: /readfiles <path> to start outside the current directory)",
@@ -56,11 +66,7 @@ export default function editorExtension(pi: ExtensionAPI): void {
         return;
       }
       const cwd = ctx.cwd;
-      const missing = getMissingDeps();
-      if (missing.length > 0) {
-        ctx.ui.notify(`files-widget requires ${missing.join(", ")}. Install: brew install bat git-delta glow`, "error");
-        return;
-      }
+      warnMissingDeps(ctx);
 
       const resolved = resolveInitialPath(args, cwd);
       if (resolved.error) {
@@ -174,10 +180,7 @@ export default function editorExtension(pi: ExtensionAPI): void {
 
   pi.on("session_start", async (_event, ctx) => {
     mutations.clear();
-    const missing = ctx.mode === "tui" ? getMissingDeps() : [];
-    if (missing.length > 0) {
-      ctx.ui.notify(`files-widget requires ${missing.join(", ")}. Install: brew install bat git-delta glow`, "error");
-    }
+    warnMissingDeps(ctx);
 
     agentModifiedFiles.clear();
     observedChangedFiles.clear();
