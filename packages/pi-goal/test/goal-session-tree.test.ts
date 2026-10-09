@@ -143,26 +143,45 @@ test("tree navigation arms the destination branch's waiting deadline", async () 
   assert.equal(fixture.mock.sentUserMessages.length, 1);
 });
 
-test("tree navigation starts a queued destination head after Pi becomes idle", async () => {
-  vi.useFakeTimers();
-  const path = settingsPath("tree-queued-enabled.json");
-  writeFileSync(path, '{"toolVisibility":"always","experimental":{"goals":true}}\n');
-  let navigating = false;
-  const goal = createGoal("old head", undefined, 0);
-  const fixture = restoreStoredGoalForTest(goal, [], "always", { isIdle: () => !navigating }, path);
-  const branch = fixture.ctx.sessionManager.getBranch() as Array<Record<string, unknown>>;
-  const queued = { ...createGoal("queued destination", undefined, 0), status: "queued" as const };
-  branch.splice(0, branch.length, { type: "custom", customType: "goal-state", data: { goal: queued } });
-  navigating = true;
-  await fixture.mock.events.get("session_tree")?.[0]?.({ oldLeafId: "old", newLeafId: "queued" }, fixture.ctx);
-  await vi.advanceTimersByTimeAsync(0);
-  assert.equal(fixture.mock.sentUserMessages.length, 0);
-  navigating = false;
-  await vi.advanceTimersByTimeAsync(1_000);
-  assert.equal(requireLastGoal(fixture.mock).text, "queued destination");
-  assert.equal(requireLastGoal(fixture.mock).status, "active");
-  assert.equal(fixture.mock.sentUserMessages.length, 1);
-});
+test.each(["busy", "pending"] as const)(
+  "tree navigation waits for the unblocking settle event (%s), without timers",
+  async (blocker) => {
+    vi.useFakeTimers();
+    const path = settingsPath(`tree-queued-${blocker}.json`);
+    writeFileSync(path, '{"toolVisibility":"always","experimental":{"goals":true}}\n');
+    let blocked = false;
+    const goal = createGoal("old head", undefined, 0);
+    const fixture = restoreStoredGoalForTest(
+      goal,
+      [],
+      "always",
+      {
+        isIdle: () => blocker !== "busy" || !blocked,
+        hasPendingMessages: () => blocker === "pending" && blocked,
+      },
+      path,
+    );
+    const branch = fixture.ctx.sessionManager.getBranch() as Array<Record<string, unknown>>;
+    const queued = { ...createGoal("queued destination", undefined, 0), status: "queued" as const };
+    branch.splice(0, branch.length, { type: "custom", customType: "goal-state", data: { goal: queued } });
+    blocked = true;
+    await fixture.mock.events.get("session_tree")?.[0]?.({ oldLeafId: "old", newLeafId: "queued" }, fixture.ctx);
+    assert.equal(vi.getTimerCount(), 0);
+    await vi.advanceTimersByTimeAsync(86_400_000);
+    await fixture.mock.events.get("agent_settled")?.[0]?.({}, fixture.ctx);
+    assert.equal(fixture.mock.sentUserMessages.length, 0);
+    assert.equal(vi.getTimerCount(), 0);
+    blocked = false;
+    await fixture.mock.events.get("agent_settled")?.[0]?.({}, fixture.ctx);
+    assert.equal(requireLastGoal(fixture.mock).text, "queued destination");
+    assert.equal(requireLastGoal(fixture.mock).status, "active");
+    assert.equal(fixture.mock.sentUserMessages.length, 1);
+    await fixture.mock.events.get("agent_settled")?.[0]?.({}, fixture.ctx);
+    await vi.advanceTimersByTimeAsync(86_400_000);
+    assert.equal(fixture.mock.sentUserMessages.length, 1, "settlement consumes navigation intent once");
+    assert.equal(vi.getTimerCount(), 0);
+  },
+);
 
 test("activating a queued destination excludes work performed while it was queued", async () => {
   vi.useFakeTimers();
@@ -201,8 +220,11 @@ test("tree navigation dispatches a restored priority action after Pi becomes idl
   await fixture.mock.events.get("session_tree")?.[0]?.({ oldLeafId: "old", newLeafId: "priority" }, fixture.ctx);
   await vi.advanceTimersByTimeAsync(0);
   assert.equal(requireLastGoal(fixture.mock).text, "old head");
+  assert.equal(vi.getTimerCount(), 0);
+  await vi.advanceTimersByTimeAsync(86_400_000);
+  assert.equal(requireLastGoal(fixture.mock).text, "old head");
   navigating = false;
-  await vi.advanceTimersByTimeAsync(1_000);
+  await fixture.mock.events.get("agent_settled")?.[0]?.({}, fixture.ctx);
   assert.equal(requireLastGoal(fixture.mock).text, "urgent goal");
   assert.equal(requireLastGoal(fixture.mock).status, "active");
 });
@@ -211,18 +233,57 @@ test("leaving a queued branch cancels its deferred navigation work", async () =>
   vi.useFakeTimers();
   const path = settingsPath("tree-cancel-enabled.json");
   writeFileSync(path, '{"toolVisibility":"always","experimental":{"goals":true}}\n');
-  const fixture = restoreStoredGoalForTest(createGoal("old head", undefined, 0), [], "always", {}, path);
+  let idle = false;
+  const fixture = restoreStoredGoalForTest(
+    createGoal("old head", undefined, 0),
+    [],
+    "always",
+    { isIdle: () => idle },
+    path,
+  );
   const branch = fixture.ctx.sessionManager.getBranch() as Array<Record<string, unknown>>;
   const queued = { ...createGoal("queued destination", undefined, 0), status: "queued" as const };
   branch.splice(0, branch.length, { type: "custom", customType: "goal-state", data: { goal: queued } });
   await fixture.mock.events.get("session_tree")?.[0]?.({ oldLeafId: "old", newLeafId: "queued" }, fixture.ctx);
-  assert.equal(vi.getTimerCount(), 1);
+  assert.equal(vi.getTimerCount(), 0);
   branch.splice(0);
   await fixture.mock.events.get("session_tree")?.[0]?.({ oldLeafId: "queued", newLeafId: "empty" }, fixture.ctx);
   assert.equal(vi.getTimerCount(), 0);
-  await vi.advanceTimersByTimeAsync(1_000);
+  idle = true;
+  await fixture.mock.events.get("agent_settled")?.[0]?.({}, fixture.ctx);
+  await vi.advanceTimersByTimeAsync(86_400_000);
   assert.equal(fixture.mock.sentUserMessages.length, 0);
 });
+
+test.each(["fresh-context", "ui-release", "shutdown"] as const)(
+  "deferred navigation respects the settlement context and lifetime (%s)",
+  async (scenario) => {
+    vi.useFakeTimers();
+    const path = settingsPath(`tree-owned-${scenario}.json`);
+    writeFileSync(path, '{"toolVisibility":"always","experimental":{"goals":true}}\n');
+    const fixture = restoreStoredGoalForTest(
+      createGoal("source", undefined, 0),
+      [],
+      "always",
+      {
+        isIdle: () => false,
+        hasPendingMessages: () => true,
+      },
+      path,
+    );
+    const branch = fixture.ctx.sessionManager.getBranch() as Array<Record<string, unknown>>;
+    const queued = { ...createGoal("destination", undefined, 0), status: "queued" as const };
+    branch.splice(0, branch.length, { type: "custom", customType: "goal-state", data: { goal: queued } });
+    await fixture.mock.events.get("session_tree")?.[0]?.({ oldLeafId: "source", newLeafId: "queued" }, fixture.ctx);
+    assert.equal(vi.getTimerCount(), 0);
+    if (scenario === "shutdown") await fixture.mock.events.get("session_shutdown")?.[0]?.({}, fixture.ctx);
+    const settledCtx = { ...fixture.ctx, isIdle: () => true, hasPendingMessages: () => false };
+    await fixture.mock.events.get(scenario === "ui-release" ? "ui_prompt_end" : "agent_settled")?.[0]?.({}, settledCtx);
+    await vi.advanceTimersByTimeAsync(86_400_000);
+    assert.equal(fixture.mock.sentUserMessages.length, scenario === "shutdown" ? 0 : 1);
+    assert.equal(vi.getTimerCount(), 0);
+  },
+);
 
 test("an old completion timer cannot clear a frozen destination status", async () => {
   vi.useFakeTimers();
@@ -271,8 +332,9 @@ test("budget enforcement does not strand a restored priority action", async () =
   navigating = true;
   await fixture.mock.events.get("session_tree")?.[0]?.({ oldLeafId: "old", newLeafId: "priority" }, fixture.ctx);
   assert.equal(requireLastGoal(fixture.mock).status, "budget_limited");
+  assert.equal(vi.getTimerCount(), 0);
   navigating = false;
-  await vi.advanceTimersByTimeAsync(0);
+  await fixture.mock.events.get("agent_settled")?.[0]?.({}, fixture.ctx);
   assert.equal(requireLastGoal(fixture.mock).text, "urgent goal");
   assert.equal(requireLastGoal(fixture.mock).status, "active");
 });

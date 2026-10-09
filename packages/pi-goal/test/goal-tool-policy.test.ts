@@ -84,6 +84,7 @@ test("goal registers command, status tools, and lifecycle hooks", () => {
     "tool_call",
     "tool_execution_end",
     "turn_end",
+    "ui_prompt_end",
   ]);
 });
 

@@ -62,32 +62,44 @@ export function registerGoalLifecycle(
     signal.addEventListener("abort", cancel, { once: true });
   }
 
-  function afterTreeNavigationSettles(ctx: StatusContext, ownsWork: () => boolean, work: () => Promise<unknown>) {
+  let pendingTreeNavigation: ((ctx: StatusContext) => Promise<boolean>) | undefined;
+
+  function afterTreeNavigationSettles(
+    ctx: StatusContext,
+    ownsWork: () => boolean,
+    work: (settledCtx: StatusContext) => Promise<unknown>,
+  ) {
     const generation = runtime.menuGeneration;
     const signal = runtime.menuController.signal;
-    let timer: ReturnType<typeof setTimeout>;
     const cancel = () => {
-      clearTimeout(timer);
+      if (pendingTreeNavigation === attempt) pendingTreeNavigation = undefined;
       signal.removeEventListener("abort", cancel);
     };
-    const attempt = () => {
+    const attempt = async (settledCtx: StatusContext): Promise<boolean> => {
       if (signal.aborted || generation !== runtime.menuGeneration || !ownsWork()) {
         cancel();
-        return;
+        return false;
       }
-      if (ctx.isIdle?.() !== true || hasPendingMessages(ctx)) {
-        timer = setTimeout(attempt, 1_000);
-        return;
-      }
+      if (settledCtx.isIdle?.() !== true || hasPendingMessages(settledCtx)) return false;
+      // Consume before calling out: synchronous bus re-entry or repeated settle
+      // events must not dispatch the same restored work twice.
       cancel();
-      void work().catch((error) => {
+      try {
+        await work(settledCtx);
+      } catch (error) {
         if (!signal.aborted && generation === runtime.menuGeneration) {
-          notifyTerminal(ctx.ui, `Cannot restore /goal after tree navigation: ${formatError(error)}`, "error");
+          notifyTerminal(settledCtx.ui, `Cannot restore /goal after tree navigation: ${formatError(error)}`, "error");
         }
-      });
+      }
+      return true;
     };
+    pendingTreeNavigation = attempt;
     signal.addEventListener("abort", cancel, { once: true });
-    timer = setTimeout(attempt, 0);
+    // Finish synchronous tree restoration first. If busy, retain intent for the
+    // registered agent_settled handler; no timed wake is armed.
+    queueMicrotask(() => {
+      if (pendingTreeNavigation === attempt) void attempt(ctx);
+    });
   }
 
   pi.on("session_start", async (_event, ctx) => {
@@ -260,7 +272,7 @@ export function registerGoalLifecycle(
       afterTreeNavigationSettles(
         ctx,
         () => runtime.pendingQueueAction === pending,
-        () => commands.dispatchPendingQueueActionIfSettled(ctx),
+        (settledCtx) => commands.dispatchPendingQueueActionIfSettled(settledCtx),
       );
     }
     if (runtime.activeGoal.status === "active") {
@@ -295,10 +307,10 @@ export function registerGoalLifecycle(
       afterTreeNavigationSettles(
         ctx,
         () => runtime.activeGoal?.id === queuedHead.id && runtime.activeGoal.status === "active",
-        async () => {
-          const sent = await runtime.sendOwnedGoalPrompt(ctx, queuedHead.id, buildGoalPrompt(queuedHead), false);
+        async (settledCtx) => {
+          const sent = await runtime.sendOwnedGoalPrompt(settledCtx, queuedHead.id, buildGoalPrompt(queuedHead), false);
           if (!sent && runtime.activeGoal?.id === queuedHead.id) {
-            runtime.stopActiveGoal(ctx, {
+            runtime.stopActiveGoal(settledCtx, {
               kind: "activation_rollback",
               expectedGoalId: queuedHead.id,
               restoreGoal: queuedHead,
@@ -878,7 +890,13 @@ export function registerGoalLifecycle(
     runtime.requestContinuation(currentGoal);
   });
 
+  pi.on("ui_prompt_end", async (_event, ctx) => {
+    // Native tree/dialog UI can release its hold without running an agent.
+    if (pendingTreeNavigation) await pendingTreeNavigation(ctx);
+  });
+
   pi.on("agent_settled", async (_event, ctx) => {
+    const dispatchedTreeNavigation = pendingTreeNavigation ? await pendingTreeNavigation(ctx) : false;
     if (runtime.queueFrozen) {
       runtime.clearSettledSafetyTracking();
       runtime.queueFreezeAwaitingSettle = false;
@@ -892,7 +910,7 @@ export function registerGoalLifecycle(
     if (runtime.pendingQueueAction) {
       dispatchedQueueAction = await commands.dispatchPendingQueueActionIfSettled(ctx);
     }
-    if (!dispatchedQueueAction) runtime.dispatchContinuationIfSettled(ctx);
+    if (!dispatchedQueueAction && !dispatchedTreeNavigation) runtime.dispatchContinuationIfSettled(ctx);
     runtime.clearSettledSafetyTracking();
     runtime.acceptedRunPrompt = undefined;
     runtime.pendingInputWake = undefined;

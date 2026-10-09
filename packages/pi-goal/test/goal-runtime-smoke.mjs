@@ -824,7 +824,7 @@ async function treePriorityScenario() {
   let sawBusyTreeHook = false;
   const now = Date.now();
   const harness = await createHarness(
-    [waitResponse],
+    [fauxAssistantMessage("Navigation observed; ready to settle."), waitResponse],
     {},
     (sessionManager) => {
       sessionManager.appendMessage(fauxAssistantMessage("historical goal response"));
@@ -861,11 +861,16 @@ async function treePriorityScenario() {
   try {
     assert.equal(persistedGoalStatus(harness.session), null);
     await harness.session.navigateTree(targetId);
+    assert.equal(harness.faux.state.callCount, 0, "navigation completion alone must not cause a timed wake");
+    assert.equal(persistedGoalState(harness.session).goal.text, "budgeted historical head");
+    // The SDK has no UI hold-release event and navigation itself does not emit
+    // agent_settled. A real host run supplies the native settlement boundary.
+    await harness.session.prompt("Observe the restored navigation state and settle.");
     await waitFor(
       () => persistedGoalState(harness.session)?.goal?.text === "urgent after tree navigation",
-      "tree priority dispatch after asynchronous observer",
+      "tree priority dispatch on actual host settlement",
     );
-    await waitFor(() => harness.session.isIdle && harness.faux.state.callCount === 1, "tree-priority goal_wait");
+    await waitFor(() => harness.session.isIdle && harness.faux.state.callCount === 2, "tree-priority goal_wait");
     const state = persistedGoalState(harness.session);
     assert.ok(sawBusyTreeHook, "Pi keeps navigation busy until every tree handler returns");
     assert.equal(state.goal.status, "paused");
