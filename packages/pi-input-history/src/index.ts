@@ -1,31 +1,36 @@
 /**
- * Persistent History + Ctrl+R Fuzzy Popup (fzf / atuin style)
+ * Persistent History + Ctrl+Alt+R Fuzzy Popup (fzf / atuin style)
  *
  * - Loads recent prompts from previous sessions into up/down history on startup.
- * - Ctrl+R opens a large two-pane popup: a filterable list on the left (row
+ * - Ctrl+Alt+R opens a large two-pane popup: a filterable list on the left (row
  *   number + age + one-line summary) and the FULL text of the highlighted entry
  *   on the right, `fzf --preview` style. Newest entry sits at the top.
  *
  * Hotkeys while searching:
  * - ↑ / Ctrl+P / Ctrl+S : move up (toward newer)
- * - ↓ / Ctrl+N / Ctrl+R : move down (toward older — "press ctrl+R again to go further back")
+ * - ↓ / Ctrl+N / Ctrl+Alt+R / Ctrl+R : move down (toward older — repeat the opening key)
  * - Ctrl+D / Ctrl+U     : scroll the preview pane
  * - <type>              : fuzzy-filter (subsequence, space = multi-token)
  * - Enter               : accept selection (fills editor)
  * - Esc / Ctrl+G / Ctrl+C : cancel
  */
 
+import { readFileSync } from "node:fs";
 import type { UserMessage } from "@earendil-works/pi-ai";
 import {
   CustomEditor,
   type ExtensionAPI,
   type ExtensionContext,
+  migrateSessionEntries,
+  parseSessionEntries,
   SessionManager,
   type Theme,
 } from "@earendil-works/pi-coding-agent";
 import {
   type Component,
+  type EditorComponent,
   type Focusable,
+  getKeybindings,
   Input,
   Key,
   matchesKey,
@@ -79,6 +84,7 @@ export default function (pi: ExtensionAPI) {
   let historyReady: Promise<void> = Promise.resolve();
   let loadGeneration = 0;
   let shortcutOwner: ShortcutSearch | undefined;
+  let sessionEditors = new Set<EditorComponent>();
 
   const retireShortcut = () => {
     const owner = shortcutOwner;
@@ -93,26 +99,72 @@ export default function (pi: ExtensionAPI) {
     const generation = ++loadGeneration;
     retireShortcut();
     historyCache = [];
+    sessionEditors.clear();
+    historyReady = Promise.resolve();
+    if (ctx.mode !== "tui" || !ctx.hasUI) return;
 
-    // Do not block later session_start handlers: the replacement editor must
-    // replace Pi's bootstrap editor immediately instead of waiting for session I/O.
-    historyReady = loadRecentPrompts(ctx.cwd, MAX_MESSAGES)
+    const editors = new Set<EditorComponent>();
+    sessionEditors = editors;
+    let scanPending = true;
+    const usedEditors = new Set<EditorComponent>();
+    const populate = (editor: EditorComponent, items: HistoryEntry[]) => {
+      // Native history is bounded. Appending old entries after a live submission
+      // would put them ahead of it and can evict it; browsing also owns its cursor.
+      if (usedEditors.has(editor)) return;
+      for (let i = items.length - 1; i >= 0; i--) {
+        editor.addToHistory?.(items[i]?.text);
+      }
+    };
+    // Compose synchronously, before the user can paste into the editor. Pi copies
+    // getText() when replacing an editor, not its private large-paste contents.
+    // When I/O finishes, update the existing instances rather than replacing them.
+    const prevComponentFactory = ctx.ui.getEditorComponent();
+    ctx.ui.setEditorComponent((tui, theme, keybindings) => {
+      const editor = prevComponentFactory?.(tui, theme, keybindings) ?? new CustomEditor(tui, theme, keybindings);
+      if (generation === loadGeneration && !editors.has(editor)) {
+        editors.add(editor);
+        const pending = () => scanPending && generation === loadGeneration;
+        const addToHistory = editor.addToHistory?.bind(editor);
+        if (addToHistory) {
+          editor.addToHistory = (text) => {
+            if (pending()) usedEditors.add(editor);
+            addToHistory(text);
+          };
+        }
+        const handleInput = editor.handleInput?.bind(editor);
+        if (handleInput) {
+          editor.handleInput = (data) => {
+            const kb = getKeybindings();
+            if (
+              pending() &&
+              (
+                [
+                  "tui.editor.historyPrevious",
+                  "tui.editor.historyNext",
+                  "tui.editor.cursorUp",
+                  "tui.editor.cursorDown",
+                ] as const
+              ).some((action) => kb.matches(data, action))
+            ) {
+              usedEditors.add(editor);
+            }
+            handleInput(data);
+          };
+        }
+        populate(editor, historyCache);
+      }
+      return editor;
+    });
+    historyReady = loadRecentPrompts(ctx.cwd, ctx.sessionManager.getSessionDir(), MAX_MESSAGES)
       .then((items) => {
         if (generation !== loadGeneration) return;
+        scanPending = false;
         historyCache = items;
-        if (items.length === 0) return;
-
-        const prevComponentFactory = ctx.ui.getEditorComponent();
-        ctx.ui.setEditorComponent((tui, theme, keybindings) => {
-          const editor = prevComponentFactory?.(tui, theme, keybindings) ?? new CustomEditor(tui, theme, keybindings);
-
-          for (let i = items.length - 1; i >= 0; i--) {
-            editor.addToHistory?.(items[i]?.text);
-          }
-          return editor;
-        });
+        for (const editor of editors) populate(editor, items);
       })
-      .catch(() => undefined);
+      .catch(() => {
+        scanPending = false;
+      });
   });
 
   pi.on("session_tree", () => {
@@ -125,11 +177,12 @@ export default function (pi: ExtensionAPI) {
     loadGeneration++;
     retireShortcut();
     historyCache = [];
+    sessionEditors.clear();
     historyReady = Promise.resolve();
   });
 
-  // Ctrl+R: fuzzy history popup (fzf / atuin style)
-  pi.registerShortcut("ctrl+r", {
+  // Ctrl+Alt+R: fuzzy history popup; leave Ctrl+R available for Pi's session rename.
+  pi.registerShortcut(Key.ctrlAlt("r"), {
     description: "Fuzzy popup search through prompt history",
     handler: async (ctx) => {
       if (ctx.mode !== "tui" || !ctx.hasUI) return;
@@ -375,8 +428,13 @@ export class HistoryPopupComponent implements Component, Focusable {
       return;
     }
 
-    // Older: ↓ / Ctrl+N (next line) / Ctrl+R (press again to search further back)
-    if (matchesKey(data, Key.down) || matchesKey(data, Key.ctrl("n")) || matchesKey(data, Key.ctrl("r"))) {
+    // Older: ↓ / Ctrl+N / repeated Ctrl+Alt+R; Ctrl+R is a popup-only compatibility alias.
+    if (
+      matchesKey(data, Key.down) ||
+      matchesKey(data, Key.ctrl("n")) ||
+      matchesKey(data, Key.ctrlAlt("r")) ||
+      matchesKey(data, Key.ctrl("r"))
+    ) {
       this.moveDown();
       this.tui.requestRender();
       return;
@@ -617,9 +675,9 @@ export function mergeHistory(branchHistory: HistoryEntry[], cached: HistoryEntry
   return merged;
 }
 
-async function loadRecentPrompts(cwd: string, maxMessages: number): Promise<HistoryEntry[]> {
+async function loadRecentPrompts(cwd: string, sessionDir: string, maxMessages: number): Promise<HistoryEntry[]> {
   try {
-    const sessions = await SessionManager.list(cwd);
+    const sessions = await SessionManager.list(cwd, sessionDir);
     const sorted = sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
     const allMessages: HistoryEntry[] = [];
     const seen = new Set<string>();
@@ -644,7 +702,10 @@ async function loadRecentPrompts(cwd: string, maxMessages: number): Promise<Hist
 
 function extractUserMessages(sessionPath: string): HistoryEntry[] {
   try {
-    const entries = SessionManager.open(sessionPath).getEntries();
+    // Opening a persistent SessionManager repairs/migrates the file. History is
+    // inspection only: parse and migrate a private in-memory copy instead.
+    const entries = parseSessionEntries(readFileSync(sessionPath, "utf8"));
+    migrateSessionEntries(entries);
     const messages: HistoryEntry[] = [];
     for (const entry of entries) {
       if (entry.type !== "message" || entry.message.role !== "user") continue;

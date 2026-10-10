@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.6
+### Patch Changes
+
+- 3364cc0: Prevent diff and wrapped display rows from selecting unrelated source for comments. Diff mode now disables selection/comments with a hint; full-file selection uses an unwrapped source snapshot with matching displayed line numbers, comment ranges, and snippets.
+- 3364cc0: Adopt Pi 1.0.4's host-provided dependency contract: declare imported Pi and TypeBox modules as `*` peers rather than installing duplicate runtime modules, and align Pi development pins with the repository's tested 1.0.4 baseline. The wildcard identifies host module ownership; it does not promise compatibility with every Pi version.
+- 3364cc0: Preserve native descendant keyboard focus and custom overlay widths. Keep question frames and active controls within the terminal viewport, and distinguish RPC actions from duplicate or reserved option labels. Bound file-browser rows and dispose browser work and polling when interactions close or the session shuts down, without clearing badges on a vetoed session switch.
+
 ## 1.2.5
 ### Patch Changes
 

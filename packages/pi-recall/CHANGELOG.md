@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.3.3
+### Patch Changes
+
+- 3364cc0: Adopt Pi 1.0.4's host-provided dependency contract: declare imported Pi and TypeBox modules as `*` peers rather than installing duplicate runtime modules, and align Pi development pins with the repository's tested 1.0.4 baseline. The wildcard identifies host module ownership; it does not promise compatibility with every Pi version.
+- 3364cc0: Protect clipboard transcripts with private isolated temporary files, decode Kitty printable filter input, and confirm RPC draft replacement with cancellable session/branch ownership so retired confirmations cannot overwrite a replacement draft. Escape unsafe recalled quote controls without changing stored text. Bound LSP tool output with private full-output spills and preserve concurrent per-session status ownership.
+- Updated dependencies [3364cc0]
+- Updated dependencies [3364cc0]
+- Updated dependencies [3364cc0]
+  - @signalridge/pi-ui@1.3.3
+
 ## 1.3.2
 ### Patch Changes
 

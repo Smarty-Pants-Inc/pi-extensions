@@ -29,4 +29,4 @@
 "@signalridge/pi-worktree": minor
 ---
 
-Declare support for Pi 1.0.0 while retaining the previously supported Pi 0.84–0.87 and 0.99 peer ranges. Pin the development Pi packages to 1.0.0. Fullscreen side-thread regression coverage verifies terminal ownership and main-editor restoration when the host itself uses fullscreen mode.
+Retain Pi 1.x admission while adopting host-owned wildcard peers and the tested Pi 1.0.4 development baseline. Wildcard peers describe module ownership, not validation of every host version. Fullscreen side-thread regression coverage verifies terminal ownership and main-editor restoration when the host itself uses fullscreen mode.

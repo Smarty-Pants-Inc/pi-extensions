@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.6
+### Patch Changes
+
+- 3364cc0: Preserve pre-request route failures and finalized physical dispatch attribution in analytics, normalize skill read paths, and account for direct tool usage and dispatched thinking levels with a rebuilt usage cache and Pi's public agent-directory resolver. Capture sanitized terminal deferred assistant stamps and use finalized tool outcomes while retaining execution timings.
+- 3364cc0: Adopt Pi 1.0.4's host-provided dependency contract: declare imported Pi and TypeBox modules as `*` peers rather than installing duplicate runtime modules, and align Pi development pins with the repository's tested 1.0.4 baseline. The wildcard identifies host module ownership; it does not promise compatibility with every Pi version.
+
 ## 1.2.5
 ### Patch Changes
 

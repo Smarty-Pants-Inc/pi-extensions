@@ -1,10 +1,11 @@
-import { mkdirSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type ModelRuntime, resolveModelScopeWithDiagnostics } from "@earendil-works/pi-coding-agent";
+import { type ExtensionContext, type ModelRuntime, resolveModelScopeWithDiagnostics } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { type ModelRegistryRef, readEnabledModels, resolveEnabledModels } from "../src/enabled-models.js";
 import { checkModelScope, setScopeModelsEnabled } from "../src/model-scope.js";
+import { captureProjectTrust, childProjectTrust } from "../src/project-trust.js";
 
 /** Mock models matching typical registry shape. */
 const MODELS = [
@@ -48,6 +49,36 @@ describe("readEnabledModels", () => {
     mkdirSync(join(projectDir, ".pi"), { recursive: true });
     writeFileSync(projectFile(), JSON.stringify(obj));
   }
+
+  it.each([{ enabledModels: [] }, { enabledModels: ["google/gemma-4-31b-it"] }])("ignores denied project model overrides: %j", ({ enabledModels }) => {
+    writeFileSync(globalFile(), JSON.stringify({ enabledModels: ["anthropic/claude-sonnet-4-6"] }));
+    writeProject({ enabledModels });
+    const authority = captureProjectTrust({ cwd: projectDir, isProjectTrusted: () => false } as ExtensionContext);
+    const args = { model: MODELS[0], cwd: projectDir, authority, modelRegistry: makeRegistry(), callerSupplied: true, agentLabel: "worker" };
+    setScopeModelsEnabled(true);
+    try {
+      expect(checkModelScope(args).kind).toBe("error");
+      expect(checkModelScope({ ...args, callerSupplied: false }).kind).toBe("warn");
+      expect(checkModelScope({ ...args, authority: { ...authority, trusted: true, deniedRoots: [] } }).kind).toBe("ok");
+    } finally {
+      setScopeModelsEnabled(false);
+    }
+  });
+
+  it("excludes global model aliases under retained ancestor denials", () => {
+    writeProject({ enabledModels: [] });
+    symlinkSync(projectFile(), globalFile());
+    const parent = captureProjectTrust({ cwd: projectDir, isProjectTrusted: () => false } as ExtensionContext);
+    const authority = childProjectTrust(parent, agentDir);
+    expect(readEnabledModels(agentDir, authority)).toBeUndefined();
+  });
+
+  it("uses the authority's config root rather than execution cwd", () => {
+    writeFileSync(globalFile(), JSON.stringify({ enabledModels: ["google/gemma-4-31b-it"] }));
+    writeProject({ enabledModels: ["anthropic/claude-sonnet-4-6"] });
+    const authority = captureProjectTrust({ cwd: projectDir, isProjectTrusted: () => true } as ExtensionContext);
+    expect(readEnabledModels(agentDir, authority)).toEqual(["anthropic/claude-sonnet-4-6"]);
+  });
 
   it("returns undefined when both settings files are missing", () => {
     expect(readEnabledModels(projectDir)).toBeUndefined();

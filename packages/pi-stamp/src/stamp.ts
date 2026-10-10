@@ -85,7 +85,6 @@ interface ToolTimingObservation {
   toolName: string;
   startedAt: number;
   completedAt?: number;
-  outcome?: ToolStampOutcome;
 }
 
 export function formatStampTime(timestamp: number): string | undefined {
@@ -333,9 +332,9 @@ export default function stampExtension(pi: ExtensionAPI, options: StampExtension
     try {
       if (!tuiSessionActive || !settingsRuntime.get().settings.toolStamps) return;
       for (const result of toolResults) {
-        if (!isRecord(result) || typeof result.toolCallId !== "string") continue;
+        if (!isRecord(result) || typeof result.toolCallId !== "string" || typeof result.isError !== "boolean") continue;
         const timing = activeToolTimings.get(result.toolCallId);
-        if (!timing || timing.completedAt === undefined || timing.outcome === undefined) {
+        if (!timing || timing.completedAt === undefined) {
           continue;
         }
         activeToolTimings.delete(result.toolCallId);
@@ -346,7 +345,9 @@ export default function stampExtension(pi: ExtensionAPI, options: StampExtension
           toolName: timing.toolName,
           startedAt: timing.startedAt,
           completedAt: timing.completedAt,
-          outcome: timing.outcome,
+          // turn_end contains the finalized tool_result rewrite, unlike the
+          // provisional execution event. Timings still come from execution.
+          outcome: result.isError ? "error" : "success",
         };
         if (isToolStampData(stamp)) pi.appendEntry<ToolStampDataV1>(STAMP_ENTRY_TYPE, stamp);
       }
@@ -437,7 +438,6 @@ export default function stampExtension(pi: ExtensionAPI, options: StampExtension
       return;
     }
     timing.completedAt = completedAt;
-    timing.outcome = event.isError ? "error" : "success";
   });
 
   pi.on("message_start", (event) => {

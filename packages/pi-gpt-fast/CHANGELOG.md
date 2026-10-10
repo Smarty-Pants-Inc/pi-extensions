@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.7
+### Patch Changes
+
+- 3364cc0: Adopt Pi 1.0.4's host-provided dependency contract: declare imported Pi and TypeBox modules as `*` peers rather than installing duplicate runtime modules, and align Pi development pins with the repository's tested 1.0.4 baseline. The wildcard identifies host module ownership; it does not promise compatibility with every Pi version.
+- 3364cc0: Preserve large pasted drafts while prompt history loads, inspect historical sessions without rewriting them, and respect the active session directory. Merge fast-mode settings under Pi's settings lock, accept BOM-prefixed JSON, and leave malformed or unreadable settings untouched.
+
 ## 1.2.6
 ### Patch Changes
 

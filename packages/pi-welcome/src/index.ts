@@ -9,20 +9,19 @@
  * header, a key-hint block, and one `[Section]` per resource kind with a blank
  * line between each; stacking this card underneath produced two unrelated
  * designs and about forty-five lines of them. So the card carries the pieces
- * worth keeping — the key hints and a count of what loaded — and `quietStartup`
+ * worth keeping — the key hints and a live resource inventory — and `quietStartup`
  * is turned on in settings to silence the rest. With `quietStartup: false` Pi
  * still prints its own block and the two appear together again.
  *
  * The card is a custom entry, not a widget: it lands in the transcript, scrolls
- * away as the conversation grows, and survives a reload. Facts are captured at
- * session_start and stored in the entry, so a resumed session redraws the card
- * as it was when that session began.
+ * away as the conversation grows, and survives a reload. Workspace facts are
+ * captured at session_start and stored in the entry; inventory is collected at
+ * component creation, after Pi binds resources, including on resume.
  */
 
 import { execFileSync } from "node:child_process";
-import { readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, join } from "node:path";
+import { basename } from "node:path";
 
 import {
   type ExtensionAPI,
@@ -30,6 +29,7 @@ import {
   getAgentDir,
   keyText,
   loadProjectContextFiles,
+  SettingsManager,
   type Theme,
   VERSION,
 } from "@earendil-works/pi-coding-agent";
@@ -124,17 +124,17 @@ function gitSummary(cwd: string): string | undefined {
   return added || removed ? `${branch} [+${added} -${removed}]` : branch;
 }
 
-/**
- * `compaction.reserveTokens` from settings.json. ExtensionContext does not carry
- * settings, so this reads the same file pi does — the trigger point is worth the
- * one stat() because it, not the raw window, is what a long session runs into.
- */
-function readReserveTokens(): number | undefined {
+/** Resolve trusted, merged settings with Pi's own defaults and model validation. */
+function compactionTrigger(pi: ExtensionAPI, ctx: ExtensionContext): number | undefined {
   try {
-    const raw = readFileSync(join(getAgentDir(), "settings.json"), "utf8");
-    const value = JSON.parse(raw)?.compaction?.reserveTokens;
-    return typeof value === "number" ? value : undefined;
+    const settings = pi.getSettings?.();
+    if (!settings || !ctx.model) return undefined;
+    const compaction = SettingsManager.inMemory(settings).getCompactionSettings(ctx.model);
+    const trigger = ctx.model.contextWindow - compaction.reserveTokens;
+    return compaction.enabled && trigger > 0 ? trigger : undefined;
   } catch {
+    // An invalid configuration (or older host without settings) is not a known
+    // automatic trigger. Do not invent a budget from raw files or invalid values.
     return undefined;
   }
 }
@@ -199,52 +199,33 @@ export function collectHints(): string[] {
   }
 }
 
-/**
- * Extension names, as Pi's own `[Extensions]` section lists them.
- *
- * Read from the same two settings files Pi reads, plus the extension
- * directories it scans. Pi labels a package-sourced extension by its package
- * name and a file-sourced one by its path, so the scope and the `pi-` prefix
- * come off to leave the part that identifies it.
- */
-function collectExtensionNames(cwd: string): string[] {
-  const names: string[] = [];
-  for (const settingsFile of [join(getAgentDir(), "settings.json"), join(cwd, ".pi", "settings.json")]) {
-    try {
-      const packages = JSON.parse(readFileSync(settingsFile, "utf8"))?.packages;
-      if (!Array.isArray(packages)) continue;
-      for (const entry of packages) {
-        const source = typeof entry === "string" ? entry : entry?.source;
-        if (typeof source !== "string") continue;
-        const spec = source.replace(/^npm:/u, "");
-        // `@scope/pi-name@1.2.3` and `./local/path` both reduce to a bare name.
-        const bare = (spec.startsWith("@") ? (spec.split("/")[1] ?? spec) : basename(spec)).replace(/@.*$/u, "");
-        names.push(bare.replace(/^pi-/u, ""));
-      }
-    } catch {
-      // Discovery is best-effort: a malformed manifest contributes no names
-      // rather than blanking the whole card.
-    }
-  }
-  for (const directory of [join(getAgentDir(), "extensions"), join(cwd, ".pi", "extensions")]) {
-    try {
-      for (const entry of readdirSync(directory)) {
-        names.push(entry.replace(/\.[cm]?[jt]s$/u, "").replace(/^pi-/u, ""));
-      }
-    } catch {
-      // An extensions directory that does not exist is the normal case.
-    }
-  }
-  return tidy(names);
-}
-
-/** Custom theme names, as Pi's own `[Themes]` section lists them. */
-function collectThemeNames(): string[] {
+/** Configured packages are not proof of loaded extensions (skills-only is valid). */
+function collectPackageNames(pi: ExtensionAPI): string[] {
   try {
     return tidy(
-      readdirSync(join(getAgentDir(), "themes"))
-        .filter((entry) => entry.endsWith(".json"))
-        .map((entry) => entry.replace(/\.json$/u, "")),
+      (pi.getSettings?.().packages ?? [])
+        .filter((entry) => {
+          if (typeof entry === "string") return true;
+          // Respect packages explicitly filtered to no resources. A skills-only
+          // package still belongs here, even with extensions: [].
+          return (["extensions", "skills", "prompts", "themes"] as const).some((kind) => {
+            const patterns = entry[kind];
+            if (patterns === undefined) return entry.autoload !== false;
+            if (patterns.length === 0) return false;
+            // Default autoload starts with all resources when filters contain
+            // only exclusions; autoload:false starts empty and needs an include.
+            return (
+              entry.autoload !== false ||
+              patterns.some((pattern) => !pattern.startsWith("!") && !pattern.startsWith("-"))
+            );
+          });
+        })
+        .map((entry) => {
+          const source = typeof entry === "string" ? entry : entry.source;
+          const spec = source.replace(/^npm:/u, "");
+          const bare = (spec.startsWith("@") ? (spec.split("/")[1] ?? spec) : basename(spec)).replace(/@.*$/u, "");
+          return bare.replace(/^pi-/u, "");
+        }),
     );
   } catch {
     return [];
@@ -252,8 +233,8 @@ function collectThemeNames(): string[] {
 }
 
 /**
- * What pi loaded for this session, by name — the inventory its own
- * `[Context]`/`[Skills]`/`[Prompts]`/`[Themes]`/`[Extensions]` sections print.
+ * Live registered skills/prompts/tools, available themes, selected context
+ * filenames, and configured packages. Not a claim that every package loaded.
  *
  * With `quietStartup` on those sections are gone and nothing brings them back
  * (`/reload` re-runs the same suppressed listing), so this card is the only
@@ -265,7 +246,7 @@ function collectThemeNames(): string[] {
  * — it reports zero on a session showing dozens. `getCommands()` reports what
  * Pi actually registered, which is the honest answer to "what loaded".
  */
-export function collectResources(pi: ExtensionAPI, cwd: string): [string, string][] {
+export function collectResources(pi: ExtensionAPI, cwd: string, ui?: ExtensionContext["ui"]): [string, string][] {
   const rows: [string, string][] = [];
   const push = (label: string, value: string | undefined) => {
     if (value) rows.push([label, value]);
@@ -283,15 +264,23 @@ export function collectResources(pi: ExtensionAPI, cwd: string): [string, string
   try {
     const commands = pi.getCommands?.() ?? [];
     const named = (source: string, prefix = "") =>
-      tidy(commands.filter((command) => command.source === source).map((command) => `${prefix}${command.name}`));
+      tidy(
+        commands
+          .filter((command) => command.source === source)
+          .map((command) => `${prefix}${source === "skill" ? command.name.replace(/^skill:/u, "") : command.name}`),
+      );
     push("Skills", nameList(named("skill")));
     push("Prompts", nameList(named("prompt", "/")));
   } catch {
     // A host without these accessors simply contributes no rows.
   }
 
-  push("Extensions", nameList(collectExtensionNames(cwd)));
-  push("Themes", nameList(collectThemeNames()));
+  push("Configured packages", nameList(collectPackageNames(pi)));
+  try {
+    push("Available themes", nameList(tidy((ui?.getAllThemes() ?? []).map((theme) => theme.name))));
+  } catch {
+    // Themes are a TUI surface; an older host may not provide it.
+  }
 
   try {
     const all = pi.getAllTools?.() ?? [];
@@ -336,19 +325,11 @@ function collect(pi: ExtensionAPI, ctx: ExtensionContext): WelcomeData {
     if (typeof window === "number" && window > 0) {
       // Pi compacts at contextWindow - reserveTokens; surfacing the trigger up
       // front is the one number that actually governs a long session.
-      const reserve = readReserveTokens();
-      const trigger =
-        typeof reserve === "number" && reserve > 0 && reserve < window
-          ? ` · compacts at ${formatTokens(window - reserve)}`
-          : "";
+      const threshold = compactionTrigger(pi, ctx);
+      const trigger = threshold !== undefined ? ` · compacts at ${formatTokens(threshold)}` : "";
       push("Budget", `${formatTokens(window)}${trigger}`);
     }
   }
-
-  // GAP is the sentinel for a blank row: session facts above, what pi loaded
-  // below, so the card reads as two groups rather than one wall.
-  const resources = collectResources(pi, ctx.cwd);
-  if (resources.length > 0) rows.push(GAP, ...resources);
 
   const hints = collectHints();
   return hints.length > 0 ? { rows, hints } : { rows };
@@ -494,31 +475,52 @@ export class WelcomeCard implements Component {
 
 // ─── Extension Entry ───────────────────────────────────────────────────────────
 
+const INVENTORY_LABELS = new Set([
+  "Inventory",
+  "Context",
+  "Skills",
+  "Prompts",
+  "Extensions",
+  "Themes",
+  "Tools",
+  "Configured packages",
+  "Available themes",
+]);
+
+function withLiveInventory(data: WelcomeData, pi: ExtensionAPI, ctx: ExtensionContext): WelcomeData {
+  // Remove legacy persisted inventory too, while preserving original workspace
+  // facts on resume. Do not rewrite the stored entry during rendering.
+  const rows = data.rows.filter(([label]) => label !== "" && !INVENTORY_LABELS.has(label));
+  const resources = collectResources(pi, ctx.cwd, ctx.ui);
+  if (resources.length > 0) rows.push(GAP, ["Inventory", "live at render"], ...resources);
+  return { ...data, rows };
+}
+
 export default function (pi: ExtensionAPI) {
+  let currentContext: ExtensionContext | undefined;
   pi.registerEntryRenderer<WelcomeData>(ENTRY_TYPE, (entry, _options, theme) => {
     const data = entry.data;
     if (!data?.rows?.length) return undefined;
-    return new WelcomeCard(data, theme);
+    return new WelcomeCard(currentContext ? withLiveInventory(data, pi, currentContext) : data, theme);
   });
 
   pi.on("session_start", async (_event, ctx) => {
-    if (ctx.mode !== "tui") return;
-
-    // A resumed session already carries its card; appending on every
-    // session_start would stack a fresh one on top at each reload.
-    try {
-      for (const entry of ctx.sessionManager.getEntries()) {
-        if (entry.type === "custom" && entry.customType === ENTRY_TYPE) {
-          return;
-        }
-      }
-    } catch {
-      // Unreadable entries mean we cannot prove the card was already written.
-      // Falling through re-appends it, which beats never showing it at all.
-    }
+    currentContext = ctx.mode === "tui" ? ctx : undefined;
+    if (!currentContext) return;
 
     try {
-      pi.appendEntry<WelcomeData>(ENTRY_TYPE, collect(pi, ctx));
+      // The transcript uses the active, compaction-aware projection, not every
+      // entry in the file. An off-branch or summarized card is not visible.
+      const visible = ctx.sessionManager.buildContextEntries();
+      if (visible.some((entry) => entry.type === "custom" && entry.customType === ENTRY_TYPE)) return;
+
+      // Restore facts from this branch if compaction summarized its card. Never
+      // borrow facts from an abandoned sibling branch.
+      const original = ctx.sessionManager
+        .getBranch()
+        .find((entry) => entry.type === "custom" && entry.customType === ENTRY_TYPE);
+      const data = original?.type === "custom" ? (original.data as WelcomeData | undefined) : undefined;
+      pi.appendEntry<WelcomeData>(ENTRY_TYPE, data?.rows?.length ? data : collect(pi, ctx));
     } catch {
       // A missing card is not worth failing a session start over.
     }

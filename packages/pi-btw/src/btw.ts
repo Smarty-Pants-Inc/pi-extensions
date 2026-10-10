@@ -267,8 +267,11 @@ export default function btw(pi: ExtensionAPI, dependencies: BtwExtensionDependen
   let sessionGeneration = 0;
   let closeActiveMenu: (() => void) | undefined;
   const closeActiveFullscreens = new Set<() => void>();
+  const closeActiveLoaders = new Set<() => void>();
   const closeMenuBeforeBoundary = (ctx: { sessionManager: ExtensionCommandContext["sessionManager"] }) => {
-    if (activeSessionManager === ctx.sessionManager) closeActiveMenu?.();
+    if (activeSessionManager !== ctx.sessionManager) return;
+    closeActiveMenu?.();
+    for (const close of closeActiveLoaders) close();
   };
   const closeFullscreenOnCommit = (ctx: { sessionManager: ExtensionCommandContext["sessionManager"] }) => {
     if (activeSessionManager !== ctx.sessionManager) return;
@@ -342,8 +345,8 @@ export default function btw(pi: ExtensionAPI, dependencies: BtwExtensionDependen
         activeSessionManager === commandSessionManager &&
         commandSessionManager.getSessionId?.() === commandSessionId;
 
-      // Menus and credential loaders both use Pi's editor-replacing custom UI.
-      // Close them before a navigation can populate the destination editor.
+      // Menus use Pi's editor-replacing custom UI. Credential loaders have
+      // separate owners so concurrent commands cannot displace their closers.
       const registerClose = (close: () => void) => {
         if (!ownsCommandSession()) close();
         else closeActiveMenu = close;
@@ -381,7 +384,12 @@ export default function btw(pi: ExtensionAPI, dependencies: BtwExtensionDependen
       try {
         const settings = await loadSettings(ctx);
         if (!ownsCommandSession()) return;
-        const resolution = await resolveModel(settings, ctx, ownsCommandSession, registerClose);
+        const registerLoaderClose = (close: () => void) => {
+          if (!ownsCommandSession()) close();
+          else closeActiveLoaders.add(close);
+          return () => closeActiveLoaders.delete(close);
+        };
+        const resolution = await resolveModel(settings, ctx, ownsCommandSession, registerLoaderClose);
         if (!ownsCommandSession()) return;
         if (resolution.kind === "cancelled") {
           notifySafely(ctx, "Cancelled", "info");
@@ -493,49 +501,74 @@ async function resolveBtwModelWithLoader(
   isSessionCurrent: () => boolean = () => true,
   registerClose?: (close: () => void) => () => void,
 ): Promise<ModelResolutionOutcome> {
-  if (!isSessionCurrent()) return { kind: "cancelled" };
-  return wrapCustomUi(ctx.ui).custom<ModelResolutionOutcome>((tui, theme, _keybindings, done) => {
-    const loader = new BorderedLoader(tui, theme, "Resolving /btw model credentials...");
-    let settled = false;
-    let unregisterClose: (() => void) | undefined;
-    const finish = (outcome: ModelResolutionOutcome) => {
-      if (settled) return;
-      settled = true;
-      unregisterClose?.();
-      const liveEditorText = isSessionCurrent() ? ctx.ui.getEditorText() : undefined;
-      done(outcome);
-      // Pi synchronously restores its opening draft in done(). Restore the live
-      // draft now, not in a later continuation that may follow navigation.
-      if (liveEditorText !== undefined && isSessionCurrent()) ctx.ui.setEditorText(liveEditorText);
-    };
-    const close = () => finish({ kind: "cancelled" });
-    loader.onAbort = close;
-    unregisterClose = registerClose?.(close);
-    if (settled) {
-      unregisterClose?.();
-      loader.dispose();
-      return loader;
+  let settled = false;
+  let complete: ((result: ModelResolutionOutcome) => void) | undefined;
+  let disposeLoader: (() => void) | undefined;
+  const finish = (result: ModelResolutionOutcome) => {
+    if (settled) return;
+    settled = true;
+    try {
+      disposeLoader?.();
+    } finally {
+      complete?.(result);
     }
+  };
+  const cancel = () => finish({ kind: "cancelled" });
+  // Register before opening: lifecycle cancellation must run before navigation
+  // takes ownership of the destination editor.
+  const unregister = registerClose?.(cancel);
+  try {
+    if (settled || !isSessionCurrent()) return { kind: "cancelled" };
+    return await wrapCustomUi(ctx.ui).custom<ModelResolutionOutcome>((tui, theme, _keybindings, done) => {
+      complete = (result) => {
+        const liveEditorText = isSessionCurrent() ? ctx.ui.getEditorText() : undefined;
+        done(result);
+        // Pi restores its opening draft synchronously. Restore the live draft
+        // before a continuation or navigation can capture the stale snapshot.
+        if (liveEditorText !== undefined && isSessionCurrent()) ctx.ui.setEditorText(liveEditorText);
+      };
+      const loader = new BorderedLoader(tui, theme, "Resolving /btw model credentials...");
+      // Own cleanup even when done() runs before the host mounts the component.
+      const rawDispose = loader.dispose.bind(loader);
+      let disposed = false;
+      disposeLoader = loader.dispose = () => {
+        if (disposed) return;
+        disposed = true;
+        rawDispose();
+      };
+      loader.onAbort = cancel;
+      if (settled || !isSessionCurrent()) {
+        disposeLoader();
+        if (settled) done({ kind: "cancelled" });
+        else cancel();
+        return loader;
+      }
 
-    resolveBtwModel({
-      settings,
-      currentModel: ctx.model,
-      modelRegistry: ctx.modelRegistry,
-      warn: (message) => {
-        if (!settled) notifySafely(ctx, message, "warning");
-      },
-    })
-      .then((selected) => {
-        if (settled || !isSessionCurrent()) return;
-        finish(selected ? { kind: "selected", selected } : { kind: "unavailable" });
+      resolveBtwModel({
+        settings,
+        currentModel: ctx.model,
+        modelRegistry: ctx.modelRegistry,
+        warn: (message) => {
+          if (!settled && isSessionCurrent()) notifySafely(ctx, message, "warning");
+        },
       })
-      .catch(() => {
-        if (settled || !isSessionCurrent()) return;
-        finish({ kind: "unavailable" });
-      });
+        .then((selected) => {
+          if (settled) return;
+          finish(isSessionCurrent() && selected ? { kind: "selected", selected } : { kind: "unavailable" });
+        })
+        .catch(() => finish({ kind: "unavailable" }));
 
-    return loader;
-  });
+      return loader;
+    });
+  } finally {
+    settled = true;
+    complete = undefined;
+    try {
+      disposeLoader?.();
+    } finally {
+      unregister?.();
+    }
+  }
 }
 
 interface RunBtwThreadDependencies {

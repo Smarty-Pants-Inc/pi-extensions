@@ -33,8 +33,8 @@ export interface SettingsFileOperations {
 export interface WorktreeSettingsRuntime {
   get(): Readonly<WorktreeSettingsState>;
   getPath(): string;
-  reload(): Promise<Readonly<WorktreeSettingsState>>;
-  save(configuredRoot: string | undefined): Promise<Readonly<WorktreeSettingsState>>;
+  reload(signal?: AbortSignal): Promise<Readonly<WorktreeSettingsState>>;
+  save(configuredRoot: string | undefined, signal?: AbortSignal): Promise<Readonly<WorktreeSettingsState>>;
   flush?(): Promise<void>;
 }
 
@@ -153,18 +153,22 @@ export async function saveWorktreeSettings(
   configuredRoot: string | undefined,
   path = settingsFilePath(),
   operations: Partial<SettingsFileOperations> = {},
+  signal?: AbortSignal,
 ): Promise<Record<string, unknown>> {
+  signal?.throwIfAborted();
   const nextDocument = { ...document };
   if (configuredRoot === undefined) delete nextDocument.worktreeRoot;
   else nextDocument.worktreeRoot = configuredRoot;
 
   await mkdir(dirname(path), { recursive: true });
+  signal?.throwIfAborted();
   const temporaryPath = temporaryFilePath(path);
   try {
     await (operations.write ?? DEFAULT_FILE_OPERATIONS.write)(
       temporaryPath,
       `${JSON.stringify(nextDocument, null, 2)}\n`,
     );
+    signal?.throwIfAborted();
     await (operations.rename ?? DEFAULT_FILE_OPERATIONS.rename)(temporaryPath, path);
     return nextDocument;
   } catch (error) {
@@ -202,9 +206,11 @@ export function createWorktreeSettingsRuntime(options: RuntimeOptions = {}): Wor
     async flush() {
       await operationQueue;
     },
-    reload() {
+    reload(signal) {
       return enqueue(async () => {
+        signal?.throwIfAborted();
         const loaded = await loadWorktreeSettings(getPath(), home, platform);
+        signal?.throwIfAborted();
         if (loaded.kind === "invalid") {
           state = { ...state, warning: loaded.warning, canSave: false };
           return Object.freeze({ ...state });
@@ -213,8 +219,9 @@ export function createWorktreeSettingsRuntime(options: RuntimeOptions = {}): Wor
         return Object.freeze({ ...state });
       });
     },
-    save(configuredRoot) {
+    save(configuredRoot, signal) {
       return enqueue(async () => {
+        signal?.throwIfAborted();
         if (!state.canSave) {
           throw new Error(`Fix the pi-worktree settings file at ${getPath()} before changing it.`);
         }
@@ -223,11 +230,14 @@ export function createWorktreeSettingsRuntime(options: RuntimeOptions = {}): Wor
             ? defaultWorktreeRoot(home, platform)
             : resolveWorktreeRoot(configuredRoot, home, platform);
         const latest = await loadWorktreeSettings(getPath(), home, platform);
+        signal?.throwIfAborted();
         if (latest.kind === "invalid") {
           state = { ...state, warning: latest.warning, canSave: false };
           throw new Error(`Fix the pi-worktree settings file at ${getPath()} before changing it.`);
         }
-        await saveWorktreeSettings(latest.document ?? {}, configuredRoot, getPath(), options.operations);
+        await saveWorktreeSettings(latest.document ?? {}, configuredRoot, getPath(), options.operations, signal);
+        // Successful atomic publication commits the save, even if its UI owner
+        // retired while rename was pending. Keep same-session consumers in sync.
         state = {
           effectiveRoot,
           source: configuredRoot === undefined ? "default" : "user",

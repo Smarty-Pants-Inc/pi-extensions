@@ -302,7 +302,12 @@ function compactPrState(value: string): string | undefined {
 
 function isSubscriptionBacked(ctx: ExtensionContext): boolean {
   const model = ctx.model;
-  return model !== undefined && (model.provider === "kimi-coding" || ctx.modelRegistry.isUsingOAuth(model));
+  if (!model) return false;
+  if (model.provider === "kimi-coding") return true;
+  return (
+    ctx.modelRegistry.isUsingOAuth(model) &&
+    ctx.modelRegistry.getProvider(model.provider)?.auth?.oauth?.isSubscription === true
+  );
 }
 
 export function formatCount(value: number): string {

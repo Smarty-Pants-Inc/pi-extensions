@@ -106,7 +106,7 @@ describe("agent-runner end-to-end (real pi-mono session + real extension)", () =
         hasConfiguredAuth: () => true,
       },
     };
-    const ctx: any = { cwd, getSystemPrompt: () => "PARENT", model, modelRegistry };
+    const ctx: any = { cwd, isProjectTrusted: () => true, getSystemPrompt: () => "PARENT", model, modelRegistry };
 
     let active: string[] = [];
     try {

@@ -8,6 +8,7 @@
  */
 
 import { isModelInScope, type ModelRegistryRef, readEnabledModels, resolveEnabledModels } from "./enabled-models.js";
+import type { ProjectTrust } from "./project-trust.js";
 
 /**
  * When enabled, subagent model choices are validated against `enabledModels`
@@ -41,6 +42,8 @@ export type ModelScopeVerdict =
 export function checkModelScope(args: {
   model: { provider: string; id: string } | undefined;
   cwd: string;
+  /** Captured config root/trust and retained ancestor denials; omit only for standalone helpers. */
+  authority?: ProjectTrust;
   modelRegistry: ModelRegistryRef;
   /** True when the model came from the tool call rather than frontmatter. */
   callerSupplied: boolean;
@@ -52,7 +55,7 @@ export function checkModelScope(args: {
   const { model, cwd, modelRegistry, callerSupplied, agentLabel, modelInput } = args;
   if (!scopeModelsEnabled || !model) return { kind: "ok" };
 
-  const allowed = resolveEnabledModels(readEnabledModels(cwd), modelRegistry, cwd);
+  const allowed = resolveEnabledModels(readEnabledModels(cwd, args.authority), modelRegistry, cwd);
   if (!allowed || isModelInScope(model, allowed)) return { kind: "ok" };
 
   // A tier whose profile says `inherit` names no model of its own, so fall back

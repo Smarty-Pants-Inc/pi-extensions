@@ -15,13 +15,17 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { pathToFileURL } from "node:url";
 
 import { transformMessages } from "@earendil-works/pi-ai/api/transform-messages";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { getAgentDir as getPiAgentDir, SessionManager } from "@earendil-works/pi-coding-agent";
 
 import {
   type CachedFileState,
   collectUsageData,
+  getAgentDir,
+  getDefaultCachePath,
+  getSessionsDir,
   loadUsageCache,
   parseSessionBuffer,
   projectLabelFromCwd,
@@ -44,6 +48,29 @@ function fixture(t) {
   mkdirSync(sessionsDir, { recursive: true });
   return { root, sessionsDir, cachePath: join(root, "cache.json") };
 }
+
+test("agent directory and derived paths match the public Pi API", (t) => {
+  const original = process.env.PI_CODING_AGENT_DIR;
+  t.after(() => {
+    if (original === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = original;
+  });
+  for (const directory of [
+    undefined,
+    "",
+    "~/usage-parity",
+    pathToFileURL(join(tmpdir(), "usage parity")).href,
+    join(tmpdir(), "absolute"),
+  ]) {
+    if (directory === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = directory;
+    const expected = getPiAgentDir();
+    assert.equal(getAgentDir(), expected);
+    assert.equal(getSessionsDir(), join(expected, "sessions"));
+    assert.equal(getDefaultCachePath(), join(expected, "usage-extension-cache.json"));
+  }
+  assert.equal(getAgentDir, getPiAgentDir, "settings/export and accounting share Pi's public resolver");
+});
 
 function sessionLine(id, ts, cwd = "/tmp", parentSession?: string) {
   return JSON.stringify({
@@ -108,6 +135,131 @@ function toolResultLine({ id = "tool1", parentId = null, ts, ...usageValues }) {
     },
   });
 }
+
+test("direct tool usage before trailing nestedCalls survives cold/warm accounting and a v11 rebuild", async (t) => {
+  const { sessionsDir, cachePath } = fixture(t);
+  const filePath = join(sessionsDir, "nested-calls.jsonl");
+  const tool = (id: string, size: number, reported: boolean) => {
+    const entry = JSON.parse(toolResultLine({ id, ts: TS_TODAY, cost: 2, input: 20, output: 4 }));
+    entry.message.content = [{ type: "text", text: "x".repeat(size), usage: usage({ cost: 998 }) }];
+    if (!reported) delete entry.message.usage;
+    entry.message.nestedCalls = [{ args: { trailing: "x".repeat(5 * 1024), usage: usage({ cost: 999 }) } }];
+    return JSON.stringify(entry);
+  };
+  writeFileSync(
+    filePath,
+    [
+      sessionLine("nested-calls", TS_TODAY),
+      tool("small", 0, true),
+      tool("large", 70 * 1024, true),
+      tool("fake-small", 0, false),
+      tool("fake", 70 * 1024, false),
+    ].join("\n"),
+  );
+  const parsed = await parseSessionBuffer(Buffer.from(readFileSync(filePath)));
+  assert.deepEqual(
+    parsed.toolUsages.map((record) => [record.sourceId, record.reportedUsage?.cost]),
+    [
+      ["small", 2],
+      ["large", 2],
+    ],
+  );
+  for (let pass = 0; pass < 2; pass++) {
+    const progress = [];
+    const data = await collectUsageData({ sessionsDir, cachePath, now: NOW, onProgress: (p) => progress.push(p) });
+    assert.equal(data.allTime.totals.cost, 4);
+    assert.equal(data.allTime.totals.tokens.input, 40);
+    assert.equal(data.allTime.totals.tokens.output, 8);
+    assert.equal(data.allTime.totals.messages, 0);
+    assert.equal(progress[0].filesToParse, pass === 0 ? 1 : 0);
+  }
+  const old = JSON.parse(readFileSync(cachePath, "utf8"));
+  old.version = 11;
+  old.files[filePath].toolUsages = [];
+  writeFileSync(cachePath, JSON.stringify(old));
+  const progress = [];
+  const rebuilt = await collectUsageData({ sessionsDir, cachePath, now: NOW, onProgress: (p) => progress.push(p) });
+  assert.equal(rebuilt.allTime.totals.cost, 4);
+  assert.equal(progress[0].mode, "rebuild");
+  assert.equal(progress[0].filesToParse, 1, "unchanged files must reparse");
+});
+
+test("large tool accounting does not decode content or nested-call args", async () => {
+  const entry = JSON.parse(toolResultLine({ ts: TS_TODAY, cost: 2 }));
+  entry.message.content = [{ type: "text", text: "x".repeat(2 * 1024 * 1024) }];
+  entry.message.nestedCalls = [{ args: { text: "x".repeat(5 * 1024), usage: usage({ cost: 999 }) } }];
+  const line = JSON.stringify(entry);
+  const buffer = Buffer.from([sessionLine("allocation-budget", TS_TODAY), line, line.replace(/":/g, '": ')].join("\n"));
+  const original = Buffer.prototype.toString;
+  let decodedBytes = 0;
+  let largestDecode = 0;
+  Buffer.prototype.toString = function (encoding, start = 0, end = this.length) {
+    const length = end - start;
+    decodedBytes += length;
+    largestDecode = Math.max(largestDecode, length);
+    return original.call(this, encoding, start, end);
+  };
+  try {
+    const parsed = await parseSessionBuffer(buffer);
+    assert.deepEqual(
+      parsed.toolUsages.map((record) => record.reportedUsage?.cost),
+      [2, 2],
+    );
+  } finally {
+    Buffer.prototype.toString = original;
+  }
+  assert.ok(largestDecode < 4096, `largest decoded range: ${largestDecode}`);
+  assert.ok(decodedBytes < 8192, `total decoded bytes: ${decodedBytes}`);
+});
+
+test("dispatch thinking levels override selection per response without changing branch selection", async (t) => {
+  const { sessionsDir, cachePath } = fixture(t);
+  const filePath = join(sessionsDir, "dispatch.jsonl");
+  const response = (id: string, parentId: string | null, level?: unknown) => {
+    const entry = JSON.parse(assistantLine({ id, parentId, ts: TS_TODAY + Number(id.slice(1)) * 1000 }));
+    if (level !== undefined) entry.message.thinkingLevel = level;
+    return JSON.stringify(entry);
+  };
+  const lines = [
+    sessionLine("dispatch", TS_TODAY),
+    JSON.stringify({ type: "thinking_level_change", id: "selected", parentId: null, thinkingLevel: "low" }),
+    response("a1", "selected", "high"),
+    response("a2", "a1", "medium"),
+    response("a3", "a2"),
+    response("a4", "a3", "invalid"),
+    response("a5", null, "off"),
+    response("a6", "a5"),
+  ];
+  const legacy = JSON.parse(response("a7", null, "high"));
+  delete legacy.parentId;
+  const legacyFallback = JSON.parse(response("a8", null));
+  delete legacyFallback.parentId;
+  lines.push(thinkingLine("low", TS_TODAY), JSON.stringify(legacy), JSON.stringify(legacyFallback));
+  writeFileSync(filePath, lines.join("\n"));
+  const expected = ["high", "medium", "low", "low", "off", "", "high", "low"];
+  const parsed = await parseSessionBuffer(Buffer.from(lines.join("\n")));
+  assert.deepEqual(
+    parsed.messages.map((message) => message.thinkingLevel),
+    expected,
+  );
+  for (let pass = 0; pass < 2; pass++) {
+    await collectUsageData({ sessionsDir, cachePath, now: NOW });
+    assert.deepEqual(
+      (await loadUsageCache(cachePath)).get(filePath)?.parsed.messages.map((message) => message.thinkingLevel),
+      expected,
+    );
+  }
+  const old = JSON.parse(readFileSync(cachePath, "utf8"));
+  old.version = 11;
+  writeFileSync(cachePath, JSON.stringify(old));
+  const progress = [];
+  await collectUsageData({ sessionsDir, cachePath, now: NOW, onProgress: (p) => progress.push(p) });
+  assert.equal(progress[0].filesToParse, 1);
+  assert.deepEqual(
+    (await loadUsageCache(cachePath)).get(filePath)?.parsed.messages.map((message) => message.thinkingLevel),
+    expected,
+  );
+});
 
 function childUsage(values = {}) {
   const persisted = usage(values);
@@ -1153,7 +1305,7 @@ test("collectUsageData returns null when aborted", async (t) => {
 test("collectUsageData forwards cancellation into the initial cache decode", async (t) => {
   const { sessionsDir, cachePath } = fixture(t);
   const prior = JSON.stringify({
-    version: 11,
+    version: 12,
     names: ["provider", "model", "thinking", "source"],
     files: {
       [join(sessionsDir, "cached.jsonl")]: {
@@ -1233,7 +1385,7 @@ test("collectUsageData skips partial cache writes on cancellation even with a fr
   }
   // The initial load happens before cancellation; the old partial-save path
   // unnecessarily re-read and serialized this large cache after cancellation.
-  const prior = JSON.stringify({ version: 11, names: [], files: {}, padding: "x".repeat(22 * 1024 * 1024) });
+  const prior = JSON.stringify({ version: 12, names: [], files: {}, padding: "x".repeat(22 * 1024 * 1024) });
   writeFileSync(cachePath, prior);
   const controller = new AbortController();
   let cancelledAt = 0;
@@ -1358,7 +1510,7 @@ test("collectUsageData survives a corrupt cache file", async (t) => {
 
   // Cache was rebuilt.
   const cacheJson = JSON.parse(readFileSync(cachePath, "utf8"));
-  assert.equal(cacheJson.version, 11);
+  assert.equal(cacheJson.version, 12);
 });
 
 test("collectUsageData works with the cache disabled", async (t) => {
@@ -1626,7 +1778,7 @@ test("abort after cache lock acquisition removes the temporary file and leaves p
 
 test("abort during locked cache read releases lock without a late write", async (t) => {
   const { root, cachePath } = fixture(t);
-  const prior = JSON.stringify({ version: 11, names: [], files: {}, padding: "x".repeat(22 * 1024 * 1024) });
+  const prior = JSON.stringify({ version: 12, names: [], files: {}, padding: "x".repeat(22 * 1024 * 1024) });
   writeFileSync(cachePath, prior);
   const controller = new AbortController();
   const check = controller.signal.throwIfAborted.bind(controller.signal);
@@ -1656,7 +1808,7 @@ test("abort during cache tuple decoding releases the lock", async (t) => {
   const filePath = join(root, "source.jsonl");
   const tuple = [0, 1, 1, 2, 3, 4, 5, 6, 2, 0, 0, 0, 3, 0, 0, -1, 0, -1];
   const prior = JSON.stringify({
-    version: 11,
+    version: 12,
     names: ["provider", "model", "thinking", "source"],
     files: {
       [filePath]: {
@@ -1756,7 +1908,7 @@ test("a matching v7 cache rebuilds to ingest previously omitted standalone usage
   assert.equal(progress[0].filesToParse, 1);
   assert.equal(data.today.totals.cost, 3);
   assert.equal(data.today.totals.messages, 1);
-  assert.equal(JSON.parse(readFileSync(cachePath, "utf8")).version, 11);
+  assert.equal(JSON.parse(readFileSync(cachePath, "utf8")).version, 12);
   assert.equal((await loadUsageCache(cachePath)).get(filePath)?.parsed.messages[1].source, "usage");
 });
 
@@ -1799,7 +1951,7 @@ test("a matching v9 cache rebuilds branch-aware TTL metadata", async (t) => {
   const data = await collectUsageData({ sessionsDir, cachePath, now: NOW, onProgress: (p) => progress.push(p) });
   assert.equal(progress[0].mode, "rebuild");
   assert.equal(progress[0].filesToParse, 1);
-  assert.equal(JSON.parse(readFileSync(cachePath, "utf8")).version, 11);
+  assert.equal(JSON.parse(readFileSync(cachePath, "utf8")).version, 12);
   assert.equal(findInsight(data, "today", /resuming conversations after a break/).stat, "$5.00");
   assert.equal((await loadUsageCache(cachePath)).get(filePath)?.parsed.messages.at(-1)?.previousAssistantId, "first");
 });
@@ -1846,7 +1998,7 @@ test("a matching v10 cache rebuilds concrete-model and zero-warm timing metadata
   assert.equal(progress[0].filesToParse, 1);
   assert.equal(data.today.totals.cost, 6);
   assert.equal(findInsight(data, "today", /re-sending conversations mid-session/).stat, "$5.00");
-  assert.equal(JSON.parse(readFileSync(cachePath, "utf8")).version, 11);
+  assert.equal(JSON.parse(readFileSync(cachePath, "utf8")).version, 12);
   const messages = (await loadUsageCache(cachePath)).get(filePath)?.parsed.messages;
   assert.equal(messages?.[1].responseModel, concrete);
   assert.equal(messages?.[1].branchWarmAt, TS_TODAY + 4.5 * 60_000);
@@ -1923,10 +2075,14 @@ test("loadUsageCache rejects wrong versions and malformed entries", async (t) =>
   writeFileSync(cachePath, JSON.stringify({ version: 10, names: [], files: {} }));
   assert.equal((await loadUsageCache(cachePath)).size, 0);
 
+  // v11 can miss dispatched thinking levels and usage before nestedCalls.
+  writeFileSync(cachePath, JSON.stringify({ version: 11, names: [], files: {} }));
+  assert.equal((await loadUsageCache(cachePath)).size, 0);
+
   writeFileSync(
     cachePath,
     JSON.stringify({
-      version: 11,
+      version: 12,
       names: ["p", "m", "high", "entry-a"],
       files: {
         "/ok.jsonl": {

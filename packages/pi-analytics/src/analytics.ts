@@ -44,6 +44,17 @@ export function createAnalyticsExtension(
     let sessionController = new AbortController();
     let collector = new ResponseCollector();
     let skillTracker: SkillTracker | undefined;
+    let dispatchedModel: ModelIdentity | undefined;
+    let assistant:
+      | {
+          startedAtMs: number;
+          streaming: boolean;
+          request?: { id: string; now: number; responses: Array<{ status: number; now: number }> };
+        }
+      | undefined;
+    // Warming replays untagged hooks, with no public completion/ownership ID.
+    // Warming or reload makes ownership unknown until a non-reload session start.
+    let ambiguousProviderHooks = false;
     let store: AnalyticsStorePort | undefined;
     let storageFailure: string | undefined;
     const retiredCloseTasks = new Set<Promise<boolean>>();
@@ -74,7 +85,7 @@ export function createAnalyticsExtension(
       },
     });
 
-    pi.on("session_start", (_event, ctx) => {
+    pi.on("session_start", (event, ctx) => {
       ++sessionGeneration;
       if (ctx.hasUI) ctx.ui.notify(EXPERIMENTAL_WARNING, "warning");
       const previousStore = store;
@@ -82,6 +93,10 @@ export function createAnalyticsExtension(
       if (previousStore) retire(previousStore);
       sessionController = new AbortController();
       collector = new ResponseCollector();
+      dispatchedModel = undefined;
+      assistant = undefined;
+      // Reload retains old warm callbacks that can reach this fresh factory.
+      ambiguousProviderHooks = event.reason === "reload";
       skillTracker = deps.createSkillTracker(ctx.cwd);
       store = undefined;
       storageFailure = undefined;
@@ -124,6 +139,8 @@ export function createAnalyticsExtension(
         return;
       }
       const explicit = tracker.consumeExplicitSkill();
+      dispatchedModel = undefined;
+      assistant = undefined;
       const interrupted = activeCollector.begin({
         id: deps.createId(),
         now: deps.now(),
@@ -152,27 +169,55 @@ export function createAnalyticsExtension(
       else pendingAttemptWithoutRun = true;
     });
 
-    pi.on("turn_start", (_event, ctx) => ensureRun(ctx, "extension"));
-
-    pi.on("before_provider_request", (_event, ctx) => {
+    pi.on("turn_start", (_event, ctx) => {
+      dispatchedModel = undefined;
       ensureRun(ctx, "extension");
-      collector.beginGeneration({
-        id: deps.createId(),
-        now: deps.now(),
-        model: modelIdentity(ctx, pi),
-      });
+      collector.beginTurn(deps.now());
+      assistant = { startedAtMs: deps.now(), streaming: false };
+    });
+
+    pi.on("cache_warming_decision", () => {
+      ambiguousProviderHooks = true;
+      // A warm request can be the first hook during preparation/resolution.
+      // Do not promote it into dispatch evidence, even if routing later fails.
+      if (assistant && !assistant.streaming) assistant.request = undefined;
+    });
+
+    pi.on("before_provider_request", () => {
+      // Physical providers usually emit hooks BEFORE message_start. Accept one
+      // candidate only in that turn's pre-stream window, never during tools.
+      if (!assistant || assistant.streaming || ambiguousProviderHooks || !collector.hasActiveRun()) return;
+      assistant.request ??= { id: deps.createId(), now: deps.now(), responses: [] };
     });
 
     pi.on("after_provider_response", (event) => {
-      collector.recordProviderResponse({ status: event.status, now: deps.now() });
+      if (!assistant || assistant.streaming || ambiguousProviderHooks) return;
+      assistant.request?.responses.push({ status: event.status, now: deps.now() });
+    });
+
+    pi.on("message_start", (event) => {
+      if (event.message.role === "assistant" && assistant) assistant.streaming = true;
     });
 
     pi.on("message_end", (event) => {
       if (event.message.role !== "assistant") return;
+      // The host synthesizes failures with the selected model when routing
+      // fails before dispatch. That identity is not physical-provider evidence.
+      const failed = event.message.stopReason === "error" || event.message.stopReason === "aborted";
+      const current = assistant;
+      assistant = undefined;
+      // Finalized successful assistants prove a generation independently of raw
+      // hooks. Failures need unambiguous request evidence (routing can fail first).
+      if (current && (current.request || !failed)) {
+        collector.beginGeneration(current.request ?? { id: deps.createId(), now: current.startedAtMs });
+        for (const response of current.request?.responses ?? []) collector.recordProviderResponse(response);
+      }
+      dispatchedModel = failed && !current?.request ? undefined : assistantModelIdentity(event.message);
       collector.finishGeneration({
         now: deps.now(),
         stopReason: event.message.stopReason,
         errorMessage: event.message.errorMessage,
+        model: dispatchedModel,
       });
     });
 
@@ -182,16 +227,17 @@ export function createAnalyticsExtension(
         id: event.toolCallId,
         name: event.toolName,
         now: deps.now(),
-        model: modelIdentity(ctx, pi),
+        model: dispatchedModel,
       });
     });
 
-    pi.on("tool_result", async (event, ctx) => {
+    pi.on("tool_result", async (event) => {
       if (event.toolName === "read" && !isBuiltinReadTool(pi)) return;
       const generation = sessionGeneration;
       const tracker = skillTracker;
       const activeCollector = collector;
       const runId = activeCollector.getActiveRunId();
+      const readModel = dispatchedModel;
       if (!tracker || !runId) return;
       const name = await tracker.matchSuccessfulRead({
         toolName: event.toolName,
@@ -211,7 +257,7 @@ export function createAnalyticsExtension(
         name,
         initiatedBy: "model",
         now: deps.now(),
-        model: modelIdentity(ctx, pi),
+        model: readModel,
       });
     });
 
@@ -223,6 +269,8 @@ export function createAnalyticsExtension(
       const generation = sessionGeneration;
       const owner = sessionController;
       const run = collector.settle(deps.now());
+      dispatchedModel = undefined;
+      assistant = undefined;
       pendingAttemptWithoutRun = false;
       pendingTriggerSource = "unknown";
       skillTracker?.clearPending();
@@ -237,6 +285,9 @@ export function createAnalyticsExtension(
       skillTracker = undefined;
       store = undefined;
       collector.interrupt(deps.now());
+      dispatchedModel = undefined;
+      assistant = undefined;
+      pendingAttemptWithoutRun = false;
       const closing = activeStore ? [closeResult(activeStore), ...retiredCloseTasks] : [...retiredCloseTasks];
       const results = await Promise.all(closing);
       if (results.some((closed) => !closed)) {
@@ -326,6 +377,16 @@ export function createAnalyticsExtension(
   };
 }
 
+function assistantModelIdentity(message: {
+  provider?: string;
+  model?: string;
+  thinkingLevel?: string;
+}): ModelIdentity | undefined {
+  if (!message.provider || !message.model) return undefined;
+  return { provider: message.provider, model: message.model, thinkingLevel: message.thinkingLevel };
+}
+
+// The selected model is run metadata, not evidence of a physical dispatch.
 function modelIdentity(ctx: ExtensionContext, pi: ExtensionAPI): ModelIdentity | undefined {
   if (!ctx.model) return undefined;
   return {

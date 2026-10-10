@@ -8,6 +8,12 @@ This package is the single owner for the `herdr:pi` source. Keep Herdr's bundled
 
 The pane stays working through automatic retries and compaction until Pi settles (or reports true idle). On Pi versions with native UI prompt events, blocking extension dialogs report `blocked` for the coalesced waiting span without transmitting prompt titles. Native waiting and `herdr:blocked` event-bus ownership are independent: ending either wait does not clear the other. Older Pi versions continue using lifecycle and event-bus reporting.
 
+Idle provider cache warming does not mark the agent working. Polling starts only
+for an active TUI session and is cleared on shutdown; resource discovery and
+headless sessions allocate no poll. Shared `herdr:blocked` notifications must be
+non-array objects with a boolean `active` and an optional string `label`.
+Malformed notifications cannot acquire or release a wait.
+
 ## Install
 
 ```bash

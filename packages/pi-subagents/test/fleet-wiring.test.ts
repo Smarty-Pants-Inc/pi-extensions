@@ -56,6 +56,7 @@ function ctxWith(ui: ReturnType<typeof uiCtx>) {
     // The list only seats itself on an interactive context: it takes over arrow
     // keys and opens an overlay, neither of which exists in print or RPC mode.
     mode: "tui",
+    isProjectTrusted: () => true,
     hasUI: true,
     ui,
     cwd: process.cwd(),

@@ -7,6 +7,7 @@ import { loadCustomAgents } from "../src/custom-agents.js";
 import { setScopeModelsEnabled } from "../src/model-scope.js";
 import { createNestedSubagentTools, type NestedAgentManager } from "../src/nested-tools.js";
 import { encodeCwd } from "../src/output-file.js";
+import { captureProjectTrust, isSameConfiguration } from "../src/project-trust.js";
 
 let cwd: string;
 let manager: NestedAgentManager;
@@ -28,6 +29,7 @@ const MODELS = [
 function ctx(executionCwd = cwd) {
   return {
     cwd: executionCwd,
+    isProjectTrusted: () => true,
     model: undefined,
     modelRegistry: {
       find: (provider: string, id: string) => ({ provider, id }),
@@ -51,6 +53,7 @@ function tools(
     maxSubagentDepth,
     allowedSubagents,
     configCwd,
+    projectTrust: captureProjectTrust(ctx(configCwd)),
   });
 }
 
@@ -499,18 +502,24 @@ describe("child-safe nested Agent tools", () => {
     }
   });
 
-  it("forwards the execution context to the manager unmodified", async () => {
+  it.each([true, false])("forwards the execution context unchanged with configuration provenance (background=%s)", async (background) => {
     // Each AgentSession builds its own ExtensionRunner, so the ctx handed to
     // execute is the CHILD's — capturing one at tool-build time instead would
     // silently misroute the grandchild's cwd, conversation, and model.
     const [agent] = tools();
-    const executionCtx = ctx();
+    const executionCtx = ctx(join(cwd, "worktree-execution"));
     await agent.execute("call-1", {
       subagent_type: "scout",
       description: "ctx check",
       prompt: "Do work",
+      run_in_background: background,
     } as any, undefined, undefined, executionCtx);
 
-    expect(spawnAndWait.mock.calls[0][1]).toBe(executionCtx);
+    const forwarded = (background ? spawn : spawnAndWait).mock.calls[0][1];
+    expect(forwarded).toBe(executionCtx);
+    const trust = captureProjectTrust(forwarded);
+    expect(trust.trusted).toBe(true);
+    expect(isSameConfiguration(cwd, trust.cwd)).toBe(true);
+    expect(isSameConfiguration(executionCtx.cwd, trust.cwd)).toBe(false);
   });
 });

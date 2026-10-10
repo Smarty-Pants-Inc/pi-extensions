@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.11.1
+### Patch Changes
+
+- 3364cc0: Gate project agent definitions, own settings, and custom tool descriptions on the host's fail-closed project trust decision. Reject denied definition provenance before child package resolution, including fallbacks and global aliases into denied roots; refresh configuration authority on session replacement and reload.
+- 3364cc0: Use patched Vitest 4.1.11 for development and regression testing without moving to a new major version. Refresh compatible transitive dependencies to include fixed source-map and brace-expansion releases.
+- 3364cc0: Inherit the parent's public Pi project-trust decision before child resource resolution instead of accepting the SDK's trusted default. Unknown trust and different configuration roots deny project settings, extension factories, skills (including named preloading), and MCP configuration without prompting or granting trust. Explicit project resource paths cannot bypass denial. Preserve global resources, child policy restrictions, and trusted parent configuration during worktree execution and nested delegation; bind built-in MCP configuration discovery to that same trusted configuration root.
+- 3364cc0: Preserve denied parent resource provenance when a child changes its configuration root. Reject explicit parent extensions and filter configured/discovered extensions and skills using both denied roots, including canonical aliases, before extension execution or skill injection. Named skill preloading also rejects denied sources behind global-root ancestor aliases. Genuine global resources and trusted parent configuration during worktree execution remain available; this resource trust boundary is not an OS sandbox or containment of arbitrary global extension behavior.
+- 3364cc0: Fingerprint tracked gate inputs without textconv or external diff helpers, and retain full binary-safe changes so transformed or abbreviated diffs cannot reuse a stale passing verdict.
+- 3364cc0: Declare `@sinclair/typebox` as a host-provided peer dependency with a `*` range instead of a runtime dependency, avoiding duplicate runtime modules and Pi extension-loader warnings.
+- 3364cc0: Reject native global settings and MCP configuration aliases into retained denied project roots before SDK parsing or package resolution. Walk raw path components and symlink targets without collapsing dot segments, so a traversed denied directory cannot be hidden by a later `..` or an outward relay. Preserve genuine global configuration and aliases into approved parent roots without duplicating host configuration schemas.
+- 3364cc0: Capture configuration trust before nested agent discovery and invocation defaults, and preserve denied ancestor roots across nested delegation. Reject global aliases into denied parent or child configuration roots before definition admission, model setup, or resource resolution while retaining authorized global definitions and standalone discovery defaults.
+- 3364cc0: Adopt Pi 1.0.4's host-provided dependency contract: declare imported Pi and TypeBox modules as `*` peers rather than installing duplicate runtime modules, and align Pi development pins with the repository's tested 1.0.4 baseline. The wildcard identifies host module ownership; it does not promise compatibility with every Pi version.
+- 3364cc0: Close configuration-admission gaps: apply model scope only from admitted settings at the captured configuration root, retain ancestor denials, and reject resource aliases that traverse denied project paths before escaping outside. Refresh provider-facing Agent descriptions and configuration-derived parameter descriptions through Pi's public tool-registration API when preparing prompts and continuations, preserving inactive tools. Disable gate-result caching while untracked files exist and prevent external diff commands during fingerprint inspection.
+- 3364cc0: Keep Goal terminal tools directly declared but unavailable to nested execution, where termination is not propagated. Verify direct termination and settlement-gated queue advancement against the installed Pi 1.0.4 host and codemode.
+  
+  Translate Pi exec results into the existing gate executor contract, failing killed commands even when their code is zero and enabling successful git fingerprint inspection. Exercise real-SDK exposure, nested approval, policy, and navigation regressions on Pi 1.0.4 instead of skipping them.
+- Updated dependencies [3364cc0]
+- Updated dependencies [3364cc0]
+- Updated dependencies [3364cc0]
+- Updated dependencies [3364cc0]
+  - @signalridge/pi-subagents-protocol@1.5.1
+  - @signalridge/pi-ui@1.3.3
+
 ## 1.11.0
 ### Minor Changes
 

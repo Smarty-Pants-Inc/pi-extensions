@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { lstat, readdir, rename, rmdir, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { moveWorktree, removeWorktreeMetadata, withWorktreeMutationLock } from "./git.js";
+import { moveWorktree, removeWorktreeMetadata, WorktreeRecoveryError, withWorktreeMutationLock } from "./git.js";
 
 interface TreeSnapshot {
   kind: "directory" | "leaf";
@@ -265,12 +265,14 @@ export async function removeWorktreeSafely(
       if (signal?.aborted) throw new Error("worktree removal aborted");
       const quarantinePath = join(dirname(path), `.${randomUUID()}.pi-worktree-quarantine`);
       let metadataRemoved = false;
+      let metadataOutcomeUnknown = false;
       let moved = false;
       let tombstonePath: string | undefined;
       let moveOutcomeUnknown = false;
       let quarantineReservation: TreeSnapshot | undefined;
       try {
         await validateRegisteredWorktree?.();
+        signal?.throwIfAborted();
         const beforeSnapshot = await snapshotTree(path);
         await moveWorktree(pi, cwd, path, quarantinePath, signal);
         moved = true;
@@ -279,6 +281,7 @@ export async function removeWorktreeSafely(
           throw new Error("worktree changed while entering quarantine");
         }
         await validateQuarantine(quarantinePath);
+        signal?.throwIfAborted();
 
         // Keep the real tree on a guarded tombstone. The registered path is reserved
         // with an exclusive non-directory entry so Git never receives an unprotected
@@ -290,16 +293,22 @@ export async function removeWorktreeSafely(
         if (!sameIdentity(reservedPath, quarantineReservation)) {
           throw new QuarantineRetainedError(quarantinePath, `quarantine reservation changed: ${quarantinePath}`);
         }
-        await removeWorktreeMetadata(
-          pi,
-          cwd,
-          quarantinePath,
-          signal,
-          () => {
-            metadataRemoved = true;
-          },
-          true,
-        );
+        try {
+          await removeWorktreeMetadata(
+            pi,
+            cwd,
+            quarantinePath,
+            signal,
+            () => {
+              metadataRemoved = true;
+            },
+            true,
+          );
+        } catch (error) {
+          // Partial metadata deletion cannot be rolled back by moving the tree.
+          metadataOutcomeUnknown = !metadataRemoved && error instanceof WorktreeRecoveryError;
+          throw error;
+        }
         await releaseQuarantineReservation(quarantinePath, quarantineReservation);
         quarantineReservation = undefined;
         if (!tombstonePath || !(await pathExists(tombstonePath))) {
@@ -309,6 +318,9 @@ export async function removeWorktreeSafely(
             true,
           );
         }
+        // Once metadata is committed, cancellation retains the recovery tree
+        // rather than beginning a fresh filesystem deletion.
+        signal?.throwIfAborted();
         await removeSnapshot(tombstonePath, snapshot, beforeDeleteEntry);
       } catch (error: unknown) {
         if (!tombstonePath && !metadataRemoved) {
@@ -332,11 +344,11 @@ export async function removeWorktreeSafely(
         }
         const primaryError = reservationError ?? error;
         if (moveOutcomeUnknown) {
-          throw new Error(
+          throw new WorktreeRecoveryError(
             `Git worktree move outcome is unknown; inspect ${path} and ${quarantinePath} before retrying: ${errorDetail(primaryError)}`,
           );
         }
-        if (moved && !metadataRemoved) {
+        if (moved && !metadataRemoved && !metadataOutcomeUnknown) {
           let restoreError: unknown = reservationError;
           let restored = false;
           if (!reservationError) {
@@ -361,16 +373,19 @@ export async function removeWorktreeSafely(
               : tombstonePath && (await pathExists(tombstonePath))
                 ? tombstonePath
                 : quarantinePath;
-          throw new Error(
+          throw new WorktreeRecoveryError(
             `Git worktree removal failed: ${errorDetail(primaryError)}; quarantine retained at ${retainedPath}${
               restoreError ? ` (${errorDetail(restoreError)})` : ". The original path was recreated."
             }`,
           );
         }
-        if (metadataRemoved && tombstonePath) {
+        if ((metadataRemoved || metadataOutcomeUnknown) && tombstonePath) {
+          const metadataStatus = metadataRemoved
+            ? "Worktree metadata was removed"
+            : "Worktree metadata outcome is unknown";
           if (primaryError instanceof QuarantineRetainedError && primaryError.outcomeUnknown) {
-            throw new Error(
-              `Worktree metadata was removed, but quarantine outcome is unknown: ${errorDetail(primaryError)}`,
+            throw new WorktreeRecoveryError(
+              `${metadataStatus}, but quarantine outcome is unknown: ${errorDetail(primaryError)}`,
             );
           }
           const retainedPath =
@@ -380,8 +395,8 @@ export async function removeWorktreeSafely(
                 ? tombstonePath
                 : undefined;
           if (retainedPath) {
-            throw new Error(
-              `Worktree metadata was removed, but quarantine was retained at ${retainedPath}: ${errorDetail(primaryError)}`,
+            throw new WorktreeRecoveryError(
+              `${metadataStatus}, but quarantine was retained at ${retainedPath}: ${errorDetail(primaryError)}`,
             );
           }
         }
@@ -389,5 +404,6 @@ export async function removeWorktreeSafely(
       }
     },
     signal,
+    `Removed worktree ${path}. Its branch was preserved`,
   );
 }

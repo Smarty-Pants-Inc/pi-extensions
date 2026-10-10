@@ -7,6 +7,7 @@ import { type ExtensionAPI, type ExtensionContext, type ModelRuntime, VERSION } 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resumeAgent, runAgent, setDefaultToolTimeoutMs } from "../src/agent-runner.js";
 import { registerAgents } from "../src/agent-types.js";
+import { clearGateCache } from "../src/gate.js";
 import type { AgentConfig } from "../src/types.js";
 import { registerFauxProvider } from "./helpers/pi-ai.js";
 
@@ -14,7 +15,7 @@ vi.setConfig({ testTimeout: 30_000 });
 
 // Tool exposure and nested ctx.executeTool are public Pi 0.99 APIs. The older
 // supported loaders are exercised by agent-runner.test.ts and loader-sdk.test.ts.
-describe.skipIf(!VERSION.startsWith("0.99.") && !VERSION.startsWith("1."))("child tool policy on real Pi 0.99", () => {
+describe.skipIf(!VERSION.startsWith("0.99.") && !VERSION.startsWith("1."))("child tool policy on real Pi", () => {
   let root: string;
   let cwd: string;
   let agentDir: string;
@@ -22,6 +23,7 @@ describe.skipIf(!VERSION.startsWith("0.99.") && !VERSION.startsWith("1."))("chil
   let faux: ReturnType<typeof registerFauxProvider>;
 
   beforeEach(() => {
+    clearGateCache();
     root = mkdtempSync(join(tmpdir(), "subagent-tool-policy-"));
     cwd = join(root, "project");
     agentDir = join(root, "agent");
@@ -52,11 +54,13 @@ describe.skipIf(!VERSION.startsWith("0.99.") && !VERSION.startsWith("1."))("chil
     calls: Array<string | string[]>,
     onCreated?: (session: Awaited<ReturnType<typeof runAgent>>["session"]) => void,
     approval?: { tool: string | string[]; confirm: () => Promise<boolean> },
+    gate?: { command: string; exec: ExtensionAPI["exec"] },
   ) {
     registerAgents(new Map([["policy", {
       name: "policy", description: "policy", builtinToolNames: [],
       extensions: paths, skills: false, systemPrompt: "Use the requested tools.",
       ...(approval ? { askTools: Array.isArray(approval.tool) ? approval.tool : [approval.tool] } : {}),
+      ...(gate ? { gate: gate.command } : {}),
       promptMode: "replace", inheritContext: false, runInBackground: false, isolated: false,
     } as AgentConfig]]));
     const model = faux.getModel();
@@ -80,11 +84,11 @@ describe.skipIf(!VERSION.startsWith("0.99.") && !VERSION.startsWith("1."))("chil
       registerProvider: () => {}, unregisterProvider: () => {},
     } as unknown as ExtensionContext["modelRegistry"];
     const ctx = {
-      cwd, model, modelRegistry, getSystemPrompt: () => "parent",
+      cwd, model, modelRegistry, isProjectTrusted: () => true, getSystemPrompt: () => "parent",
       hasUI: Boolean(approval), ui: { confirm: approval?.confirm },
     } as unknown as ExtensionContext;
     return runAgent(ctx, "policy", "go", {
-      pi: { exec: async () => ({ code: 1, stdout: "", stderr: "" }) } as unknown as ExtensionAPI,
+      pi: { exec: gate?.exec ?? (async () => ({ code: 1, killed: false, stdout: "", stderr: "" })) } as unknown as ExtensionAPI,
       model, supervisorQuestions: false, onSessionCreated: onCreated,
     });
   }
@@ -93,6 +97,40 @@ describe.skipIf(!VERSION.startsWith("0.99.") && !VERSION.startsWith("1."))("chil
     return session.messages.filter((m) => m.role === "toolResult" && m.toolName === name)
       .map((m) => ({ isError: m.isError, text: m.content.map((c) => c.type === "text" ? c.text : "").join("") }));
   }
+
+  it.each([
+    { code: 0, killed: false, status: "PASSED" },
+    { code: 7, killed: false, status: "FAILED" },
+    { code: 0, killed: true, status: "FAILED" },
+  ])("translates host exec results for gates ($code, killed=$killed)", async ({ code, killed, status }) => {
+    const exec = vi.fn<ExtensionAPI["exec"]>(async (file, args) => ({
+      stdout: file === "git" && args[0] === "rev-parse" ? "head\n" : "",
+      stderr: "", code: file === "git" ? 0 : code, killed: file === "git" ? false : killed,
+    }));
+    const first = await runChild([], [], undefined, undefined, { command: `check-${code}-${killed}`, exec });
+    expect(first.responseText).toContain(`Acceptance gate \`check-${code}-${killed}\`: ${status}`);
+    expect(exec.mock.calls.map(([file, args]) => [file, args])).toEqual([
+      ["git", ["rev-parse", "--is-inside-work-tree"]],
+      ["git", ["rev-parse", "HEAD"]], ["git", ["status", "--porcelain", "--untracked-files=all", "--ignored=matching"]],
+      ["git", ["diff", "--no-ext-diff", "--no-textconv", "--binary", "--full-index", "HEAD"]], ["sh", ["-c", `check-${code}-${killed}`]],
+    ]);
+    // A successful host-shaped git inspection establishes a reusable fingerprint.
+    const second = await runChild([], [], undefined, undefined, { command: `check-${code}-${killed}`, exec });
+    expect(second.responseText).toContain(`${status} (cached`);
+    expect(exec.mock.calls.filter(([file]) => file === "sh")).toHaveLength(1);
+  });
+
+  it("does not cache a gate when a host-shaped git inspection was killed with code zero", async () => {
+    const exec = vi.fn<ExtensionAPI["exec"]>(async (file) => ({
+      stdout: "", stderr: "", code: 0, killed: file === "git",
+    }));
+    for (let i = 0; i < 2; i++) {
+      const result = await runChild([], [], undefined, undefined, { command: "check-killed-fingerprint", exec });
+      expect(result.responseText).toContain("Acceptance gate `check-killed-fingerprint`: PASSED");
+      expect(result.responseText).not.toContain("(cached");
+    }
+    expect(exec.mock.calls.filter(([file]) => file === "sh")).toHaveLength(2);
+  });
 
   it("preserves Pi exposure and defaultActive, including after a turn and deliberate deactivation", async () => {
     const path = extension("exposure", `

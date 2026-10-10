@@ -84,9 +84,11 @@ Full detail lives in each package's README —
 [`pi-workflows`](packages/pi-workflows/README.md) for the runtime globals,
 resume semantics, and routing table;
 [`pi-subagents`](packages/pi-subagents/README.md) for agent types, tiers,
-FleetView, and scheduling. For the released Pi host compatibility matrix and
-current upstream extension references, see [the Pi 1.0.0 compatibility review](docs/pi-1.0-compatibility.md),
-[the Pi 0.99.1 review](docs/pi-0.99-compatibility.md), and the [0.87.1 baseline](docs/pi-0.87-compatibility.md).
+FleetView, and scheduling. For the tested Pi **1.0.4** host baseline, package
+coverage, and current upstream references, see [the Pi 1.0 compatibility review](docs/pi-1.0-compatibility.md).
+The [0.99.1](docs/pi-0.99-compatibility.md) and [0.87.1](docs/pi-0.87-compatibility.md)
+reviews remain historical baselines. Host-provided peers use `"*"` for module
+ownership, not as a claim that every Pi version is supported.
 
 ---
 

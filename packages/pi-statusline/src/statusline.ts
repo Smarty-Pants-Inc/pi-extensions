@@ -16,6 +16,7 @@ import {
   loadStatuslineSettingsForAgent,
   settingsFilePath,
 } from "./settings.js";
+import { type TerminalLifetime, terminalLifetime } from "./terminal-lifetime.js";
 import type { PalettePreset } from "./types.js";
 import { FooterUsageAccumulator } from "./usage.js";
 
@@ -29,6 +30,7 @@ export default function statusline(pi: ExtensionAPI) {
   let loaded: LoadedStatuslineSettings | undefined;
   let previewPalettePreset: PalettePreset | undefined;
   let activeSessionManager: ExtensionContext["sessionManager"] | undefined;
+  let activeTerminal: TerminalLifetime | undefined;
   let observedUsageLeafId: string | null = null;
   const footerUsage = new FooterUsageAccumulator();
   const runtime: RuntimeState = {
@@ -174,6 +176,7 @@ export default function statusline(pi: ExtensionAPI) {
     runtime.duplicateExtensions = findDuplicateExtensions(installedPackages);
     runtime.extensionStatusIconAliases = buildExtensionStatusIconAliases(installedPackages);
     ctx.ui.setFooter((tui, theme, footerData) => {
+      activeTerminal = terminalLifetime(tui);
       runtime.requestRender = () => tui.requestRender();
 
       const refreshFooterGitStatus = () => refreshGitStatus(cwd, generation);
@@ -235,9 +238,13 @@ export default function statusline(pi: ExtensionAPI) {
     getLoaded: () => loaded ?? loadStatuslineSettings(configPath),
     getMenuOwner: () => {
       const generation = sessionGeneration;
+      const terminal = activeTerminal;
       return {
         signal: menuController.signal,
         isCurrent: () => generation === sessionGeneration && !menuController.signal.aborted,
+        // A retired command may resume the same terminal, but cannot touch its
+        // replacement session. The replacement instance shares this quit token.
+        isHostActive: () => terminal?.active === true,
       };
     },
     apply(next, ctx) {
@@ -270,6 +277,15 @@ export default function statusline(pi: ExtensionAPI) {
     installFooter(ctx);
   });
 
+  const closeCommandsBeforeNavigation = () => {
+    menuController.abort(new DOMException("Statusline navigation started", "AbortError"));
+    menuController = new AbortController();
+    previewPalettePreset = undefined;
+    refresh();
+  };
+  pi.on("session_before_switch", () => closeCommandsBeforeNavigation());
+  pi.on("session_before_tree", () => closeCommandsBeforeNavigation());
+
   pi.on("session_tree", (_event, ctx) => {
     installFooter(ctx);
     refresh();
@@ -281,8 +297,11 @@ export default function statusline(pi: ExtensionAPI) {
     refresh();
   });
 
-  pi.on("session_shutdown", (_event, ctx) => {
+  pi.on("session_shutdown", (event, ctx) => {
     if (!ownsRuntime(ctx)) return;
+    // Only quit ends the terminal lifetime; new/resume/fork/reload retire just
+    // this session's commands. Mark quit before aborting any pending dialog.
+    if (event.reason === "quit" && activeTerminal) activeTerminal.active = false;
     sessionGeneration += 1;
     menuController.abort(new DOMException("Statusline session shut down", "AbortError"));
     activeSessionManager = undefined;

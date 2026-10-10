@@ -1,4 +1,4 @@
-import { execSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -26,10 +26,16 @@ function mockPi(): ExtensionAPI {
 }
 
 describe("detectEnv", () => {
-  it("detects git repo in current project", async () => {
-    const env = await detectEnv(mockPi(), process.cwd());
-    expect(env.isGitRepo).toBe(true);
-    expect(env.platform).toBe(process.platform);
+  it("detects a git repository without relying on the checkout", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pi-env-repo-"));
+    try {
+      execFileSync("git", ["init", "--quiet"], { cwd });
+      const env = await detectEnv(mockPi(), cwd);
+      expect(env.isGitRepo).toBe(true);
+      expect(env.platform).toBe(process.platform);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 
   it("returns branch name when on a branch", async () => {

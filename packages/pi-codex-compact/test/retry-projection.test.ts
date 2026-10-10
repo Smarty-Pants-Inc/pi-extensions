@@ -41,7 +41,7 @@ const detailsFor = (keptMessages: AgentMessage[], willRetry = true) =>
   });
 
 for (const reason of ["error", "length"] as const) {
-  test(`${reason}: projection follows native persisted rebuild -> runtime-only tail trim -> continuation`, async () => {
+  test(`${reason}: legacy projection follows persisted rebuild -> runtime-only tail trim -> continuation`, async () => {
     const session = SessionManager.inMemory();
     const keptId = session.appendMessage(user);
     const tail = assistant(reason);
@@ -49,8 +49,8 @@ for (const reason of ["error", "length"] as const) {
     const details = detailsFor([user, tail]);
     assert.deepEqual(details.retryTrimmedTail, tail);
     session.appendCompaction(fallbackSummary(details.checkpointId), keptId, 100, details, true);
-    // _runAutoCompaction rebuilds agent state, emits session_compact, then removes
-    // a trailing error/length assistant before agent.continue(). The branch is unchanged.
+    // Projectionless legacy hosts trimmed the tail after session_compact without
+    // a durable context edit. This bridge is not the canonical host's behavior.
     const persisted = session.buildSessionContext().messages;
     assert.deepEqual(persisted.at(-1), tail);
     let runtime = persisted;
@@ -95,16 +95,17 @@ for (const reason of ["error", "length"] as const) {
 }
 
 for (const reason of ["error", "length"] as const) {
-  test(`${reason}: extension lifecycle preserves occurrence provenance through reload, resets on rebuild`, async () => {
+  test(`${reason}: canonical lifecycle keeps full lineage and identical later occurrences through reload`, async () => {
     const session = SessionManager.inMemory();
     const keptId = session.appendMessage(user);
     const tail = assistant(reason);
     session.appendMessage(tail);
-    const details = detailsFor([user, tail]);
+    const details = detailsFor([user, tail], false);
     session.appendCompaction(fallbackSummary(details.checkpointId), keptId, 100, details, true);
     const compactionEntry = session.getBranch().at(-1);
     const persisted = session.buildSessionContext().messages;
-    const runtime = [...persisted.slice(0, -1), structuredClone(tail)];
+    // The retained tail remains present; an identical continuation is a new occurrence.
+    const runtime = [...persisted, structuredClone(tail)];
     const { ctx } = createMockContext({
       sessionManager: session,
       model: { id: "gpt-5.6", provider: "openai-codex", api: "openai-codex-responses" },
@@ -158,13 +159,13 @@ for (const reason of ["error", "length"] as const) {
     await emit("session_compact", { willRetry: false, compactionEntry });
     assert.equal((await emit("context", { messages: persisted }))?.messages.length, 1);
     await new Promise((resolve) => setTimeout(resolve, 5));
-    const second = detailsFor([user, tail, structuredClone(tail)]);
+    const second = detailsFor([user, tail, structuredClone(tail)], false);
     session.appendCompaction(fallbackSummary(second.checkpointId), keptId, 100, second, true);
     const secondPersisted = session.buildSessionContext().messages;
-    // Old checkpoint provenance cannot authorize projection for a new ID.
-    assert.equal(await emit("context", { messages: secondPersisted }), undefined);
+    // Full canonical lineage needs no event-inferred omission for the new ID.
+    assert.equal((await emit("context", { messages: secondPersisted }))?.messages.length, 1);
     await emit("session_compact", { willRetry: true, compactionEntry: session.getBranch().at(-1) });
-    const secondRuntime = [...secondPersisted.slice(0, -1), structuredClone(tail)];
+    const secondRuntime = [...secondPersisted, structuredClone(tail)];
     assert.deepEqual((await emit("context", { messages: secondRuntime }))?.messages.slice(1), [tail]);
     session.appendCompaction("native summary", keptId, 100);
     await emit("session_compact", { willRetry: false, compactionEntry: session.getBranch().at(-1) });

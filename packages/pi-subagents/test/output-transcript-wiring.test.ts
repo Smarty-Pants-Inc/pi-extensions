@@ -49,6 +49,7 @@ function makePi() {
 
 function makeCtx(cwd: string) {
   return {
+    isProjectTrusted: () => true,
     hasUI: false,
     ui: { setStatus: vi.fn(), setWidget: vi.fn(), notify: vi.fn() },
     cwd,

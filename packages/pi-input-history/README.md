@@ -1,12 +1,12 @@
 # pi-input-history
 
-**Cross-session prompt history and an fzf/atuin-style fuzzy Ctrl+R popup for pi.**
+**Cross-session prompt history and an fzf/atuin-style fuzzy Ctrl+Alt+R popup for pi.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](https://opensource.org/licenses/MIT)
 
 ## Why
 
-Pi's built-in ↑/↓ history only covers the current session and is lost on reload. This extension persists your last 100 prompts across sessions and adds an fzf/atuin-style **Ctrl+R** popup — a scrollable, live-filtered list of past prompts — so you can find any of them instantly.
+Pi's built-in ↑/↓ history only covers the current session and is lost on reload. This extension persists your last 100 prompts across sessions and adds an fzf/atuin-style **Ctrl+Alt+R** popup — a scrollable, live-filtered list of past prompts — so you can find any of them instantly.
 
 The popup is rendered with Pi's native TUI components and adapts to narrow terminals.
 
@@ -28,24 +28,24 @@ pi -e ./packages/pi-input-history
 
 ### Persistent history
 
-On session start, your last 100 prompts across all sessions are loaded into the editor. Use **↑/↓** arrows to browse them as usual.
+On session start, your last 100 prompts across all sessions are loaded into the editor. Use **↑/↓** arrows to browse them as usual. If you submit a prompt or use history navigation before the background scan finishes, that editor is not seeded: your newer native history and browsing state take priority. The scanned prompts remain available through **Ctrl+Alt+R**, without replacing the editor or disturbing private paste contents.
 
-### Fuzzy popup (Ctrl+R)
+### Fuzzy popup (Ctrl+Alt+R)
 
-1. Press **Ctrl+R** to open the popup — a large centred two-pane dialog, `fzf --preview` style. The left pane lists your recent prompts newest-first, each row carrying its position and age; the right pane shows the **full text** of the highlighted entry, which one-line summaries cannot convey for long prompts.
+1. Press **Ctrl+Alt+R** to open the popup — a large centred two-pane dialog, `fzf --preview` style. The left pane lists your recent prompts newest-first, each row carrying its position and age; the right pane shows the **full text** of the highlighted entry, which one-line summaries cannot convey for long prompts.
 2. Type to fuzzy-filter the list live (subsequence matching, space-separated multi-token).
 3. The selected row shows as a full-width highlight bar; matched characters are underlined in your theme's accent color.
 4. Navigate and accept:
 
-| Key                         | Action                       |
-| --------------------------- | ---------------------------- |
-| `↑` / `Ctrl+P` / `Ctrl+S`   | Move up the list (newer)     |
-| `↓` / `Ctrl+N` / `Ctrl+R`   | Move down the list (older)   |
-| `Ctrl+D` / `Ctrl+U`         | Scroll the preview pane      |
-| `Enter`                     | Accept selection into editor |
-| `Esc` / `Ctrl+G` / `Ctrl+C` | Cancel                       |
+| Key                                   | Action                       |
+| ------------------------------------- | ---------------------------- |
+| `↑` / `Ctrl+P` / `Ctrl+S`              | Move up the list (newer)      |
+| `↓` / `Ctrl+N` / `Ctrl+Alt+R` / `Ctrl+R` | Move down the list (older)    |
+| `Ctrl+D` / `Ctrl+U`                     | Scroll the preview pane      |
+| `Enter`                               | Accept selection into editor |
+| `Esc` / `Ctrl+G` / `Ctrl+C`             | Cancel                       |
 
-Arrow and Emacs bindings follow the list (`Ctrl+P`/`Ctrl+N` = previous/next line); `Ctrl+R`/`Ctrl+S` keep their shell meaning, so pressing **Ctrl+R** again walks further back in history. Below 76 columns the preview pane is dropped and the list takes the full width.
+Arrow and Emacs bindings follow the list (`Ctrl+P`/`Ctrl+N` = previous/next line). Press **Ctrl+Alt+R** again to walk further back in history, including while the background scan is pending. Inside the popup, `Ctrl+R` remains a compatible older-entry alias and `Ctrl+S` moves toward newer entries; outside it, `Ctrl+R` remains available for Pi's session rename. Below 76 columns the preview pane is dropped and the list takes the full width.
 
 ## Features
 
@@ -58,7 +58,7 @@ Arrow and Emacs bindings follow the list (`Ctrl+P`/`Ctrl+N` = previous/next line
 
 ## Acknowledgments
 
-The Ctrl+R reverse search component is inspired by [pi-readline-search](https://github.com/mrshu/pi-readline-search) by [@mrshu](https://github.com/mrshu).
+The reverse search component is inspired by [pi-readline-search](https://github.com/mrshu/pi-readline-search) by [@mrshu](https://github.com/mrshu).
 
 ## License
 

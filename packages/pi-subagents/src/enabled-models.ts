@@ -3,7 +3,7 @@
  * + project-local `<cwd>/.pi/settings.json`, project wins) and resolves
  * entries to concrete `provider/modelId` keys for scope validation.
  *
- * **Project overrides global**, mirroring pi's own `SettingsManager`
+ * **Admitted project settings override global**, mirroring pi's own `SettingsManager`
  * deep-merge behavior and matching the precedence we use for our own
  * `subagents.json` settings (see `src/settings.ts:loadSettings`). If
  * project file has `enabledModels` set, it wholly replaces global's
@@ -25,6 +25,7 @@ import { join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { minimatch } from "minimatch";
 import type { ModelEntry } from "./model-resolver.js";
+import { isProjectResource, type ProjectTrust } from "./project-trust.js";
 
 /** Minimal registry shape — only the methods resolveEnabledModels actually calls. */
 export interface ModelRegistryRef {
@@ -61,11 +62,17 @@ function readField(path: string): string[] | undefined {
  * Read enabledModels from pi's settings — project-local overrides global.
  * Mirrors pi's SettingsManager deep-merge for the `enabledModels` field
  * (and matches our own loadSettings precedence in src/settings.ts).
- * Returns undefined when neither file has the field.
+ * Runtime callers pass captured configuration authority to exclude denied
+ * project sources and global aliases; standalone callers keep project defaults.
+ * Returns undefined when neither admitted file has the field.
  */
-export function readEnabledModels(cwd: string): string[] | undefined {
-  const [project, global] = settingsPaths(cwd);
-  return readField(project) ?? readField(global);
+export function readEnabledModels(cwd: string, authority?: ProjectTrust): string[] | undefined {
+  const [project, global] = settingsPaths(authority?.cwd ?? cwd);
+  // Standalone readers retain project precedence. Runtime readers must pass
+  // captured configuration authority, never infer it from execution cwd.
+  const denied = (path: string): boolean => authority?.deniedRoots.some(root => isProjectResource(path, root)) ?? false;
+  return (authority?.trusted !== false && !denied(project) ? readField(project) : undefined)
+    ?? (!denied(global) ? readField(global) : undefined);
 }
 
 /**

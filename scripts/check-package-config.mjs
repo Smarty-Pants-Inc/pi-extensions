@@ -1,13 +1,21 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { dirname, relative, resolve, sep } from "node:path";
+import { dirname, matchesGlob, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import semver from "semver";
+import ts from "typescript";
 
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
 export const REPOSITORY_ROOT = resolve(dirname(SCRIPT_PATH), "..");
 const REQUIRED_SCRIPTS = ["lint", "typecheck", "test", "check", "format"];
 const PACKAGE_DIRECTORY_PATTERN = /^pi-.+$/u;
 const PACKAGE_NAME_PATTERN = /^@signalridge\/pi-.+$/u;
+const PI_HOST_DEPENDENCIES = new Set([
+  "@earendil-works/pi-ai",
+  "@earendil-works/pi-agent-core",
+  "@earendil-works/pi-coding-agent",
+  "@earendil-works/pi-tui",
+]);
+const HOST_DEPENDENCIES = new Set([...PI_HOST_DEPENDENCIES, "typebox", "@sinclair/typebox"]);
 
 function isFile(path) {
   return existsSync(path) && statSync(path).isFile();
@@ -113,10 +121,29 @@ export function validatePackageManifest(directory, packageRoot, manifest) {
   }
 }
 
-function validateTestedPiPeers(directory, manifest, rootManifest) {
+function validateHostDependencies(directory, manifest, rootManifest) {
+  for (const section of ["dependencies", "optionalDependencies"]) {
+    for (const dependency of Object.keys(manifest[section] ?? {})) {
+      if (!HOST_DEPENDENCIES.has(dependency)) continue;
+      throw new Error(
+        `packages/${directory}/package.json ${section}[${dependency}] is host-provided; ` +
+          'declare it only in peerDependencies with a "*" range (and optionally devDependencies for tests).',
+      );
+    }
+  }
   for (const [dependency, range] of Object.entries(manifest.peerDependencies ?? {})) {
-    if (!dependency.startsWith("@earendil-works/pi-")) continue;
-    const label = `packages/${directory}/package.json peerDependencies[${dependency}]`;
+    if (!HOST_DEPENDENCIES.has(dependency)) continue;
+    if (range !== "*") {
+      throw new Error(
+        `packages/${directory}/package.json peerDependencies[${dependency}] must use "*" for host module ownership; ` +
+          `found ${JSON.stringify(range)}. The exact tested Pi version belongs in devDependencies.`,
+      );
+    }
+  }
+  for (const dependency of PI_HOST_DEPENDENCIES) {
+    const devPin = manifest.devDependencies?.[dependency];
+    if (!(dependency in (manifest.peerDependencies ?? {})) && devPin === undefined) continue;
+    const label = `packages/${directory}/package.json`;
     const testedVersion = rootManifest.devDependencies?.[dependency];
     if (typeof testedVersion !== "string" || semver.valid(testedVersion) !== testedVersion) {
       throw new Error(
@@ -124,16 +151,68 @@ function validateTestedPiPeers(directory, manifest, rootManifest) {
           `found ${JSON.stringify(testedVersion) ?? "missing"}. Pin the Pi version used by repository checks.`,
       );
     }
-    if (typeof range !== "string" || semver.validRange(range) === null) {
-      throw new Error(`${label} has invalid range ${JSON.stringify(range)}; declare a valid semver peer range.`);
-    }
-    if (!semver.satisfies(testedVersion, range)) {
+    if (devPin !== undefined && devPin !== testedVersion) {
       throw new Error(
-        `${label} range ${JSON.stringify(range)} excludes root-tested Pi ${testedVersion}; ` +
-          "expand the peer range to admit the tested version while retaining supported versions.",
+        `${label} devDependencies[${dependency}] must match the exact root-tested Pi pin ${testedVersion}; ` +
+          `found ${JSON.stringify(devPin)}.`,
       );
     }
   }
+}
+
+function isPublishedSource(path, manifest) {
+  if (!/\.(?:[cm]?[jt]s|[jt]sx)$/u.test(path)) return false;
+  const patterns = manifest.files;
+  const matches = (pattern) => matchesGlob(path, pattern) || matchesGlob(path, `${pattern}/**`);
+  return (
+    patterns.some((pattern) => !pattern.startsWith("!") && matches(pattern)) &&
+    !patterns.some((pattern) => pattern.startsWith("!") && matches(pattern.slice(1)))
+  );
+}
+
+function validatePublishedHostImports(directory, packageRoot, manifest) {
+  function walk(root) {
+    for (const entry of readdirSync(root, { withFileTypes: true })) {
+      if (["node_modules", ".git", "coverage"].includes(entry.name)) continue;
+      const absolute = resolve(root, entry.name);
+      if (entry.isDirectory()) {
+        walk(absolute);
+      } else if (entry.isFile()) {
+        const path = relative(packageRoot, absolute).split(sep).join("/");
+        if (!isPublishedSource(path, manifest)) continue;
+        const source = ts.createSourceFile(absolute, readFileSync(absolute, "utf8"), ts.ScriptTarget.Latest);
+        function visit(node) {
+          let specifier;
+          if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) specifier = node.moduleSpecifier;
+          else if (
+            ts.isCallExpression(node) &&
+            (node.expression.kind === ts.SyntaxKind.ImportKeyword ||
+              (ts.isIdentifier(node.expression) && node.expression.text === "require"))
+          ) {
+            specifier = node.arguments[0];
+          } else if (ts.isImportTypeNode(node) && ts.isLiteralTypeNode(node.argument)) {
+            specifier = node.argument.literal;
+          } else if (ts.isExternalModuleReference(node)) {
+            specifier = node.expression;
+          }
+          if (specifier && ts.isStringLiteralLike(specifier)) {
+            const dependency = [...HOST_DEPENDENCIES].find(
+              (name) => specifier.text === name || specifier.text.startsWith(`${name}/`),
+            );
+            if (dependency && manifest.peerDependencies?.[dependency] !== "*") {
+              throw new Error(
+                `packages/${directory}/${path} imports host-provided ${dependency}; ` +
+                  `declare peerDependencies[${dependency}] with a "*" range.`,
+              );
+            }
+          }
+          ts.forEachChild(node, visit);
+        }
+        visit(source);
+      }
+    }
+  }
+  walk(packageRoot);
 }
 
 export function validatePackageConfig(root = REPOSITORY_ROOT) {
@@ -157,7 +236,8 @@ export function validatePackageConfig(root = REPOSITORY_ROOT) {
     if (!isFile(manifestPath)) throw new Error(`missing package manifest: packages/${directory}/package.json`);
     const manifest = readManifest(manifestPath);
     validatePackageManifest(directory, packageRoot, manifest);
-    validateTestedPiPeers(directory, manifest, rootManifest);
+    validateHostDependencies(directory, manifest, rootManifest);
+    validatePublishedHostImports(directory, packageRoot, manifest);
   }
   return directories.length;
 }

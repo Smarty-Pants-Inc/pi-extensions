@@ -1,6 +1,6 @@
 import { DynamicBorder, getSelectListTheme, type Theme } from "@earendil-works/pi-coding-agent";
 import {
-  Container,
+  CURSOR_MARKER,
   Editor,
   type EditorTheme,
   type Focusable,
@@ -40,6 +40,10 @@ export class QuestionDialog implements Focusable {
   private readonly answers: (QuestionAnswer | undefined)[];
   private questionIndex = 0;
   private selectedRow = 0;
+  private viewportStart = 0;
+  private viewportCapacity = 1;
+  private contentLineCount = 0;
+  private manualViewport = false;
   private selectedOptions = new Set<number>();
   private editorMode = false;
   private settled = false;
@@ -117,14 +121,29 @@ export class QuestionDialog implements Focusable {
       return;
     }
 
+    // Reading a long question must not move the selected answer. Return to
+    // that control before accepting input so an offscreen choice is never submitted.
+    if (this.manualViewport && (this.isMultiToggle(data) || this.keybindings.matches(data, "tui.select.confirm"))) {
+      this.manualViewport = false;
+      this.tui.requestRender();
+      return;
+    }
+
     if (this.keybindings.matches(data, "tui.select.up")) {
+      this.manualViewport = false;
       this.selectedRow = Math.max(0, this.selectedRow - 1);
     } else if (this.keybindings.matches(data, "tui.select.down")) {
+      this.manualViewport = false;
       this.selectedRow = Math.min(this.rows().length - 1, this.selectedRow + 1);
     } else if (this.keybindings.matches(data, "tui.select.pageUp")) {
-      this.selectedRow = Math.max(0, this.selectedRow - 5);
+      this.manualViewport = true;
+      this.viewportStart = Math.max(0, this.viewportStart - this.viewportCapacity);
     } else if (this.keybindings.matches(data, "tui.select.pageDown")) {
-      this.selectedRow = Math.min(this.rows().length - 1, this.selectedRow + 5);
+      this.manualViewport = true;
+      this.viewportStart = Math.min(
+        Math.max(0, this.contentLineCount - this.viewportCapacity),
+        this.viewportStart + this.viewportCapacity,
+      );
     } else if (this.isMultiToggle(data)) {
       const row = this.rows()[this.selectedRow];
       if (row?.kind === "done" && this.keybindings.matches(data, "tui.select.confirm")) this.activateCurrentRow();
@@ -136,87 +155,82 @@ export class QuestionDialog implements Focusable {
   }
 
   render(width: number): string[] {
-    const safeWidth = Math.max(20, width);
-    const innerWidth = Math.max(8, safeWidth - 4);
-    const content = new Container();
-    content.addChild(new DynamicBorder((text) => this.theme.fg("borderAccent", text)));
-
+    const safeWidth = Math.max(1, width);
+    const innerWidth = Math.max(1, safeWidth - 4);
+    const lines: string[] = [];
+    // These rows already include the complete side frame. Text's default
+    // padding would wrap the frame and insert incidental blank rows.
+    const add = (text: string): void => {
+      lines.push(...new Text(this.frame(text, safeWidth), 0, 0).render(safeWidth));
+    };
+    let focusLine = 0;
     const question = this.questions[this.questionIndex];
     if (!question) {
-      content.addChild(new Text(this.frame("No question is available.", safeWidth)));
-      content.addChild(new DynamicBorder((text) => this.theme.fg("borderAccent", text)));
-      return this.fitLines(content.render(safeWidth), safeWidth);
-    }
-
-    const progress = this.questions.length > 1 ? ` [${this.questionIndex + 1}/${this.questions.length}]` : "";
-    content.addChild(
-      new Text(this.frame(this.theme.bold(this.theme.fg("accent", `${question.header}${progress}`)), safeWidth)),
-    );
-    for (const line of this.wrapLines(question.question, innerWidth)) {
-      content.addChild(new Text(this.frame(this.theme.fg("text", line), safeWidth)));
-    }
-
-    if (this.editorMode) {
-      content.addChild(
-        new Text(this.frame(this.theme.fg("dim", "Type your response, then press Enter to submit."), safeWidth)),
-      );
-      const editorWidth = Math.max(1, innerWidth);
-      for (const line of this.editor.render(editorWidth)) {
-        content.addChild(new Text(this.frame(line, safeWidth)));
-      }
-      content.addChild(new Text(this.frame(this.theme.fg("dim", "Esc cancel"), safeWidth)));
+      add("No question is available.");
     } else {
-      content.addChild(
-        new Text(
-          this.frame(
-            this.theme.fg(
-              "dim",
-              question.multiSelect ? "Space/Enter toggle · choose Done when finished" : "Enter select · Esc cancel",
-            ),
-            safeWidth,
+      const progress = this.questions.length > 1 ? ` [${this.questionIndex + 1}/${this.questions.length}]` : "";
+      add(this.theme.bold(this.theme.fg("accent", `${question.header}${progress}`)));
+      for (const line of this.wrapLines(question.question, innerWidth)) add(this.theme.fg("text", line));
+
+      if (this.editorMode) {
+        add(this.theme.fg("dim", "Type your response, then press Enter to submit."));
+        const editorLines = this.editor.render(innerWidth);
+        const cursorLine = editorLines.findIndex((line) => line.includes(CURSOR_MARKER));
+        focusLine = lines.length + Math.max(0, cursorLine);
+        for (const line of editorLines) add(line);
+        add(this.theme.fg("dim", "Esc cancel"));
+      } else {
+        add(
+          this.theme.fg(
+            "dim",
+            question.multiSelect ? "Space/Enter toggle · choose Done when finished" : "Enter select · Esc cancel",
           ),
-        ),
-      );
-      for (const [rowIndex, row] of this.rows().entries()) {
-        const selected = rowIndex === this.selectedRow;
-        const prefix = selected ? "❯ " : "  ";
-        if (row.kind === "option") {
-          const option = question.options[row.index];
-          if (!option) continue;
-          const checked = question.multiSelect ? (this.selectedOptions.has(row.index) ? "[x] " : "[ ] ") : "";
-          const marker = this.theme.fg(selected ? "accent" : "border", prefix);
-          const label = this.theme.fg(selected ? "accent" : "text", `${checked}${option.label}`);
-          for (const line of this.wrapLines(`${marker}${label}`, innerWidth)) {
-            content.addChild(new Text(this.frame(line, safeWidth)));
-          }
-          if (option.description) {
-            for (const description of this.wrapLines(`    ${option.description}`, innerWidth)) {
-              content.addChild(new Text(this.frame(this.theme.fg("muted", description), safeWidth)));
+        );
+        for (const [rowIndex, row] of this.rows().entries()) {
+          const selected = rowIndex === this.selectedRow;
+          if (selected) focusLine = lines.length;
+          const prefix = selected ? "❯ " : "  ";
+          if (row.kind === "option") {
+            const option = question.options[row.index];
+            if (!option) continue;
+            const checked = question.multiSelect ? (this.selectedOptions.has(row.index) ? "[x] " : "[ ] ") : "";
+            const marker = this.theme.fg(selected ? "accent" : "border", prefix);
+            const label = this.theme.fg(selected ? "accent" : "text", `${checked}${option.label}`);
+            for (const line of this.wrapLines(`${marker}${label}`, innerWidth)) add(line);
+            if (option.description) {
+              for (const line of this.wrapLines(`    ${option.description}`, innerWidth))
+                add(this.theme.fg("muted", line));
             }
+          } else {
+            const label =
+              row.kind === "other"
+                ? "Other (free text)"
+                : row.kind === "done"
+                  ? "Done"
+                  : "Back (revise previous answer)";
+            add(this.theme.fg(selected ? "accent" : row.kind === "done" ? "success" : "dim", `${prefix}${label}`));
           }
-        } else if (row.kind === "other") {
-          content.addChild(
-            new Text(this.frame(this.theme.fg(selected ? "accent" : "text", `${prefix}Other (free text)`), safeWidth)),
-          );
-        } else if (row.kind === "done") {
-          content.addChild(
-            new Text(this.frame(this.theme.fg(selected ? "accent" : "success", `${prefix}Done`), safeWidth)),
-          );
-        } else {
-          content.addChild(
-            new Text(
-              this.frame(
-                this.theme.fg(selected ? "accent" : "dim", `${prefix}Back (revise previous answer)`),
-                safeWidth,
-              ),
-            ),
-          );
         }
       }
     }
-
-    content.addChild(new DynamicBorder((text) => this.theme.fg("borderAccent", text)));
-    return this.fitLines(content.render(safeWidth), safeWidth);
+    // Match the overlay's 85% maxHeight and one-row terminal margins. Keep
+    // both borders mounted while scrolling content to the selected control or
+    // editor cursor; the host otherwise clips controls without scrolling them.
+    const rows = this.tui.terminal.rows;
+    const height = Math.max(3, Math.min(Math.floor(rows * 0.85), rows - 2));
+    const capacity = Math.max(1, height - 2);
+    this.viewportCapacity = capacity;
+    this.contentLineCount = lines.length;
+    this.viewportStart = Math.min(this.viewportStart, Math.max(0, lines.length - capacity));
+    if (!this.manualViewport) {
+      if (focusLine < this.viewportStart) this.viewportStart = focusLine;
+      else if (focusLine >= this.viewportStart + capacity) this.viewportStart = focusLine - capacity + 1;
+    }
+    const border = new DynamicBorder((text) => this.theme.fg("borderAccent", text)).render(safeWidth);
+    return this.fitLines(
+      [...border, ...lines.slice(this.viewportStart, this.viewportStart + capacity), ...border],
+      safeWidth,
+    );
   }
 
   private rows(): DialogRow[] {
@@ -236,6 +250,8 @@ export class QuestionDialog implements Focusable {
     this.editor.focused = false;
     this.selectedOptions = new Set<number>();
     this.selectedRow = 0;
+    this.viewportStart = 0;
+    this.manualViewport = false;
     const previous = this.answers[this.questionIndex];
     const selected = previous?.selected;
     const selections = selected === undefined ? [] : Array.isArray(selected) ? selected : [selected];
@@ -377,9 +393,10 @@ export class QuestionDialog implements Focusable {
   }
 
   private frame(value: string, width: number): string {
-    const contentWidth = Math.max(1, width - 4);
+    const contentWidth = Math.max(0, width - 4);
     const text = truncateToWidth(value, contentWidth);
     const padding = " ".repeat(Math.max(0, contentWidth - visibleWidth(text)));
+    if (width < 4) return truncateToWidth(this.theme.fg("borderAccent", "│".repeat(width)), width);
     return `${this.theme.fg("borderAccent", "│")} ${text}${padding} ${this.theme.fg("borderAccent", "│")}`;
   }
 

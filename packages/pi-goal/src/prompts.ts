@@ -34,7 +34,14 @@ export function buildResumePrompt(goal: GoalPromptContext, stoppedStatus: GoalSt
 export function buildGoalSystemPrompt(goal: GoalPromptContext) {
   const budgetLine =
     goal.tokenBudget === undefined ? "" : `\n- Respect the goal token budget (${formatBudget(goal)} used).`;
-  return `Active /goal:\n${goalContextBlock(goal)}\n\n${goalModeRules("the active goal")}${budgetLine}`;
+  return `Active /goal:\n${goalContextBlock(goal)}\n\nA later Goal runtime binding update can replace this goal_id after real input resumes a wait. Use its current goal_id, not the earlier binding.\n\n${goalModeRules("the active goal")}${budgetLine}`;
+}
+
+export const GOAL_BINDING_UPDATE_HEADER =
+  "Goal runtime binding update: real input resumed the waiting goal. This current goal_id supersedes the earlier binding.";
+
+export function buildGoalBindingUpdate(goal: GoalPromptContext) {
+  return `${GOAL_BINDING_UPDATE_HEADER}\n\n${goalCompletionGuardBlock(goal)}`;
 }
 
 export function buildContinuePrompt(goal: GoalPromptContext, marker: string) {

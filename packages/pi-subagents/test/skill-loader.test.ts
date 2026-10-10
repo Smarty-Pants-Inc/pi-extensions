@@ -2,7 +2,10 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { preloadSkills } from "../src/skill-loader.js";
+import { preloadSkills as loadSkills } from "../src/skill-loader.js";
+
+// Ordinary lookup tests explicitly authorize their project fixture.
+const preloadSkills = (names: string[], cwd: string) => loadSkills(names, cwd, { projectTrusted: true });
 
 describe("preloadSkills", () => {
   let tmpDir: string;
@@ -91,6 +94,13 @@ describe("preloadSkills", () => {
   it("finds nested <subdir>/<name>/SKILL.md", () => {
     writeSkillDir(join(projectRoot(), "dev-tools"), "using-modern-cli", "# Modern CLI");
     expect(preloadSkills(["using-modern-cli"], tmpDir)[0].content).toContain("Modern CLI");
+  });
+
+  it("excludes both denied project roots while preserving global named skills", () => {
+    writeFlat(projectRoot(), "shared", "denied-pi");
+    writeSkillDir(join(tmpDir, ".agents", "skills"), "shared", "denied-agents");
+    writeFlat(globalRoot(), "shared", "global-only");
+    expect(loadSkills(["shared"], tmpDir, { projectTrusted: false })[0].content).toBe("global-only");
   });
 
   it("prefers project over global", () => {

@@ -33,7 +33,7 @@ describe("Pi SDK extension skill loading", () => {
     const loader = new DefaultResourceLoader({
       cwd,
       agentDir,
-      settingsManager: SettingsManager.create(cwd, agentDir),
+      settingsManager: SettingsManager.create(cwd, agentDir, { projectTrusted: true }),
       noExtensions: true,
       noSkills: restricted,
       ...(restricted ? { skillsOverride: () => ({ skills: [], diagnostics: [] }) } : {}),
@@ -65,7 +65,7 @@ describe("Pi SDK extension skill loading", () => {
 
   it("keeps only named preloaded skills when an extension contributes another", async () => {
     const { cwd, agentDir, extension } = fixture();
-    const selected = preloadSkills(["selected-skill"], cwd);
+    const selected = preloadSkills(["selected-skill"], cwd, { projectTrusted: true });
     expect(selected).toHaveLength(1);
     expect(selected[0].content).toContain("selected-skill content");
 
