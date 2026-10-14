@@ -14,6 +14,7 @@ import planMode, {
   stripProposedPlanBlocks,
   stripProposedPlanBlocksFromMessage,
 } from "../src/plan-mode.js";
+import { nativeInput } from "./native-input.js";
 import { createMockContext, createMockPi } from "./support.js";
 
 test("plan-mode registers flag, question tool, command, and safety hooks", () => {
@@ -495,9 +496,11 @@ test("Plan lifecycle enters with a prompt and hands a valid plan to implementati
     select: async () => "Implement here",
   });
   await mock.commands.get("plan")?.handler("design it", context.ctx);
-  assert.deepEqual(mock.sentUserMessages[0], { text: "design it", options: undefined });
+  assert.match(mock.sentUserMessages[0]?.text ?? "", /^design it\n\n<!-- pi-plan-delivery:/u);
+  assert.equal(mock.sentUserMessages[0]?.options, undefined);
   assert.deepEqual(mock.rawPi.getActiveTools(), ["bash", "read", "plan_mode_question", "plan_mode_complete"]);
 
+  await nativeInput(mock, context.ctx, mock.sentUserMessages[0]?.text ?? "", "extension");
   await mock.events.get("agent_end")?.[0]?.(
     { messages: [{ role: "assistant", content: "<proposed_plan>\n# Ship it\n</proposed_plan>" }] },
     context.ctx,
@@ -642,6 +645,7 @@ test("invalid proposed plans remain unready and notify the user", async () => {
   planMode(mock.pi);
   const context = createMockContext();
   await mock.commands.get("plan")?.handler("start", context.ctx);
+  await nativeInput(mock, context.ctx);
   await mock.events.get("agent_end")?.[0]?.(
     { messages: [{ role: "assistant", content: "<proposed_plan>unfinished" }] },
     context.ctx,
@@ -744,6 +748,7 @@ test("legacy plan completion is presented once only after settlement", async () 
     },
   });
   await mock.commands.get("plan")?.handler("start", context.ctx);
+  await nativeInput(mock, context.ctx);
   await mock.events.get("agent_end")?.[0]?.(
     { messages: [{ role: "assistant", content: "<proposed_plan>\n# Legacy\n</proposed_plan>" }] },
     context.ctx,
@@ -828,6 +833,7 @@ test("repeated legacy agent_end events produce one settled presentation", async 
     },
   });
   await mock.commands.get("plan")?.handler("start", context.ctx);
+  await nativeInput(mock, context.ctx);
   const event = {
     messages: [{ role: "assistant", content: "<proposed_plan>\n# Retry\n</proposed_plan>" }],
   };
@@ -861,6 +867,7 @@ test("stale settled legacy presentation is ignored without losing ready state", 
   planMode(mock.pi);
   const context = createMockContext({ hasUI: false });
   await mock.commands.get("plan")?.handler("start", context.ctx);
+  await nativeInput(mock, context.ctx);
   await mock.events.get("agent_end")?.[0]?.(
     {
       messages: [{ role: "assistant", content: "<proposed_plan>\n# Persisted\n</proposed_plan>" }],
@@ -890,6 +897,7 @@ test("a newer Plan turn cancels stale ready presentation", async () => {
     | undefined;
   assert.ok(execute);
   await execute("complete", { plan: "# Stale" }, undefined, undefined, context.ctx);
+  await nativeInput(mock, context.ctx);
   await mock.events.get("before_agent_start")?.[0]?.({ systemPrompt: "base" }, context.ctx);
   await mock.events.get("agent_settled")?.[0]?.({}, context.ctx);
   assert.equal(selectCalls, 0);

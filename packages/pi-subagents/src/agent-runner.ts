@@ -17,6 +17,7 @@ import {
   DefaultResourceLoader,
   type ExtensionAPI,
   getAgentDir,
+  type ResolvedResource,
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
@@ -28,6 +29,7 @@ import { extractText } from "./context.js";
 import { assertNoRawInheritance, assertSafeChildSession } from "./context-boundary.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
+import { extensionResourceIdentity, resolveExtensionResourceNames } from "./extension-resource-names.js";
 import { formatGateVerdict, type GateExec, runGate, workspaceFingerprint } from "./gate.js";
 import {
   INTERNAL_AGENT_CONFIG_OVERRIDE,
@@ -40,6 +42,7 @@ import { type ModelRegistry, resolveModel, shortModelLabel } from "./model-resol
 import { parentModelSessionOptions } from "./model-runtime-bridge.js";
 import { checkModelScope } from "./model-scope.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
+import { ANSWER_SUBAGENT_QUESTION, type ParentQuestionHandler } from "./parent-questions.js";
 import { captureProjectTrust, childProjectTrust, configurationMcpFactory, isProjectResource } from "./project-trust.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
 import { shutdownAndDisposeSession } from "./session-lifecycle.js";
@@ -57,6 +60,7 @@ export const SUBAGENT_TOOL_NAMES = {
   AGENT: "Agent",
   GET_RESULT: "get_subagent_result",
   STEER: "steer_subagent",
+  ANSWER_QUESTION: ANSWER_SUBAGENT_QUESTION,
 } as const;
 
 /** Names of tools registered by this extension that subagents must NOT inherit. */
@@ -241,8 +245,9 @@ function extensionToolNamesInScope(session: AgentSession, ctx: {
   extNames: Set<string>;
   narrowing: Map<string, Set<string>>;
   nestedToolNames: Set<string>;
+  resolvedNames: Map<string, string[]>;
 }): () => Set<string> {
-  const { loader, toolNames, disallowedSet, extNames, narrowing, nestedToolNames } = ctx;
+  const { loader, toolNames, disallowedSet, extNames, narrowing, nestedToolNames, resolvedNames } = ctx;
   const builtins = new Set(toolNames);
   return () => {
     const keep = new Set<string>();
@@ -258,7 +263,7 @@ function extensionToolNamesInScope(session: AgentSession, ctx: {
       const path = tool.sourceInfo.path;
       const extension = extensionsByPath.get(path);
       if (extension) {
-        const canons = extensionCanonicalNames(extension.path);
+        const canons = resolvedNames.get(extension.path) ?? extensionCanonicalNames(extension.path);
         if (optInActive && !canons.some((c) => extNames.has(c))) continue;
         // First alias that carries a narrowing set — a user won't narrow one
         // extension under two different names, so first-match is correct.
@@ -685,7 +690,9 @@ export interface RunOptions {
    * Defaults to on wherever there is a UI to ask through; `false` withholds the
    * tool entirely rather than injecting one that always refuses.
    */
-  supervisorQuestions?: boolean;
+  supervisorQuestions?: boolean | "parent";
+  /** Manager-issued root clarification channel; never supplied by child tool args. */
+  parentQuestion?: ParentQuestionHandler;
   /** Runtime bridge for opt-in child-safe nested delegation. */
   nestedRuntime?: {
     manager: NestedAgentManager;
@@ -902,6 +909,9 @@ export async function runAgent(
   // an already-cancelled caller. This matters for tool-call signals: the
   // caller may be cancelled before this async function gets its first turn.
   throwIfAborted(options.signal);
+  if (options.supervisorQuestions === "parent" && !options.parentQuestion) {
+    throw new Error('Parent clarification requires a manager-issued background channel. Use Agent with run_in_background: true and supervisor_questions: "parent".');
+  }
   const parentProjectTrust = captureProjectTrust(ctx);
   // Configuration provenance is established synchronously, before definition
   // admission, model setup, callbacks, or any await. Execution cwd is not trust.
@@ -1086,12 +1096,12 @@ export async function runAgent(
   const settingsManager = SettingsManager.create(configCwd, agentDir, { projectTrusted });
 
   // Extension loading:
-  // - true  → all default-discovered extensions
+  // - true  → all child-safe default-discovered extensions
   // - false → none (noExtensions)
   // - string[] → allowlist. Bare names keep matching default-discovered
   //   extensions; path entries load explicitly; "*" keeps all defaults.
-  //   On Pi with replaceable built-ins, restrictive policies resolve paths
-  //   before loading, so excluded factories cannot replace a selected built-in.
+  //   Resolve enabled resources before loading: excluded factories cannot
+  //   replace selected built-ins or schedule unmanaged asynchronous wakes.
   //
   // Suppress AGENTS.md/CLAUDE.md and APPEND_SYSTEM.md — upstream's
   // buildSystemPrompt() re-appends both AFTER systemPromptOverride, which
@@ -1112,12 +1122,11 @@ export async function runAgent(
     : undefined;
   const keepNames = extensionsSpec?.names ?? new Set<string>();
   // `exclude_extensions:` is a denylist applied AFTER the include set — exclude wins.
-  // Plain canonical names only (case-insensitive). Without preselection,
-  // filtering is post-factory, not a sandbox for extensions that already loaded.
+  // Plain canonical names only (case-insensitive). Preselection prevents
+  // factory execution, but resolving packages is not an untrusted-code sandbox.
   const excludeNames = new Set((excludeExtensions ?? []).map((n) => n.toLowerCase()));
   const hasExcludes = excludeNames.size > 0;
-  // The override filters without preselection, validates preselection when used,
-  // and ALWAYS puts our tool policy first. Pi passes one mutable
+  // The override validates preselection and ALWAYS puts our tool policy first. Pi passes one mutable
   // tool_call event through handlers in extension order; if an earlier extension
   // changes event.toolName, a later gate would inspect a different name from the
   // one Pi actually executes. Ordering before untrusted handlers is essential.
@@ -1131,6 +1140,7 @@ export async function runAgent(
   let discoveredNames: Set<string> | undefined;
   let prefilteredExtensionPaths: Set<string> | undefined;
   const resolvedExplicitNames = new Set<string>();
+  let resolvedNames = new Map<string, string[]>();
   const interactiveAskNames = new Set(ctx.hasUI ? (agentConfig?.askTools ?? []).map((name) => name.toLowerCase()) : []);
   const approvalTimer: ApprovalTimer = {
     hasInteractiveAsk: interactiveAskNames.size > 0,
@@ -1226,11 +1236,12 @@ export async function runAgent(
   // discovered extension can register /mcp, replace builtin:mcp, and only then
   // get filtered out by our allowlist. Resolve configured resources through the
   // public package API first and feed only the selected paths into a loader with
-  // discovery off. Without the built-in factory capability, retain the
-  // post-load filtering fallback rather than assuming replacement behavior.
+  // discovery off. Always preselect, even under default inheritance: a
+  // pi-background factory can schedule model wakes beyond session.prompt(),
+  // after the manager has completed the record and cleaned its worktree.
   const builtinNames = extensionFactories.filter((factory) => typeof factory !== "function" && factory.builtin)
     .map((factory) => factory.name);
-  const prefilter = !noExtensions && (!loadAll || hasExcludes || !projectTrusted) && builtinNames.length > 0;
+  const prefilter = !noExtensions;
   if (prefilter) {
     await settingsManager.reload();
     throwIfAborted(options.signal);
@@ -1240,31 +1251,54 @@ export async function runAgent(
     // state or replace its source-resolution rules with path heuristics.
     const configured = await packages.resolve();
     throwIfAborted(options.signal);
-    const explicit = await packages.resolveExtensionSources(extensionsSpec?.paths ?? [], { temporary: true });
-    throwIfAborted(options.signal);
+    // Validate each source before cross-source dedup discards valid alias metadata.
+    const explicitSources = new Map<string, ResolvedResource[]>();
     for (const source of extensionsSpec?.paths ?? []) {
-      if (!existsSync(source) || !explicit.extensions.some((resource) => resource.enabled && resource.metadata.source === source)) {
+      const resolved = await packages.resolveExtensionSources([source], { temporary: true });
+      throwIfAborted(options.signal);
+      const enabled = resolved.extensions.filter(resource => resource.enabled);
+      if (!existsSync(source) || enabled.length === 0) {
         throw new Error(`Extension source "${source}" requested by agent "${type}" was not found or has no enabled extensions.`);
       }
+      explicitSources.set(source, enabled);
     }
+    const explicitResources = [...explicitSources.values()].flat();
     settingsBeforeLoad = JSON.stringify([settingsManager.getGlobalSettings(), settingsManager.getProjectSettings()]);
-    const enabledConfigured = configured.extensions.filter((resource) => resource.enabled && !deniedProjectResource(resource.path)).map((resource) => resource.path);
-    const enabledExplicit = explicit.extensions.filter((resource) => resource.enabled);
+    const enabledConfigured = configured.extensions.filter((resource) => resource.enabled && !deniedProjectResource(resource.path));
+    const enabledExplicit = explicitResources;
     for (const resource of enabledExplicit) {
       if (deniedProjectResource(resource.path)) {
         throw new Error(`Project extension "${resource.path}" requested by agent "${type}" is not trusted.`);
       }
     }
-    discoveredNames = new Set([...enabledConfigured, ...enabledExplicit.map((resource) => resource.path)].flatMap(extensionCanonicalNames));
+    const resolved = await resolveExtensionResourceNames(
+      [...configured.extensions.filter(resource => !deniedProjectResource(resource.path)), ...enabledExplicit],
+      packages, extensionCanonicalNames,
+    );
+    throwIfAborted(options.signal);
+    resolvedNames = resolved.names;
+    discoveredNames = new Set([...enabledConfigured, ...enabledExplicit]
+      .flatMap(resource => resolvedNames.get(resource.path) ?? []));
+    let warnedBackground = false;
+    const admitChildExtension = (resource: ResolvedResource, intentional: boolean): boolean => {
+      if (!resolvedNames.get(resource.path)?.includes("pi-background")) return true;
+      const reason = `pi-background cannot load in agent "${type}": managed child sessions do not support asynchronous model wakes after completion/worktree cleanup`;
+      if (intentional) throw new Error(`${reason} (requested extension "${resource.path}").`);
+      if (!warnedBackground) {
+        warnedBackground = true;
+        options.onToolActivity?.({ type: "end", toolName: `extension-error:${reason}; excluded from inherited resources` });
+      }
+      return false;
+    };
     const selectedExplicit = enabledExplicit.filter((resource) =>
-      !extensionCanonicalNames(resource.path).some((name) => excludeNames.has(name)));
-    const explicitPaths = new Set(selectedExplicit.map((resource) => resource.path));
+      !resolvedNames.get(resource.path)?.some((name) => excludeNames.has(name)) && admitChildExtension(resource, true));
+    const explicitPaths = new Set(selectedExplicit.map((resource) => extensionResourceIdentity(resource.path)));
     // For priority, use the package's declared name rather than a generic entry
     // alias like "src"; unrelated packages often have src/index.ts too.
     const explicitNames = new Set(selectedExplicit.map((resource) =>
-      extensionPackageName(resource.path) ?? extensionCanonicalName(resource.path)));
-    for (const source of extensionsSpec?.paths ?? []) {
-      if (selectedExplicit.some((resource) => resource.metadata.source === source)) {
+      resolved.packageName(resource) ?? extensionCanonicalName(resource.path)));
+    for (const [source, resources] of explicitSources) {
+      if (resources.some(resource => explicitPaths.has(extensionResourceIdentity(resource.path)))) {
         resolvedExplicitNames.add(extensionCanonicalName(source));
       }
     }
@@ -1272,15 +1306,23 @@ export async function runAgent(
       // The loader normally loads temporary paths before discovered paths. Keep
       // that priority (including for directory/package paths with many entries).
       ...selectedExplicit.map((resource) => resource.path),
-      ...enabledConfigured.filter((path) => {
-        const names = extensionCanonicalNames(path);
+      ...enabledConfigured.filter((resource) => {
+        const names = resolvedNames.get(resource.path) ?? extensionCanonicalNames(resource.path);
         if (names.some((name) => excludeNames.has(name))) return false;
-        if (explicitPaths.has(path) || explicitNames.has(extensionPackageName(path) ?? extensionCanonicalName(path))) return false;
-        return loadAll || names.some((name) => bareNames.has(name));
-      }),
+        if (explicitPaths.has(extensionResourceIdentity(resource.path)) ||
+            explicitNames.has(resolved.packageName(resource) ?? extensionCanonicalName(resource.path))) return false;
+        const intentional = names.some((name) => bareNames.has(name));
+        return (loadAll || intentional) && admitChildExtension(resource, intentional);
+      }).map((resource) => resource.path),
     ];
-    prefilteredExtensionPaths = new Set(selectedPaths);
-    additionalExtensionPaths = [...prefilteredExtensionPaths];
+    const seen = new Set<string>();
+    additionalExtensionPaths = selectedPaths.filter(path => {
+      const identity = extensionResourceIdentity(path);
+      if (seen.has(identity)) return false;
+      seen.add(identity);
+      return true;
+    });
+    prefilteredExtensionPaths = new Set(additionalExtensionPaths);
   }
 
   const loader = new DefaultResourceLoader({
@@ -1310,7 +1352,12 @@ export async function runAgent(
       throw new Error(`Pi extension settings changed while loading agent "${type}"; retry with the current settings.`);
     }
     const loadedPaths = new Set(loader.getExtensions().extensions.map((extension) => extension.path));
-    for (const path of prefilteredExtensionPaths) {
+    // Preserve ordinary unrestricted inheritance: Pi may drop a faulty factory
+    // or let a replaceable built-in yield to another discovered extension. The
+    // original restrictive preselection still requires every selected path.
+    const validateSelected = !loadAll || hasExcludes || !projectTrusted ||
+      bareNames.size > 0 || (extensionsSpec?.paths.length ?? 0) > 0;
+    for (const path of validateSelected ? prefilteredExtensionPaths : []) {
       if (!loadedPaths.has(path)) {
         const diagnostic = loader.getExtensions().errors.find((error) => error.path === path);
         throw new Error(`Selected extension "${path}" was not loaded for agent "${type}"${diagnostic ? `: ${diagnostic.error}` : " (possibly replaced by another extension)"}.`);
@@ -1371,7 +1418,7 @@ export async function runAgent(
   }
   if (keepNames.size > 0 || extNames.size > 0) {
     const survivingNames = new Set(
-      loader.getExtensions().extensions.flatMap((e) => extensionCanonicalNames(e.path)),
+      loader.getExtensions().extensions.flatMap((e) => resolvedNames.get(e.path) ?? extensionCanonicalNames(e.path)),
     );
     for (const name of keepNames) {
       // A directory/package source can resolve to entries with different
@@ -1460,8 +1507,9 @@ export async function runAgent(
   // only a human to answer, which `hasUI` decides. Isolation still suppresses
   // it: an `isolated: true` agent is defined as built-in tools only.
   const supervisorTools =
-    ctx.hasUI && !isolated && options.supervisorQuestions !== false
+    (ctx.hasUI || options.supervisorQuestions === "parent") && !isolated && options.supervisorQuestions !== false
       ? createSupervisorTool({
+          ...(options.supervisorQuestions === "parent" ? { parentQuestion: options.parentQuestion } : {}),
           // Use the canonical agent type, not display_name: the question must
           // identify the actual subagent that requested the decision.
           agentLabel: agentConfig?.name ?? type,
@@ -1609,7 +1657,7 @@ export async function runAgent(
     throwIfAborted(options.signal);
 
   const inScope = noExtensions ? undefined : extensionToolNamesInScope(session, {
-    loader, toolNames, disallowedSet, extNames, narrowing, nestedToolNames,
+    loader, toolNames, disallowedSet, extNames, narrowing, nestedToolNames, resolvedNames,
   });
   checkToolCall = async (name, input, deadline) => {
     const run = async (): Promise<ToolCallEventResult | undefined> => {

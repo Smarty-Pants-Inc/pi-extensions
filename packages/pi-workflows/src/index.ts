@@ -1,14 +1,11 @@
 import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
+import { sanitizeDisplayText } from "@signalridge/pi-ui";
 import { Type } from "@sinclair/typebox";
-import {
-  DEFAULT_TRIGGER_WORD,
-  deduplicateWorkflowDirective,
-  hasTriggerWord,
-  WORKFLOW_ARMED_DIRECTIVE,
-} from "./arming.js";
+import { DEFAULT_TRIGGER_WORD, hasTriggerWord, WORKFLOW_ARMING_MESSAGE_TYPE, WorkflowTurnArming } from "./arming.js";
 import { BUILTIN_WORKFLOWS, validateBuiltinArgs } from "./builtins.js";
 import { type CommandResult, resolveCodeReviewScope } from "./code-review-scope.js";
 import { type ScriptStartOptions, type ScriptStartResult, WorkflowEngine, WorkflowWaitAbortedError } from "./engine.js";
@@ -335,6 +332,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
   let shutdownQuiesce: Promise<{ settled: boolean; pending: string[]; diagnostic?: string }> | undefined;
   let lifecycleGeneration = 0;
   let deliveryGeneration = 0;
+  const deliveryObservers = new Map<string, string>();
   let handledTreeEvent: unknown;
   let journalBranchAnchor: string | null | undefined;
   let protocolAbortController: AbortController | undefined;
@@ -343,9 +341,24 @@ export default function piWorkflows(pi: ExtensionAPI): void {
   let effortLevel: "off" | "high" | "ultra" = workflowSettings.effort;
   let triggerKeyword: string | undefined = workflowSettings.keywordTriggerWord;
   let keywordTriggerEnabled = workflowSettings.keywordTriggerEnabled;
-  /** Per-session delivery endpoint for background-run results (A10 fail-closed). */
-  let deliverResult: ((text: string, details?: unknown) => void) | undefined;
-  /** Pending deliveries for runs that settled before a session endpoint was bound (A10). */
+  /** Public sends are void: acceptance is checked against the owning branch. */
+  let deliveryContext: ExtensionContext | undefined;
+  let deliveryTimer: ReturnType<typeof setTimeout> | undefined;
+  let inputPreparing = false;
+  const turnArming = new WorkflowTurnArming();
+  let compacting = false;
+  let navigating = false;
+  let deliveryBranchAnchor: string | null | undefined;
+  const DELIVERY_WAKE_PREFIX = "[pi-workflows:wake:";
+  const DELIVERY_WAKE_TEXT = "Workflow results are ready in the preceding context.";
+  const MAX_WAKE_ADMISSIONS = 256;
+  // Private, one-use admissions survive an earlier awaited input handler, not
+  // a lifecycle retirement. Missing/evicted IDs fail closed without tombstones.
+  const wakeAdmissions = new Map<
+    string,
+    { generation: number; context: ExtensionContext; engine: WorkflowEngine; anchor: string | null | undefined }
+  >();
+  /** Pending deliveries for completed runs, including durable recovery (A10). */
   const pendingDeliveryMarkers = new Map<string, { text: string; timestamp: number }>();
   const PENDING_DELIVERY_TYPE = "pi-workflows:pending-delivery";
   const PENDING_DELIVERY_ACK_TYPE = "pi-workflows:pending-delivery-ack";
@@ -382,21 +395,46 @@ export default function piWorkflows(pi: ExtensionAPI): void {
     else console.warn(`[pi-workflows] ${notice}`);
     return { cancel: true };
   };
+  const invalidateDelivery = (): void => {
+    deliveryGeneration++;
+    deliveryObservers.clear();
+    turnArming.retire();
+    wakeAdmissions.clear();
+    if (deliveryTimer) clearTimeout(deliveryTimer);
+    deliveryTimer = undefined;
+  };
   const beginShutdownQuiesce = (): Promise<{ settled: boolean; pending: string[]; diagnostic?: string }> => {
     if (shutdownQuiesce) return shutdownQuiesce;
+    // Retire admission and delivery BEFORE aborting children, including when
+    // subagents initiates shutdown first. Journal cleanup retains its separate
+    // lifecycle generation until the native shutdown hook finishes quiescence.
+    active = false;
+    invalidateDelivery();
+    deliveryContext = undefined;
     const closingEngine = engine;
-    if (!closingEngine || closingEngine.isDisposed()) return Promise.resolve({ settled: true, pending: [] });
-    shutdownQuiesce = closingEngine.quiesceForBranchChange().catch((error: unknown) => ({
-      settled: false,
-      pending: [],
-      diagnostic: error instanceof Error ? error.message : String(error),
-    }));
+    if (!closingEngine || closingEngine.isDisposed()) {
+      shutdownQuiesce = Promise.resolve({ settled: true, pending: [] });
+      return shutdownQuiesce;
+    }
+    // Publish the handshake promise before abort can synchronously re-enter
+    // the bus through an owned-child cleanup callback.
+    let settle: (result: { settled: boolean; pending: string[]; diagnostic?: string }) => void = () => {};
+    shutdownQuiesce = new Promise((resolve) => {
+      settle = resolve;
+    });
+    void closingEngine.quiesceForBranchChange().then(settle, (error: unknown) => {
+      settle({
+        settled: false,
+        pending: [],
+        diagnostic: error instanceof Error ? error.message : String(error),
+      });
+    });
     return shutdownQuiesce;
   };
   // Subagents starts this handshake before retiring the owned-agent RPC. When
   // workflows shuts down first, its native hook performs the same operation.
   pi.events.on("pi-workflows:shutdown-quiesce", (raw: unknown) => {
-    if (!active || !engine) return;
+    if (!engine) return;
     const respond = (raw as { respond?: unknown } | null)?.respond;
     if (typeof respond === "function") respond(beginShutdownQuiesce());
   });
@@ -405,6 +443,8 @@ export default function piWorkflows(pi: ExtensionAPI): void {
     const event = (raw as { event?: unknown } | null)?.event;
     if (!event || event === handledTreeEvent) return;
     handledTreeEvent = event;
+    invalidateDelivery();
+    pendingDeliveryMarkers.clear();
     engine.fenceCommittedBranch();
   });
 
@@ -489,7 +529,21 @@ export default function piWorkflows(pi: ExtensionAPI): void {
     active = true;
     const workflowEngine = currentEngine();
     workflowEngine.onRunSettled = notifyRunChanged;
+    workflowEngine.onBackgroundExecution = (runId) => void deliverBackgroundResult(workflowEngine, runId);
     workflowEngine.onRuntimeEvent = notifyRunChanged;
+    if (typeof pi.registerMessageRenderer === "function") {
+      pi.registerMessageRenderer("pi-workflows:delivery", (message, { expanded }, theme) => {
+        const original =
+          typeof message.content === "string"
+            ? message.content
+            : message.content
+                .filter((part) => part.type === "text")
+                .map((part) => part.text)
+                .join("\n");
+        const display = sanitizeDisplayText(original, { multiline: true });
+        return new Text(theme.fg("toolOutput", display.slice(0, expanded ? 8000 : 2000)), 0, 0);
+      });
+    }
     // `control("resume")` and the provider-limit retry start executions with no
     // caller to pass options for them, and the strength table is deliberately
     // never frozen onto a run. Without this they would resume with no table and
@@ -519,11 +573,13 @@ export default function piWorkflows(pi: ExtensionAPI): void {
         ],
         parameters: WorkflowToolSchema,
         renderCall(args, theme) {
-          const label = args.name ?? (args.script !== undefined ? "script" : "");
+          const label = sanitizeDisplayText(args.name ?? (args.script !== undefined ? "script" : ""));
           return new Text(theme.fg("toolTitle", theme.bold(`Workflow ${label}`)), 0, 0);
         },
         renderResult(result, { expanded, isPartial }, theme) {
-          const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+          const text = sanitizeDisplayText(result.content[0]?.type === "text" ? result.content[0].text : "", {
+            multiline: true,
+          });
           if (isPartial) return new Text(theme.fg("warning", "Workflow running…"), 0, 0);
           const preview = expanded ? text.slice(0, 8_000) : text.split("\n").slice(0, 4).join("\n");
           return new Text(
@@ -585,7 +641,6 @@ export default function piWorkflows(pi: ExtensionAPI): void {
                 replacement,
               );
               if (!resumed) return textResult(`Workflow run not found: ${params.resumeFromRunId}`);
-              if (resumed.background) void deliverBackgroundResult(workflowEngine, resumed.runId);
               return textResult(formatStart(resumed), resumed);
             }
             const result = await workflowEngine.start(script, options);
@@ -610,10 +665,16 @@ export default function piWorkflows(pi: ExtensionAPI): void {
           "List, inspect, pause, resume, stop, or remove workflow runs with bounded machine-readable output.",
         parameters: ControlSchema,
         renderCall(args, theme) {
-          return new Text(theme.fg("toolTitle", theme.bold(`Workflow control: ${args.action ?? ""}`)), 0, 0);
+          return new Text(
+            theme.fg("toolTitle", theme.bold(`Workflow control: ${sanitizeDisplayText(args.action ?? "")}`)),
+            0,
+            0,
+          );
         },
         renderResult(result, { expanded }, theme) {
-          const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+          const text = sanitizeDisplayText(result.content[0]?.type === "text" ? result.content[0].text : "", {
+            multiline: true,
+          });
           return new Text(theme.fg("dim", expanded ? text.slice(0, 8_000) : text.slice(0, 1_000)), 0, 0);
         },
         async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
@@ -950,7 +1011,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
     // /workflows-trigger: keyword arming (A5). Typing the bounded word
     // `workflow`/`workflows` — or a configured synonym — in an ordinary message
     // counts as an explicit opt-in to multi-agent orchestration, and the message
-    // is annotated to say so. Arming AUTHORIZES the tool; it never forces a run,
+    // receives hidden model guidance. Arming AUTHORIZES the tool; it never forces a run,
     // and it never opens UI. A user asking a question about workflows still gets
     // an ordinary answer.
     const TRIGGER_WORD_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,31}$/u;
@@ -1003,77 +1064,66 @@ export default function piWorkflows(pi: ExtensionAPI): void {
       },
     });
 
-    // Keyword arming input hook (A5). The message is annotated rather than
-    // acted on: the model is told it may use the `workflow` tool and may still
+    // Keyword arming input hook (A5). Record provenance, never append model
+    // guidance to native user text: the model may use `workflow` and may still
     // decline, which is what keeps "how do workflows work?" an ordinary
     // question. Nothing is swallowed and no UI opens.
-    pi.on("input", (event) => {
-      if (event.source === "extension") return { action: "continue" as const };
-      const deduplicatedText = deduplicateWorkflowDirective(event.text);
-      if (deduplicatedText !== event.text) {
-        return {
-          action: "transform" as const,
-          text: deduplicatedText,
-          ...(event.images ? { images: event.images } : {}),
-        };
-      }
-      const explicitTrigger = keywordTriggerEnabled && hasTriggerWord(event.text, triggerKeyword);
-      const substantive = effortLevel !== "off" && event.text.trim().length >= 16 && !event.text.trim().startsWith("/");
-      if (!explicitTrigger && !substantive) return { action: "continue" as const };
-      if (event.text.includes(WORKFLOW_ARMED_DIRECTIVE)) return { action: "continue" as const };
-      const effortDirective =
-        effortLevel === "ultra"
-          ? 'Effort: ULTRA. Be exhaustive: use broad parallel review, verification, and completeness checks. Width is where the exhaustiveness goes: keep steps at strength: "medium" and reserve "high" for a step whose error is expensive to reverse, if the run has one at all.'
-          : effortLevel === "high"
-            ? "Effort: HIGH. Be thorough: use several independent reviewers and an adversarial verification pass."
-            : "";
-      return {
-        action: "transform" as const,
-        text: `${event.text}\n\n${WORKFLOW_ARMED_DIRECTIVE}${effortDirective ? `\n${effortDirective}` : ""}`,
-        ...(event.images ? { images: event.images } : {}),
-      };
-    });
-
-    // Input transforms can be chained with handlers loaded after this package.
-    // Normalize only our own repeated marker again at the final context boundary;
-    // unrelated plugin content and hooks remain untouched.
-    pi.on("context", (event) => {
-      type UserMessage = Extract<(typeof event.messages)[number], { role: "user" }>;
-      let lastUserIndex = -1;
-      let lastUserMessage: UserMessage | undefined;
-      for (let index = 0; index < event.messages.length; index += 1) {
-        const message = event.messages[index];
-        if (message && "role" in message && message.role === "user") {
-          lastUserIndex = index;
-          lastUserMessage = message;
+    pi.on("input", (event, ctx) => {
+      const ownWake = event.source === "extension" && event.text.startsWith(DELIVERY_WAKE_PREFIX);
+      if (ownWake) {
+        const admission = wakeAdmissions.get(event.text);
+        wakeAdmissions.delete(event.text); // exact, one-use ownership, even on rejection
+        if (
+          !admission ||
+          admission.generation !== deliveryGeneration ||
+          admission.context !== deliveryContext ||
+          admission.engine !== engine ||
+          !canDeliver()
+        ) {
+          turnArming.retire();
+          return { action: "handled" as const };
+        }
+        try {
+          if (
+            admission.anchor &&
+            !admission.context.sessionManager.getBranch().some((entry) => entry.id === admission.anchor)
+          ) {
+            turnArming.retire();
+            return { action: "handled" as const };
+          }
+        } catch {
+          turnArming.retire();
+          return { action: "handled" as const };
         }
       }
-      const message = lastUserMessage;
-      if (lastUserIndex < 0 || !message || !("content" in message)) return;
-      let seen = false;
-      const deduplicate = (text: string): string =>
-        text.replaceAll(WORKFLOW_ARMED_DIRECTIVE, (directive) => {
-          if (seen) return "";
-          seen = true;
-          return directive;
-        });
-      const content =
-        typeof message.content === "string"
-          ? deduplicate(message.content)
-          : message.content.map((part) => {
-              if (part.type !== "text") return part;
-              const text = deduplicate(part.text);
-              return text === part.text ? part : { ...part, text };
-            });
-      if (
-        content === message.content ||
-        (Array.isArray(content) && content.every((part, index) => part === message.content[index]))
-      )
-        return;
-      const messages = event.messages.slice();
-      messages[lastUserIndex] = { ...message, content };
-      return { messages };
+      inputPreparing = true;
+      navigating = false; // a fresh prompt supersedes an uncommitted navigation
+      if (deliveryTimer) clearTimeout(deliveryTimer);
+      deliveryTimer = undefined;
+      const text = event.text;
+      const explicitTrigger = keywordTriggerEnabled && hasTriggerWord(text, triggerKeyword);
+      const substantive = effortLevel !== "off" && text.trim().length >= 16 && !text.trim().startsWith("/");
+      turnArming.observe(
+        { ...event, text },
+        ctx,
+        active && (explicitTrigger || substantive),
+        effortLevel,
+        explicitTrigger,
+      );
+      if (ownWake)
+        return {
+          action: "transform" as const,
+          text: DELIVERY_WAKE_TEXT,
+          ...(event.images ? { images: event.images } : {}),
+        };
+      return { action: "continue" as const };
     });
+
+    // Hidden guidance is turn-local, including on reload and after later hooks
+    // navigate while before_agent_start is awaiting. Never edit native history.
+    // Request-local overlays never enter native history or summarization.
+    pi.on("message_start", (event, ctx) => turnArming.messageStarted(event, ctx));
+    pi.on("context", (event, ctx) => turnArming.filterContext(event, ctx));
 
     // Standing effort mode mirrors the reference: it auto-arms substantive
     // interactive messages but remains guidance, not an inferred spend ceiling.
@@ -1171,8 +1221,64 @@ export default function piWorkflows(pi: ExtensionAPI): void {
 
     // Neither before-event is a commit point. Pi can veto in a later handler,
     // or summarization may abort after every handler has run.
-    pi.on("session_before_switch", (_event, ctx) => navigationPreflight(ctx));
-    pi.on("session_before_tree", (_event, ctx) => navigationPreflight(ctx));
+    const beforeNavigation = (ctx: ExtensionContext): { cancel: true } | undefined => {
+      turnArming.retire();
+      const veto = navigationPreflight(ctx);
+      if (!veto) {
+        navigating = true;
+        if (deliveryTimer) clearTimeout(deliveryTimer);
+        deliveryTimer = undefined;
+      }
+      return veto;
+    };
+    pi.on("session_before_switch", (_event, ctx) => beforeNavigation(ctx));
+    pi.on("session_before_tree", (event, ctx) => {
+      // The public preparation array is mutable; remove only legacy owned
+      // custom guidance, never quoted user content or stored history.
+      const entries = event.preparation?.entriesToSummarize ?? [];
+      for (let index = entries.length - 1; index >= 0; index--) {
+        const entry = entries[index];
+        if (entry?.type === "custom_message" && entry.customType === WORKFLOW_ARMING_MESSAGE_TYPE)
+          entries.splice(index, 1);
+      }
+      return beforeNavigation(ctx);
+    });
+    pi.on("session_before_fork", (_event, ctx) => beforeNavigation(ctx));
+    pi.on("before_agent_start", (event, ctx) => {
+      inputPreparing = true;
+      if (deliveryTimer) clearTimeout(deliveryTimer);
+      deliveryTimer = undefined;
+      return turnArming.consume(event, ctx);
+    });
+    pi.on("agent_start", () => {
+      inputPreparing = false;
+    });
+    pi.on("session_before_compact", (event) => {
+      for (const messages of [
+        event.preparation?.messagesToSummarize ?? [],
+        event.preparation?.turnPrefixMessages ?? [],
+      ]) {
+        for (let index = messages.length - 1; index >= 0; index--) {
+          const message = messages[index];
+          if (message?.role === "custom" && message.customType === WORKFLOW_ARMING_MESSAGE_TYPE)
+            messages.splice(index, 1);
+        }
+      }
+      compacting = true;
+      if (deliveryTimer) clearTimeout(deliveryTimer);
+      deliveryTimer = undefined;
+    });
+    const afterCompact = (): void => {
+      compacting = false;
+      schedulePendingDeliveries();
+    };
+    pi.on("session_compact", afterCompact);
+    pi.on("session_compact_failed", afterCompact);
+    pi.on("agent_settled", () => {
+      turnArming.retire();
+      inputPreparing = false;
+      schedulePendingDeliveries();
+    });
     pi.on("session_tree", (event, ctx) => {
       let workflowEngine: WorkflowEngine;
       try {
@@ -1180,6 +1286,11 @@ export default function piWorkflows(pi: ExtensionAPI): void {
       } catch {
         return;
       }
+      invalidateDelivery();
+      pendingDeliveryMarkers.clear();
+      inputPreparing = false;
+      compacting = false;
+      navigating = false;
       if (handledTreeEvent !== event) {
         // A controller abort can synchronously call stop-owned RPC. Detach the
         // old subagent records first, regardless of extension load order, so its
@@ -1188,13 +1299,16 @@ export default function piWorkflows(pi: ExtensionAPI): void {
         workflowEngine.fenceCommittedBranch();
       }
       handledTreeEvent = event;
-      deliveryGeneration++;
       try {
         const entries = ctx.sessionManager.getBranch() as unknown as SessionEntryLike[];
         journalBranchAnchor =
           ctx.sessionManager.getLeafId?.() ?? (entries.at(-1) as { id?: string } | undefined)?.id ?? null;
         workflowEngine.restore(entries);
         workflowEngine.resumeLifecycle();
+        deliveryContext = ctx;
+        deliveryBranchAnchor = journalBranchAnchor;
+        hydratePendingDeliveries(entries);
+        schedulePendingDeliveries();
       } catch (error: unknown) {
         active = false; // never resume an old branch after a failed restore
         console.warn(
@@ -1220,12 +1334,28 @@ export default function piWorkflows(pi: ExtensionAPI): void {
   };
 
   /** Background-run result delivery: fail-closed, session-bound (A10). */
-  const deliverBackgroundResult = async (engine: WorkflowEngine, runId: string): Promise<void> => {
+  const deliverBackgroundResult = async (workflowEngine: WorkflowEngine, runId: string): Promise<void> => {
     const generation = deliveryGeneration;
-    const run = await engine.waitFor(runId).catch(() => undefined);
-    if (!run || generation !== deliveryGeneration) return;
+    const executionGeneration = workflowEngine.getState(runId)?.executionGeneration;
+    const observerKey = `${generation}:${executionGeneration}`;
+    if (deliveryObservers.get(runId) === observerKey) return;
+    deliveryObservers.set(runId, observerKey);
+    while (deliveryObservers.size > 256) {
+      const oldest = deliveryObservers.keys().next().value;
+      if (oldest === undefined) break;
+      deliveryObservers.delete(oldest);
+    }
+    const run = await workflowEngine.waitFor(runId).catch(() => undefined);
+    if (
+      !run ||
+      generation !== deliveryGeneration ||
+      workflowEngine !== engine ||
+      executionGeneration !== workflowEngine.getState(runId)?.executionGeneration ||
+      !["completed", "failed", "stopped"].includes(run.status)
+    )
+      return;
     const header = `Workflow ${run.runId} ${run.status}`;
-    const state = engine.getState(runId);
+    const state = workflowEngine.getState(runId);
     const finalResult = state?.result ?? run.finalResult;
     const body =
       run.error ??
@@ -1233,41 +1363,153 @@ export default function piWorkflows(pi: ExtensionAPI): void {
         ? `completed with ${Object.keys(run.callResults).length} agent call(s).`
         : `result:\n${typeof finalResult === "string" ? finalResult : (JSON.stringify(finalResult, null, 2) ?? String(finalResult))}`);
     const text = `${header}: ${body}`;
-    if (deliverResult) {
-      try {
-        deliverResult(text);
-      } catch {
-        // Endpoint suspended or send failed — leave pending for next bind (fail-closed).
-        rememberPendingDelivery(runId, text);
-        try {
-          pi.appendEntry(PENDING_DELIVERY_TYPE, { runId, text, status: run.status, timestamp: Date.now() });
-        } catch {
-          // appendEntry is best-effort; in-memory marker still ensures flush on next bind
-        }
-      }
-    } else {
-      // No bound session endpoint — fail-closed: persist a pending marker and
-      // flush it when a session binds, never fall back to shared pi.sendMessage.
-      rememberPendingDelivery(runId, text);
-      try {
-        pi.appendEntry(PENDING_DELIVERY_TYPE, { runId, text, status: run.status, timestamp: Date.now() });
-      } catch {
-        // best-effort persistence; in-memory marker still ensures retry
+    if (!ownsDeliveryBranch()) return;
+    rememberPendingDelivery(runId, text);
+    try {
+      pi.appendEntry(PENDING_DELIVERY_TYPE, {
+        runId,
+        text: text.slice(0, 8_000),
+        status: run.status,
+        timestamp: Date.now(),
+      });
+      advanceDeliveryAnchor();
+    } catch {
+      // Best-effort persistence; the in-memory marker remains retryable.
+    }
+    schedulePendingDeliveries();
+  };
+
+  const ownsDeliveryBranch = (): boolean => {
+    if (!active || !deliveryContext || !engine || engine.isDisposed()) return false;
+    try {
+      const branch = deliveryContext.sessionManager.getBranch();
+      return [deliveryBranchAnchor, journalBranchAnchor].every(
+        (anchor) => !anchor || branch.some((entry) => entry.id === anchor),
+      );
+    } catch {
+      return false;
+    }
+  };
+  const advanceDeliveryAnchor = (): void => {
+    if (!deliveryContext) return;
+    deliveryBranchAnchor =
+      deliveryContext.sessionManager.getLeafId?.() ?? deliveryContext.sessionManager.getBranch().at(-1)?.id ?? null;
+  };
+  const canDeliver = (): boolean => {
+    if (!ownsDeliveryBranch() || inputPreparing || compacting || navigating) return false;
+    try {
+      return deliveryContext?.isIdle() === true && deliveryContext.hasPendingMessages() === false;
+    } catch {
+      return false;
+    }
+  };
+  const hydratePendingDeliveries = (entries: SessionEntryLike[]): void => {
+    pendingDeliveryMarkers.clear();
+    for (const entry of entries) {
+      const shaped = entry as { type?: unknown; customType?: unknown; data?: unknown };
+      if (shaped.type !== "custom") continue;
+      const data = shaped.data as Record<string, unknown> | undefined;
+      if (typeof data?.runId !== "string") continue;
+      if (shaped.customType === PENDING_DELIVERY_ACK_TYPE) pendingDeliveryMarkers.delete(data.runId);
+      else if (shaped.customType === PENDING_DELIVERY_TYPE && typeof data.text === "string") {
+        rememberPendingDelivery(
+          data.runId,
+          data.text,
+          typeof data.timestamp === "number" ? data.timestamp : Date.now(),
+        );
       }
     }
   };
-
   const flushPendingDeliveries = (): void => {
-    if (!deliverResult || pendingDeliveryMarkers.size === 0) return;
-    for (const [runId, pending] of [...pendingDeliveryMarkers]) {
-      try {
-        deliverResult(pending.text);
+    if (!canDeliver() || !deliveryContext || pendingDeliveryMarkers.size === 0) return;
+    if (typeof pi.sendMessage !== "function" || typeof pi.sendUserMessage !== "function") return;
+    const ctx = deliveryContext;
+    const generation = deliveryGeneration;
+    // Bounded batches coalesce simultaneous completions without model polling.
+    const batch = [...pendingDeliveryMarkers].slice(0, 8);
+    const isCurrent = (): boolean => generation === deliveryGeneration && ctx === deliveryContext && canDeliver();
+    const persisted = (runId: string): boolean =>
+      ctx.sessionManager.getBranch().some((entry) => {
+        const shaped = entry as {
+          type?: string;
+          customType?: string;
+          content?: unknown;
+          details?: { runIds?: unknown };
+        };
+        const ids = shaped.details?.runIds;
+        return (
+          shaped.type === "custom_message" &&
+          shaped.customType === "pi-workflows:delivery" &&
+          typeof shaped.content === "string" &&
+          Array.isArray(ids) &&
+          ids.length > 0 &&
+          ids.length <= 8 &&
+          ids.every((id) => typeof id === "string" && id.length > 0 && id.length <= 128) &&
+          new Set(ids).size === ids.length &&
+          ids.includes(runId)
+        );
+      });
+    try {
+      if (!isCurrent()) return;
+      // Never use a custom-message triggerTurn: that skips input preparation
+      // and before_agent_start. The void API is NOT an acceptance promise.
+      const missing = batch.filter(([runId]) => !persisted(runId));
+      if (missing.length > 0)
+        pi.sendMessage(
+          {
+            content: missing.map(([, marker]) => marker.text).join("\n\n"),
+            display: true,
+            customType: "pi-workflows:delivery",
+            details: { runIds: missing.map(([runId]) => runId) },
+          },
+          { triggerTurn: false },
+        );
+      if (!isCurrent() || !batch.every(([runId]) => persisted(runId))) return;
+      advanceDeliveryAnchor();
+      for (const [runId] of batch) {
+        if (!isCurrent()) return;
+        const priorEntryIds = new Set(ctx.sessionManager.getBranch().map((entry) => entry.id));
         pi.appendEntry(PENDING_DELIVERY_ACK_TYPE, { runId, timestamp: Date.now() });
+        if (!isCurrent()) return;
+        const acknowledged = ctx.sessionManager.getBranch().some((entry) => {
+          const shaped = entry as { type?: string; customType?: string; data?: { runId?: unknown } };
+          return (
+            !priorEntryIds.has(entry.id) &&
+            shaped.type === "custom" &&
+            shaped.customType === PENDING_DELIVERY_ACK_TYPE &&
+            shaped.data?.runId === runId
+          );
+        });
+        if (!acknowledged) return;
+        advanceDeliveryAnchor();
         pendingDeliveryMarkers.delete(runId);
-      } catch {
-        // Keep pending until both delivery and its durable acknowledgement succeed.
       }
+      // An earlier input hook can await while the same manager navigates. Keep
+      // exact owner evidence until our input hook consumes this private wake.
+      if (isCurrent() && engine) {
+        const wake = `${DELIVERY_WAKE_PREFIX}${randomUUID()}] ${DELIVERY_WAKE_TEXT}`;
+        wakeAdmissions.set(wake, { generation, context: ctx, engine, anchor: deliveryBranchAnchor });
+        while (wakeAdmissions.size > MAX_WAKE_ADMISSIONS) {
+          const oldest = wakeAdmissions.keys().next().value;
+          if (oldest === undefined) break;
+          wakeAdmissions.delete(oldest);
+        }
+        // Disable commands/templates explicitly for internal notification input.
+        pi.sendUserMessage(wake, { deliverAs: "followUp", expandPromptTemplates: false });
+      }
+    } catch {
+      // Retain unacknowledged markers. Retry only at a later lifecycle boundary.
     }
+  };
+  const schedulePendingDeliveries = (): void => {
+    if (deliveryTimer || pendingDeliveryMarkers.size === 0 || !ownsDeliveryBranch()) return;
+    const generation = deliveryGeneration;
+    // Defer handoff out of our notification-only agent_settled handler;
+    // later handlers may navigate or start compaction in either load order.
+    deliveryTimer = setTimeout(() => {
+      deliveryTimer = undefined;
+      if (generation === deliveryGeneration) flushPendingDeliveries();
+    }, 0);
   };
 
   /** Build a script from a natural-language prompt and run it in background. */
@@ -1301,6 +1543,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
   };
 
   pi.on("session_start", async (_event, ctx) => {
+    turnArming.retire();
     if (active || engine) return;
     const generation = ++lifecycleGeneration;
     sessionCwd = ctx.cwd ?? process.cwd();
@@ -1407,56 +1650,19 @@ export default function piWorkflows(pi: ExtensionAPI): void {
     widgetUi = ctx.mode === "tui" ? ctx.ui : undefined;
     registerSurface();
 
-    // Bind per-session delivery endpoint (A10): capture the session-bound send
-    // at this moment so completions deliver to the originating session, not
-    // whichever session happens to be current later. Never fall back to the
-    // shared pi.sendMessage — a missing or suspended endpoint leaves the
-    // result pending and flushes on the next successful bind (fail-closed).
+    // Public API methods target the current session: generation + branch
+    // ownership, not a captured function value, provide session affinity.
+    deliveryContext = ctx;
+    deliveryBranchAnchor = journalBranchAnchor;
+    inputPreparing = false;
+    compacting = false;
+    navigating = false;
     try {
-      const capturedSend = pi.sendMessage;
-      if (typeof capturedSend === "function") {
-        deliverResult = (text: string) => {
-          // Use the captured function value for session affinity; if the
-          // captured function is itself a shared accessor, the flush is still
-          // fail-closed (delivery only when bound).
-          (capturedSend as unknown as (message: unknown, options: unknown) => unknown).call(
-            pi,
-            {
-              content: text,
-              display: true,
-              customType: "pi-workflows:delivery",
-            },
-            { deliverAs: "followUp", triggerTurn: true },
-          );
-        };
-      }
+      hydratePendingDeliveries(ctx.sessionManager.getBranch() as unknown as SessionEntryLike[]);
     } catch {
-      // binding is best-effort; pending stays buffered
+      pendingDeliveryMarkers.clear(); // fail closed on an unreadable branch
     }
-    // Hydrate any pending markers persisted before this bind (e.g. runs that
-    // settled before the first session_start) — scan the branch for
-    // PENDING_DELIVERY_TYPE entries that have no in-memory counterpart.
-    try {
-      const acknowledged = new Set<string>();
-      for (const entry of initialEntries) {
-        const shaped = entry as { type?: unknown; customType?: unknown; data?: unknown };
-        if (shaped.type !== "custom" || typeof shaped.customType !== "string") continue;
-        const data = shaped.data as Record<string, unknown> | undefined;
-        const entryRunId = typeof data?.runId === "string" ? data.runId : undefined;
-        if (!entryRunId) continue;
-        if (shaped.customType === PENDING_DELIVERY_ACK_TYPE) {
-          acknowledged.add(entryRunId);
-        } else if (shaped.customType === PENDING_DELIVERY_TYPE) {
-          const pendingText = typeof data?.text === "string" ? data.text : undefined;
-          const timestamp = typeof data?.timestamp === "number" ? data.timestamp : Date.now();
-          if (pendingText && !acknowledged.has(entryRunId)) rememberPendingDelivery(entryRunId, pendingText, timestamp);
-        }
-      }
-      for (const runId of acknowledged) pendingDeliveryMarkers.delete(runId);
-    } catch {
-      // scan is best-effort
-    }
-    flushPendingDeliveries();
+    schedulePendingDeliveries();
 
     // Saved workflow commands register at session_start (Pi cannot unregister
     // or replace command metadata, so factory-time registration would freeze the
@@ -1493,10 +1699,8 @@ export default function piWorkflows(pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", async () => {
-    deliveryGeneration += 1;
-    // Invalidate all long-lived command/tool/widget closures before awaiting
-    // engine quiescence; the old session must not accept another run.
-    active = false;
+    // This synchronous boundary is shared with the bus-first shutdown path.
+    const quiescence = beginShutdownQuiesce();
     clearWidget();
     widgetUi = undefined;
     if (widgetTimer) {
@@ -1507,7 +1711,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
     if (closingEngine) {
       let timer: ReturnType<typeof setTimeout> | undefined;
       const result = await Promise.race([
-        beginShutdownQuiesce(),
+        quiescence,
         new Promise<undefined>((resolve) => {
           timer = setTimeout(() => resolve(undefined), 6_000);
         }),
@@ -1529,7 +1733,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
     protocolProbe = undefined;
     protocolInFlight = undefined;
     protocolError = undefined;
-    deliverResult = undefined;
+    deliveryContext = undefined;
   });
 }
 

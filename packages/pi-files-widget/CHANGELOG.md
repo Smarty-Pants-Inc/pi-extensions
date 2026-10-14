@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.7
+### Patch Changes
+
+- c2fd867: Render inert file metadata without changing original paths or comments, preserve NUL-delimited Git paths, avoid optional status locks, and refresh open browsers across branch and tracked-inventory changes. Sanitize comment notification display copies and retire browser polling, scans and rendering on SDK disposal or live mode/UI ineligibility before the extension's session handler runs, without sending comments or notifications through retained UI.
+- Updated dependencies [c2fd867]
+  - @signalridge/pi-ui@1.4.0
+
 ## 1.2.6
 ### Patch Changes
 

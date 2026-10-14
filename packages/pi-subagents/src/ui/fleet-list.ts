@@ -11,15 +11,15 @@
  * can `consume` keys — gated on `getEditorText() === ""` so normal typing is untouched.
  */
 
-import { Editor, isKeyRelease, Key, matchesKey, type TUI, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { borderedComponent } from "@signalridge/pi-ui";
+import { type Component, isKeyRelease, Key, matchesKey, type TUI, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { borderedComponent, sanitizeDisplayText } from "@signalridge/pi-ui";
 import { renderAgentName } from "../agent-color.js";
 import type { AgentManager } from "../agent-manager.js";
 import type { AgentRecord } from "../types.js";
 import { getLifetimeTotal } from "../usage.js";
 import { type AgentActivity, type Theme } from "./agent-display.js";
 import { ConversationViewer, VIEWPORT_HEIGHT_PCT } from "./conversation-viewer.js";
-import { sanitizeDisplayText } from "./safe-text.js";
+import { type OwnerGroup, OwnerGroupViewer, workflowGroupId } from "./owner-group.js";
 import { getAgentStatusColor, getAgentStatusLabel, getAgentStatusMark } from "./status-label.js";
 import type { ViewerKeybindings } from "./viewer-keys.js";
 
@@ -48,9 +48,10 @@ export type FleetUICtx = {
   ): Promise<T>;
 };
 
-type MainEntry = { kind: "main" };
-type AgentEntry = { kind: "agent"; record: AgentRecord };
-type FleetEntry = MainEntry | AgentEntry;
+type MainEntry = { kind: "main"; id: string };
+type AgentEntry = { kind: "agent"; id: string; record: AgentRecord };
+type GroupEntry = { kind: "group"; id: string; group: OwnerGroup };
+type FleetEntry = MainEntry | AgentEntry | GroupEntry;
 
 /** `11s` — integer seconds, no decimal/suffix (matches Claude Code, unlike formatMs). */
 export function formatFleetElapsed(ms: number): string {
@@ -91,6 +92,8 @@ export class FleetList {
   private active = false;
   /** 0 = `main`, 1..N = subagents. */
   private selectedIndex = 0;
+  private selectedId = "main";
+  private overlayGeneration = 0;
   /** Set while a conversation overlay is open; calling it closes the overlay. */
   private viewerClose: (() => void) | undefined;
   private viewingAgentId: string | undefined;
@@ -112,7 +115,7 @@ export class FleetList {
   /** Capture the UI context and (re)register the global input handler. */
   setUICtx(ui: FleetUICtx): void {
     if (ui === this.ui) return;
-    this.inputUnsub?.();
+    this.dispose();
     this.ui = ui;
     this.widgetRegistered = false;
     this.tui = undefined;
@@ -133,6 +136,7 @@ export class FleetList {
   }
 
   dispose(): void {
+    this.overlayGeneration++;
     if (this.timer) { clearInterval(this.timer); this.timer = undefined; }
     this.inputUnsub?.();
     this.inputUnsub = undefined;
@@ -149,7 +153,7 @@ export class FleetList {
   /** Re-register/refresh the below-editor widget; clears it when no agents remain. */
   update(): void {
     if (!this.ui) return;
-    const hasAgents = this.enabled && this.agentRecords().length > 0;
+    const hasAgents = this.enabled && this.roster().length > 1;
 
     if (!hasAgents) {
       if (this.widgetRegistered) {
@@ -160,6 +164,7 @@ export class FleetList {
       if (this.timer) { clearInterval(this.timer); this.timer = undefined; }
       this.active = false;
       this.selectedIndex = 0;
+      this.selectedId = "main";
       return;
     }
 
@@ -171,7 +176,8 @@ export class FleetList {
         this.tui = tui;
         return {
           render: (w: number) => this.renderBar(w, theme),
-          invalidate: () => { this.widgetRegistered = false; this.tui = undefined; },
+          invalidate: () => { /* no render cache; mounting/focus remain owned */ },
+          dispose: () => { if (this.tui === tui) { this.widgetRegistered = false; this.tui = undefined; } },
         };
       }, { placement: "belowEditor" });
       this.widgetRegistered = true;
@@ -193,7 +199,7 @@ export class FleetList {
   private agentRecords(): AgentRecord[] {
     const now = Date.now();
     return this.manager.listAgentsMutable()
-      .filter(a => !a.parentAgentId && a.session && (
+      .filter(a => !a.parentAgentId && !a.detached && !workflowGroupId(a) && a.session && (
         a.status === "running" || a.status === "queued"
         || a.id === this.viewingAgentId
         || (a.completedAt != null && now - a.completedAt < FINISHED_LINGER_MS)
@@ -201,14 +207,39 @@ export class FleetList {
       .sort((a, b) => a.startedAt - b.startedAt);
   }
 
-  private roster(): FleetEntry[] {
-    return [{ kind: "main" }, ...this.agentRecords().map(record => ({ kind: "agent" as const, record }))];
+  private groups(): OwnerGroup[] {
+    const groups = new Map<string, OwnerGroup>();
+    for (const record of this.manager.listAgentsMutable()) {
+      if (record.parentAgentId || record.detached) continue;
+      const id = workflowGroupId(record);
+      if (!id) continue;
+      let group = groups.get(id);
+      if (!group) { group = { id, runId: record.owner!.runId, records: [] }; groups.set(id, group); }
+      group.records.push(record);
+    }
+    for (const group of groups.values()) group.records.sort((a, b) => a.startedAt - b.startedAt || a.id.localeCompare(b.id));
+    return [...groups.values()];
   }
 
-  private clampSelection(): void {
-    const max = this.roster().length - 1;
-    if (this.selectedIndex > max) this.selectedIndex = Math.max(0, max);
-    if (this.selectedIndex < 0) this.selectedIndex = 0;
+  private roster(): FleetEntry[] {
+    return [
+      { kind: "main", id: "main" },
+      ...this.groups().map(group => ({ kind: "group" as const, id: `group:${group.id}`, group })),
+      ...this.agentRecords().map(record => ({ kind: "agent" as const, id: `agent:${record.id}`, record })),
+    ];
+  }
+
+  private clampSelection(roster = this.roster()): void {
+    const index = roster.findIndex(entry => entry.id === this.selectedId);
+    // Missing identity returns explicitly to main, never to a different child.
+    this.selectedIndex = index >= 0 ? index : 0;
+    this.selectedId = roster[this.selectedIndex].id;
+  }
+
+  private select(index: number): void {
+    const roster = this.roster();
+    this.selectedIndex = Math.max(0, Math.min(roster.length - 1, index));
+    this.selectedId = roster[this.selectedIndex].id;
   }
 
   // ---- Key handling ----
@@ -234,25 +265,27 @@ export class FleetList {
     if (!this.active) {
       // Activate: ↓ or ← at an empty prompt moves focus into the list.
       const isActivator = matchesKey(data, "down") || matchesKey(data, "left");
-      if (isActivator && this.agentRecords().length > 0 && this.ui.getEditorText() === "") {
+      if (isActivator && this.roster().length > 1 && this.ui.getEditorText() === "") {
         this.active = true;
-        this.selectedIndex = 0;
+        this.select(0);
         this.update();
         return { consume: true };
       }
       return undefined;
     }
 
+    // Reconcile identity before both navigation and opening, even between ticks.
+    this.clampSelection();
     // Active — arrows navigate, Enter opens, Esc / Up-past-top exits.
     if (matchesKey(data, "down")) {
       const max = this.roster().length - 1;
-      this.selectedIndex = Math.min(max, this.selectedIndex + 1);
+      this.select(Math.min(max, this.selectedIndex + 1));
       this.update();
       return { consume: true };
     }
     if (matchesKey(data, "up")) {
       if (this.selectedIndex === 0) { this.deactivate(); return { consume: true }; }
-      this.selectedIndex -= 1;
+      this.select(this.selectedIndex - 1);
       this.update();
       return { consume: true };
     }
@@ -265,64 +298,91 @@ export class FleetList {
   }
 
   /**
-   * True when pi's prompt editor owns the keyboard. pi's editor is an `Editor`
-   * subclass (CustomEditor) while every dialog/selector is not, and the loader
-   * aliases pi-tui to pi's own copy, so `instanceof` is a reliable identity
-   * check. `focusedComponent` is TUI-private (no public accessor), hence the
-   * best-effort peek: unknowable focus (no tui seen yet, nothing focused)
-   * counts as the editor so activation keeps working.
+   * True when pi's prompt editor owns the keyboard. The editor is pluggable
+   * (ui.setEditorComponent) and need not extend `Editor` (#374), so match pi-tui's
+   * `EditorComponent` contract instead: `getText` + `setText`, which pi calls on
+   * every editor and none of pi's dialogs, selectors or overlays implement.
+   * Use the public structural focus getter (not present in every TUI interface
+   * declaration). Unknown focus retains the initial editor fallback.
    */
   private editorHasFocus(): boolean {
-    const focused = (this.tui as { focusedComponent?: unknown } | undefined)?.focusedComponent;
-    return focused == null || focused instanceof Editor;
+    const focusHost = this.tui as { getFocusedComponent?: () => unknown } | undefined;
+    const focused = typeof focusHost?.getFocusedComponent === "function" ? focusHost.getFocusedComponent() : undefined;
+    if (focused == null) return true;
+    const c = focused as { getText?: unknown; setText?: unknown };
+    return typeof c.getText === "function" && typeof c.setText === "function";
   }
 
   private deactivate(): void {
     this.active = false;
-    this.selectedIndex = 0;
+    this.select(0);
     this.update();
   }
 
   private openSelected(): void {
-    const entry = this.roster()[this.selectedIndex];
+    const roster = this.roster();
+    this.clampSelection(roster);
+    const entry = roster[this.selectedIndex];
     if (!entry || entry.kind === "main") {
       // `main` = return to the prompt; the native transcript is already shown.
       this.deactivate();
       return;
     }
-    const record = entry.record;
     if (!this.ui) return;
+    if (entry.kind === "group") { this.openGroup(entry.group); return; }
+    const record = entry.record;
     if (!record.session) {
       this.ui.notify(`Agent is ${record.status}; no session available.`, "info");
       return;
     }
-    const session = record.session;
-    const activity = this.agentActivity.get(record.id);
     this.viewingAgentId = record.id;
+    void this.openOverlay((tui, theme, keys, done) => this.conversation(record, tui, theme, keys, done));
+  }
 
-    void this.ui.custom<undefined>(
-      (tui, theme, keybindings, done) => {
+  private conversation(record: AgentRecord, tui: TUI, theme: Theme, keys: ViewerKeybindings, done: (result: undefined) => void): ConversationViewer {
+    const session = record.session;
+    if (!session) throw new Error("No session available");
+    const owner = record.owner ? { ...record.owner } : undefined;
+    // An id can be reused for another thread attempt. Bind controls to this
+    // session and immutable owner generation, never to id alone.
+    const current = (): AgentRecord | undefined => this.manager.listAgentsMutable().find(candidate =>
+      candidate.id === record.id && candidate.session === session && !candidate.detached &&
+      candidate.owner?.extension === owner?.extension && candidate.owner?.runId === owner?.runId &&
+      candidate.owner?.nodeId === owner?.nodeId && candidate.owner?.attemptId === owner?.attemptId);
+    return new ConversationViewer(tui, session, record, this.agentActivity.get(record.id), theme, done,
+      () => { if (current() && this.manager.abort(record.id)) this.ui?.notify(`Stopped "${sanitizeDisplayText(record.description)}".`, "info"); },
+      keys,
+      message => !!current() && this.manager.steer(record.id, message),
+      () => current() ?? { ...record, status: record.status === "running" || record.status === "queued" ? "stopped" : record.status, detached: true },
+    );
+  }
+
+  private openGroup(group: OwnerGroup): void {
+    void this.openOverlay((tui, theme, keys, done) => new OwnerGroupViewer(tui, theme, group.runId,
+      () => this.groups().find(candidate => candidate.id === group.id)?.records ?? [],
+      (record, back) => this.conversation(record, tui, theme, keys, back),
+      () => done(undefined), keys));
+  }
+
+  private async openOverlay(factory: (tui: TUI, theme: Theme, keys: ViewerKeybindings, done: (result: undefined) => void) => Component): Promise<void> {
+    const ui = this.ui;
+    if (!ui) return;
+    const generation = ++this.overlayGeneration;
+    this.viewerClose = () => {}; // reserve input during asynchronous construction
+    try {
+      await ui.custom<undefined>((tui, theme, keys, done) => {
+        if (generation !== this.overlayGeneration || ui !== this.ui) {
+          done(undefined);
+          return { render: () => [], invalidate: () => {} };
+        }
         this.viewerClose = () => done(undefined);
-        return borderedComponent(new ConversationViewer(
-          tui,
-          session,
-          record,
-          activity,
-          theme,
-          done,
-          () => {
-            if (this.manager.abort(record.id)) this.ui?.notify(`Stopped "${sanitizeDisplayText(record.description)}".`, "info");
-          },
-          keybindings,
-          (message: string) => this.manager.steer(record.id, message),
-          () => this.manager.getRecord?.(record.id),
-        ), (text) => theme.fg("borderAccent", text));
-      },
-      {
-        overlay: true,
-        overlayOptions: { anchor: "center", width: "90%", maxHeight: `${VIEWPORT_HEIGHT_PCT}%` },
-      },
-    ).then(() => this.clearViewer(), () => this.clearViewer());
+        return borderedComponent(factory(tui, theme, keys, done), text => theme.fg("borderAccent", text));
+      }, { overlay: true, overlayOptions: { anchor: "center", width: "90%", maxHeight: `${VIEWPORT_HEIGHT_PCT}%` } });
+    } catch {
+      if (generation === this.overlayGeneration) ui.notify("Cannot open conversation; try again.", "error");
+    } finally {
+      if (generation === this.overlayGeneration) this.clearViewer();
+    }
   }
 
   /** Reset overlay state and return to the list (on close, auto-close, or error). */
@@ -333,7 +393,7 @@ export class FleetList {
     // update()'s clamp to settle.
     if (this.viewingAgentId) {
       const idx = this.roster().findIndex(e => e.kind === "agent" && e.record.id === this.viewingAgentId);
-      if (idx >= 0) this.selectedIndex = idx;
+      if (idx >= 0) this.select(idx);
     }
     this.viewerClose = undefined;
     this.viewingAgentId = undefined;
@@ -343,9 +403,11 @@ export class FleetList {
   // ---- Rendering ----
 
   private renderBar(width: number, theme: Theme): string[] {
-    const agents = this.roster().slice(1) as AgentEntry[];
+    const roster = this.roster();
+    this.clampSelection(roster);
+    const agents = roster.slice(1);
     if (agents.length === 0) return [];
-    const sel = Math.min(this.selectedIndex, agents.length);
+    const sel = this.selectedIndex;
 
     // Key names read as proper nouns, the verbs after them stay lowercase, and
     // segments are separated by " · " — the same shape every hint line in the
@@ -372,7 +434,12 @@ export class FleetList {
 
     if (start > 0) lines.push(rightAlign("", theme.fg("dim", `${start} more above`), width));
     for (let a = start; a < start + visible; a++) {
-      lines.push(this.renderAgentRow(a + 1, sel, agents[a].record, width, theme));
+      const entry = agents[a];
+      if (entry.kind === "agent") lines.push(this.renderAgentRow(a + 1, sel, entry.record, width, theme));
+      else if (entry.kind === "group") {
+        const label = `  ▸ Workflow ${sanitizeDisplayText(entry.group.runId)} · ${entry.group.records.length} retained children`;
+        lines.push(truncateToWidth(theme.fg(a + 1 === sel ? "accent" : "muted", label), width));
+      }
     }
     if (hiddenBelow > 0) lines.push(rightAlign("", theme.fg("dim", `${hiddenBelow} more below`), width));
 

@@ -88,6 +88,7 @@ function fixture(subagentsFirst: boolean, hangQuiesce = false) {
       leaf = id;
     },
     sendMessage: vi.fn(),
+    sendUserMessage: vi.fn(),
     registerTool: (tool: {
       name: string;
       execute: (...args: unknown[]) => Promise<{ details: { runId: string; status: string } }>;
@@ -115,11 +116,14 @@ function fixture(subagentsFirst: boolean, hangQuiesce = false) {
     cwd: process.cwd(),
     mode: "rpc",
     hasUI: true,
+    isIdle: () => true,
+    hasPendingMessages: () => false,
     ui: { notify: (message: string) => notices.push(message), setWidget: vi.fn() },
     sessionManager,
   };
   return {
     bus,
+    pi,
     handlers,
     tools,
     entries,
@@ -212,6 +216,58 @@ describe("workflow navigation preflight", () => {
     expect(f.requests.filter((request) => request.name === "stop" || request.name === "quiesce")).toEqual([]);
     await f.shutdown();
   });
+
+  it.each([true, false])(
+    "bus-first shutdown fences a late run result and retains cleanup journal ownership (subagents first: %s)",
+    async (subagentsFirst) => {
+      const f = fixture(subagentsFirst);
+      await f.start();
+      const runId = await f.run();
+      let quiescence: Promise<unknown> | undefined;
+      let reentrant: Promise<unknown> | undefined;
+      f.bus.on("subagents:rpc:quiesce-owned", () => {
+        f.bus.emit("pi-workflows:shutdown-quiesce", {
+          respond: (promise: Promise<unknown>) => {
+            reentrant = promise;
+          },
+        });
+      });
+      f.bus.emit("pi-workflows:shutdown-quiesce", {
+        respond: (promise: Promise<unknown>) => {
+          quiescence = promise;
+        },
+      });
+      expect(quiescence).toBeDefined();
+      expect(reentrant).toBe(quiescence);
+      await quiescence;
+      await vi.waitFor(() =>
+        expect(
+          f.entries.some((entry) => {
+            const fact = entry.data as { kind?: string; status?: string; runId?: string };
+            return fact.kind === "run_recovery" && fact.status === "interrupted" && fact.runId === runId;
+          }),
+        ).toBe(true),
+      );
+      // The waiter resolves during the earlier peer shutdown, before the native
+      // workflows shutdown hook. No delivery may wake that retiring session.
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(f.pi.sendMessage).not.toHaveBeenCalled();
+      expect(f.pi.sendUserMessage).not.toHaveBeenCalled();
+      expect(f.entries.some((entry) => entry.customType === "pi-workflows:pending-delivery")).toBe(false);
+      const retired = await f.tools.get("workflow")?.execute(
+        "retired",
+        {
+          script: 'export const meta = { name: "retired", description: "test" }; return 1;',
+          background: true,
+        },
+        undefined,
+        undefined,
+        f.ctx,
+      );
+      expect(retired?.details.runId).toBeUndefined();
+      await f.shutdown();
+    },
+  );
 
   it("times out failed shutdown quiescence and fences late callbacks", async () => {
     const f = fixture(false, true);

@@ -22,6 +22,7 @@ interface ActiveRun {
   generationIds: Set<string>;
   tools: ToolCallRecord[];
   toolIds: Set<string>;
+  nestedToolIds: Set<string>;
   skills: SkillActivationRecord[];
   skillIndexes: Map<string, number>;
   providerErrors: ProviderErrorRecord[];
@@ -71,6 +72,7 @@ export class ResponseCollector {
       generationIds: new Set(),
       tools: [],
       toolIds: new Set(),
+      nestedToolIds: new Set(),
       skills: [],
       skillIndexes: new Map(),
       providerErrors: [],
@@ -149,10 +151,11 @@ export class ResponseCollector {
     }
   }
 
-  beginTool(input: { id: string; name: string; now: number; model?: ModelIdentity }): void {
+  beginTool(input: { id: string; name: string; now: number; model?: ModelIdentity; parentToolCallId?: string }): void {
     const active = this.active;
     if (!active || active.toolIds.has(input.id)) return;
     active.toolIds.add(input.id);
+    if (input.parentToolCallId !== undefined) active.nestedToolIds.add(input.id);
     active.tools.push({
       id: input.id,
       ordinal: active.tools.length,
@@ -173,6 +176,19 @@ export class ResponseCollector {
     tool.durationMs = elapsed(tool.startedAtMs, input.now);
     tool.isError = input.isError;
     tool.completionState = "finished";
+  }
+
+  reconcileToolResults(results: ReadonlyArray<{ toolCallId: string; isError: boolean }>): void {
+    const active = this.active;
+    if (!active) return;
+    const finalized = new Map(results.map((result) => [result.toolCallId, result.isError]));
+    for (const tool of active.tools) {
+      // Nested executions have no transcript result. Keep their execution flag
+      // and timing; only top-level finished calls have host-finalized outcomes.
+      if (tool.completionState !== "finished" || active.nestedToolIds.has(tool.id)) continue;
+      const isError = finalized.get(tool.id);
+      if (isError !== undefined) tool.isError = isError;
+    }
   }
 
   activateSkill(input: { name: string; initiatedBy: "user" | "model"; now: number; model?: ModelIdentity }): void {

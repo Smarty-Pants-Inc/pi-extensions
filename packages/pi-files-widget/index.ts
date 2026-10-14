@@ -7,7 +7,8 @@
 
 import { statSync } from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { createFileBrowser } from "./browser.js";
+import { sanitizeDisplayText } from "@signalridge/pi-ui";
+import { type BrowserController, createFileBrowser } from "./browser.js";
 import { formatCommentMessage } from "./comment.js";
 import { POLL_INTERVAL_MS } from "./constants.js";
 import { resolveToolPath } from "./paths.js";
@@ -44,6 +45,8 @@ export default function editorExtension(pi: ExtensionAPI): void {
   const observedChangedFiles = new Set<string>();
   const mutations = new Map<string, { cwd: string; path: string; before: string | undefined }>();
   let closeActiveInteraction: (() => void) | undefined;
+  let completeActiveInteraction: (() => void) | undefined;
+  let sessionGeneration = 0;
   const optionalDeps = ["bat", "delta", "glow"] as const;
   let warnedMissingDeps = false;
   const warnMissingDeps = (ctx: ExtensionContext): void => {
@@ -65,6 +68,8 @@ export default function editorExtension(pi: ExtensionAPI): void {
           ctx.ui.notify("The /readfiles browser requires TUI mode and is unavailable over RPC.", "warning");
         return;
       }
+      const generation = sessionGeneration;
+      const sessionManager = ctx.sessionManager;
       const cwd = ctx.cwd;
       warnMissingDeps(ctx);
 
@@ -77,7 +82,24 @@ export default function editorExtension(pi: ExtensionAPI): void {
       await ctx.ui.custom<void>((tui, theme, _kb, done) => {
         let pollInterval: ReturnType<typeof setInterval> | null = null;
         let disposed = false;
+        let browser: BrowserController | undefined;
 
+        const isCurrent = () => {
+          if (disposed) return false;
+          try {
+            if (
+              generation === sessionGeneration &&
+              ctx.mode === "tui" &&
+              ctx.hasUI &&
+              ctx.sessionManager === sessionManager
+            )
+              return true;
+          } catch {
+            // SDK disposal invalidates captured public getters without shutdown.
+          }
+          dispose();
+          return false;
+        };
         const dispose = () => {
           if (disposed) return;
           disposed = true;
@@ -85,11 +107,15 @@ export default function editorExtension(pi: ExtensionAPI): void {
             clearInterval(pollInterval);
             pollInterval = null;
           }
-          browser.dispose();
-          if (closeActiveInteraction === cleanup) closeActiveInteraction = undefined;
+          try {
+            browser?.dispose();
+          } finally {
+            if (closeActiveInteraction === dispose) closeActiveInteraction = undefined;
+            if (completeActiveInteraction === cleanup) completeActiveInteraction = undefined;
+          }
         };
         const cleanup = () => {
-          if (disposed) return;
+          if (!isCurrent()) return;
           dispose();
           done();
         };
@@ -98,21 +124,22 @@ export default function editorExtension(pi: ExtensionAPI): void {
           payload: { relPath: string; lineRange: string; ext: string; selectedText: string },
           comment: string,
         ) => {
-          if (disposed) return;
+          if (!isCurrent()) return;
           const message = formatCommentMessage(payload, comment);
+          const displayPath = sanitizeDisplayText(payload.relPath);
           if (ctx.isIdle()) {
             pi.sendUserMessage(message);
-            ctx.ui.notify(`Comment sent to agent for ${payload.relPath} (${payload.lineRange})`, "info");
+            ctx.ui.notify(`Comment sent to agent for ${displayPath} (${payload.lineRange})`, "info");
           } else {
             pi.sendUserMessage(message, { deliverAs: "followUp" });
-            ctx.ui.notify(`Comment queued for agent for ${payload.relPath} (${payload.lineRange})`, "info");
+            ctx.ui.notify(`Comment queued for agent for ${displayPath} (${payload.lineRange})`, "info");
           }
         };
 
         const requestRender = () => {
-          if (!disposed) tui.requestRender();
+          if (isCurrent()) tui.requestRender();
         };
-        const browser = createFileBrowser(
+        browser = createFileBrowser(
           initialPath,
           agentModifiedFiles,
           theme,
@@ -121,21 +148,28 @@ export default function editorExtension(pi: ExtensionAPI): void {
           requestRender,
           cwd,
           observedChangedFiles,
+          isCurrent,
         );
 
+        if (!isCurrent()) {
+          browser.dispose();
+          return browser;
+        }
         closeActiveInteraction?.();
-        closeActiveInteraction = cleanup;
+        closeActiveInteraction = dispose;
+        completeActiveInteraction = cleanup;
         pollInterval = setInterval(() => {
           requestRender();
         }, POLL_INTERVAL_MS);
 
         return {
-          render: (w) => browser.render(w),
+          render: (w) => (isCurrent() ? (browser?.render(w) ?? []) : []),
           handleInput: (data) => {
-            browser.handleInput(data);
+            if (!isCurrent()) return;
+            browser?.handleInput(data);
             requestRender();
           },
-          invalidate: () => browser.invalidate(),
+          invalidate: () => browser?.invalidate(),
           dispose,
         };
       });
@@ -179,6 +213,8 @@ export default function editorExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    sessionGeneration += 1;
+    closeActiveInteraction?.();
     mutations.clear();
     warnMissingDeps(ctx);
 
@@ -187,7 +223,9 @@ export default function editorExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", async () => {
-    // Complete the owned custom interaction while its context is still valid.
+    // A valid shutdown completes the custom interaction; SDK disposal/rebind
+    // uses resource-only retirement and never writes through an invalid UI.
+    completeActiveInteraction?.();
     closeActiveInteraction?.();
   });
 }

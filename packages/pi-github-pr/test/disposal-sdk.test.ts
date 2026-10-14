@@ -23,8 +23,8 @@ vi.mock("node:fs", async (importOriginal) => {
 
 const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
 
-for (const deadline of ["poll", "expiry", "debounce", "in-flight"] as const) {
-  test(`installed SDK disposal retires GitHub ${deadline} ownership without shutdown`, async () => {
+for (const deadline of ["poll", "expiry", "debounce", "in-flight", "print", "rpc"] as const) {
+  test(`installed SDK retires GitHub ${deadline} ownership without shutdown`, async () => {
     assert.equal(VERSION, "1.0.4");
     const cwd = mkdtempSync(join(tmpdir(), "github-dispose-"));
     const agentDir = join(cwd, "agent");
@@ -136,6 +136,16 @@ for (const deadline of ["poll", "expiry", "debounce", "in-flight"] as const) {
         assert.ok(release);
       }
       const before = statuses.length;
+      if (deadline === "print" || deadline === "rpc") {
+        const watches = vi.mocked(watch).mock.calls.length;
+        await session.bindExtensions({ mode: deadline });
+        await session.prompt("headless fixture");
+        await flush();
+        assert.equal(requests, 1, "headless start and agent_end do not query GitHub");
+        assert.equal(vi.mocked(watch).mock.calls.length, watches, "no headless watcher");
+        assert.equal(vi.getTimerCount(), 0, "outgoing TUI timers retire before headless activation");
+        assert.equal(statuses.length, before, "no headless status writes or clears");
+      }
       session.dispose();
       assert.equal(shutdowns, 0, "SDK dispose does not emit shutdown");
       assert.throws(() => captured?.sessionManager, /stale/);

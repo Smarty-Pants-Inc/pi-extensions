@@ -143,6 +143,7 @@ test("factory registers lifecycle hooks without constructing or opening storage"
     "tool_execution_end",
     "tool_execution_start",
     "tool_result",
+    "turn_end",
     "turn_start",
   ]);
 });
@@ -231,6 +232,57 @@ test("a settled response is written once with the current session signal", async
   assert.equal(store.runs[0]?.generations[0]?.model, undefined);
   assert.equal(store.signals[0]?.aborted, false);
 });
+
+for (const source of ["extension", "interactive", "rpc"] as const) {
+  for (const text of ["continue", "/skill:reviewing-code"]) {
+    test(`a ${source} input (${text}) after settlement retains its trigger and skill attribution`, async () => {
+      const store = new FakeStore();
+      const mock = createMockPi();
+      createAnalyticsExtension({
+        createStore: () => store,
+        createSkillTracker: (cwd) => new SkillTracker(cwd, async (filePath) => filePath),
+      })(mock.pi);
+      const started = lifecycleContext({ mode: source === "interactive" ? "tui" : "rpc" });
+      await emit(mock, "session_start", { reason: "startup" }, started.ctx);
+      await emit(mock, "input", { text: "initial run", source: "interactive" }, started.ctx);
+      await settleOneRun(mock, started.ctx);
+      assert.equal(store.runs.length, 1);
+      assert.equal(store.runs[0]?.triggerSource, "interactive");
+
+      await emit(mock, "input", { text, source }, started.ctx);
+      await emit(
+        mock,
+        "before_agent_start",
+        {
+          prompt: text,
+          systemPromptOptions: {
+            skills: [{ name: "reviewing-code", filePath: "/workspace/SKILL.md" }],
+          },
+        },
+        started.ctx,
+      );
+      await emit(mock, "agent_start", {}, started.ctx);
+      await emit(mock, "turn_start", {}, started.ctx);
+      const message = { role: "assistant", stopReason: "stop", provider: "openai", model: "gpt-test" };
+      await emit(mock, "message_start", { message }, started.ctx);
+      await emit(mock, "message_end", { message }, started.ctx);
+      await emit(mock, "agent_settled", {}, started.ctx);
+
+      assert.equal(store.runs.length, 2);
+      const recorded = store.runs[1];
+      assert.ok(recorded);
+      const run = decodeStoredRun(encodeStoredRun(recorded));
+      assert.equal(run.triggerSource, source);
+      assert.equal(run.outcome, "success");
+      assert.equal(run.attemptCount, 1);
+      assert.equal(run.generations.length, 1);
+      assert.deepEqual(
+        run.skills.map(({ name, initiatedBy }) => ({ name, initiatedBy })),
+        source !== "extension" && text.startsWith("/skill:") ? [{ name: "reviewing-code", initiatedBy: "user" }] : [],
+      );
+    });
+  }
+}
 
 test("finalized physical dispatch owns generations, errors, tools and model skill reads, not the selected router", async () => {
   const store = new FakeStore();

@@ -3,6 +3,7 @@ import { Type } from "typebox";
 import { type DialogOutcome, QuestionDialog } from "./dialog.js";
 import {
   MAX_DESCRIPTION_LENGTH,
+  MAX_FREE_TEXT_LENGTH,
   MAX_HEADER_LENGTH,
   MAX_ID_LENGTH,
   MAX_LABEL_LENGTH,
@@ -151,29 +152,46 @@ async function askWithDialog(
     };
     if (signal) signal.addEventListener("abort", onAbort, { once: true });
 
-    void ctx.ui
-      .custom<DialogOutcome>(
-        (tui, theme, keybindings, done) => {
-          dialog = new QuestionDialog(tui, theme, keybindings, questions, (outcome) => {
-            done(outcome);
-            finish(outcome);
-          });
-          return dialog;
-        },
-        {
-          overlay: true,
-          overlayOptions: {
-            anchor: "center",
-            width: "90%",
-            minWidth: 36,
-            maxHeight: "85%",
-            margin: 1,
+    void Promise.resolve()
+      .then(() =>
+        ctx.ui.custom<DialogOutcome>(
+          (tui, theme, keybindings, done) => {
+            dialog = new QuestionDialog(tui, theme, keybindings, questions, (outcome) => {
+              if (settled) return;
+              try {
+                done(outcome);
+              } catch {
+                // The dialog has already settled; cancelling it again cannot
+                // finish the tool if the host completion callback fails.
+                finish({ kind: "cancelled", reason: "ui_error", answers: outcome.answers });
+                return;
+              }
+              finish(outcome);
+            });
+            if (signal?.aborted) dialog.cancel("aborted");
+            return dialog;
           },
-        },
+          {
+            overlay: true,
+            overlayOptions: {
+              anchor: "center",
+              width: "90%",
+              minWidth: 36,
+              maxHeight: "85%",
+              margin: 1,
+            },
+          },
+        ),
       )
-      .then((outcome) => finish(outcome ?? { kind: "cancelled", reason: "disposed", answers: [] }))
+      .then((outcome) => {
+        if (outcome) finish(outcome);
+        else if (dialog) dialog.cancel("disposed");
+        else finish({ kind: "cancelled", reason: "disposed", answers: [] });
+      })
       .catch((_error: unknown) => {
-        finish({ kind: "cancelled", reason: "ui_error", answers: [] });
+        const reason = signal?.aborted ? "aborted" : "ui_error";
+        if (dialog) dialog.cancel(reason);
+        else finish({ kind: "cancelled", reason, answers: [] });
       });
   });
 }
@@ -206,14 +224,29 @@ async function askWithRpcFallback(
       continue;
     }
     if (choice.kind === "other") {
-      const text = await withAbort(
-        ctx.ui.input(`${progress(index, questions.length)}${question.header}: ${question.question}`, "", { signal }),
-        signal,
-      );
-      if (text === undefined)
-        return { kind: "cancelled", reason: signal?.aborted ? "aborted" : "cancelled", answers: complete(answers) };
-      const freeText = sanitizeDisplayText(text, 4_000);
-      if (!freeText) continue;
+      let freeText: string;
+      while (true) {
+        const response = await withAbort(
+          () => ctx.ui.input(questionTitle(question, index, questions.length), "", { signal }),
+          signal,
+        );
+        if (response.kind === "cancelled") return { ...response, answers: complete(answers) };
+        if (response.value === undefined) return { kind: "cancelled", reason: "cancelled", answers: complete(answers) };
+        if (response.value.length > MAX_FREE_TEXT_LENGTH) {
+          try {
+            ctx.ui.notify(
+              `Response exceeds ${MAX_FREE_TEXT_LENGTH} UTF-16 code units; shorten it and try again.`,
+              "warning",
+            );
+          } catch {
+            return { kind: "cancelled", reason: "ui_error", answers: complete(answers) };
+          }
+          continue;
+        }
+        freeText = response.value;
+        break;
+      }
+      if (!freeText.trim()) continue;
       answers[index] = answerFor(question, choice.selections, freeText);
     } else {
       answers[index] = answerFor(question, choice.selections);
@@ -239,11 +272,12 @@ async function selectSingle(
 ): Promise<FallbackChoice> {
   const actions = rpcActions(question, canGoBack);
   const selected = await withAbort(
-    ctx.ui.select(`${progress(index, total)}${question.header}: ${question.question}`, [...actions.keys()], { signal }),
+    () => ctx.ui.select(questionTitle(question, index, total), [...actions.keys()], { signal }),
     signal,
   );
-  if (selected === undefined) return { kind: "cancelled", reason: signal?.aborted ? "aborted" : "cancelled" };
-  const action = actions.get(selected);
+  if (selected.kind === "cancelled") return selected;
+  if (selected.value === undefined) return { kind: "cancelled", reason: "cancelled" };
+  const action = actions.get(selected.value);
   if (action?.kind === "other") return { kind: "other", selections: [] };
   if (action?.kind === "back") return { kind: "back" };
   return action?.kind === "option"
@@ -262,13 +296,15 @@ async function selectMulti(
   while (true) {
     const actions = rpcActions(question, index > 0, selected);
     const choice = await withAbort(
-      ctx.ui.select(`${progress(index, total)}${question.header}: ${question.question}`, [...actions.keys()], {
-        signal,
-      }),
+      () =>
+        ctx.ui.select(questionTitle(question, index, total), [...actions.keys()], {
+          signal,
+        }),
       signal,
     );
-    if (choice === undefined) return { kind: "cancelled", reason: signal?.aborted ? "aborted" : "cancelled" };
-    const action = actions.get(choice);
+    if (choice.kind === "cancelled") return choice;
+    if (choice.value === undefined) return { kind: "cancelled", reason: "cancelled" };
+    const action = actions.get(choice.value);
     if (action?.kind === "done" || action?.kind === "other") {
       return {
         kind: action.kind === "done" ? "selected" : "other",
@@ -296,7 +332,7 @@ function rpcActions(question: Question, canGoBack: boolean, selected?: ReadonlyS
   for (const [index, option] of question.options.entries()) {
     const checked = selected ? `${selected.has(index) ? "[x]" : "[ ]"} ` : "";
     actions.set(
-      `[option:${index + 1}] ${checked}${option.label}${option.description ? ` — ${option.description}` : ""}`,
+      `[option:${index + 1}] ${checked}${sanitizeDisplayText(option.label, MAX_LABEL_LENGTH)}${option.description ? ` — ${sanitizeDisplayText(option.description, MAX_DESCRIPTION_LENGTH)}` : ""}`,
       { kind: "option", index },
     );
   }
@@ -327,6 +363,10 @@ function answerFor(question: Question, selections: QuestionSelection[], freeText
 
 function complete(answers: (QuestionAnswer | undefined)[]): QuestionAnswer[] {
   return answers.filter((answer): answer is QuestionAnswer => answer !== undefined);
+}
+
+function questionTitle(question: Question, index: number, total: number): string {
+  return `${progress(index, total)}${sanitizeDisplayText(question.header, MAX_HEADER_LENGTH)}: ${sanitizeDisplayText(question.question, MAX_QUESTION_LENGTH)}`;
 }
 
 function progress(index: number, total: number): string {
@@ -370,19 +410,31 @@ function cancelMessage(reason: CancellationReason): string {
   }
 }
 
-async function withAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T | undefined> {
-  if (signal?.aborted) return undefined;
-  if (!signal) return promise;
-  return new Promise<T | undefined>((resolve) => {
+type UiOutcome<T> = { kind: "value"; value: T } | { kind: "cancelled"; reason: "aborted" | "ui_error" };
+
+async function withAbort<T>(request: () => Promise<T>, signal: AbortSignal | undefined): Promise<UiOutcome<T>> {
+  if (signal?.aborted) return { kind: "cancelled", reason: "aborted" };
+  return new Promise<UiOutcome<T>>((resolve) => {
     let settled = false;
-    const finish = (value: T | undefined): void => {
+    const finish = (outcome: UiOutcome<T>): void => {
       if (settled) return;
       settled = true;
-      signal.removeEventListener("abort", onAbort);
-      resolve(value);
+      signal?.removeEventListener("abort", onAbort);
+      resolve(outcome);
     };
-    const onAbort = (): void => finish(undefined);
-    signal.addEventListener("abort", onAbort, { once: true });
-    void promise.then(finish, () => finish(undefined));
+    const onAbort = (): void => finish({ kind: "cancelled", reason: "aborted" });
+    const onError = (): void => finish({ kind: "cancelled", reason: signal?.aborted ? "aborted" : "ui_error" });
+    signal?.addEventListener("abort", onAbort, { once: true });
+    try {
+      // Always observe late rejection, including after cancellation. Sync throws
+      // and promise rejection have the same structured outcome in every mode.
+      void request().then(
+        (value) => finish(signal?.aborted ? { kind: "cancelled", reason: "aborted" } : { kind: "value", value }),
+        onError,
+      );
+    } catch {
+      onError();
+    }
+    if (signal?.aborted) onAbort();
   });
 }

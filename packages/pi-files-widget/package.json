@@ -1,6 +1,6 @@
 {
   "name": "@signalridge/pi-files-widget",
-  "version": "1.2.6",
+  "version": "1.2.7",
   "description": "In-terminal file browser and viewer for Pi.",
   "license": "MIT",
   "author": "Thomas Mustier",
@@ -36,6 +36,9 @@
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "1.0.4",
     "@earendil-works/pi-tui": "1.0.4"
+  },
+  "dependencies": {
+    "@signalridge/pi-ui": "^1.4.0"
   },
   "type": "module",
   "private": false,

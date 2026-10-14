@@ -28,15 +28,17 @@ describe("terminal sanitization of child-agent text", () => {
   });
 
   it("neutralizes the 8-bit C1 CSI introducer", () => {
-    expect(sanitizeTerminalText(C1_CSI)).toBe(" 31mred");
+    expect(sanitizeTerminalText(C1_CSI)).toBe("\\u009b31mred");
     expect(sanitizeTerminalText(C1_CSI)).not.toContain("");
   });
 
   it("neutralizes bidi overrides and isolates", () => {
     for (const codePoint of ["؜", "‎", "‏", "‪", "‮", "⁦", "⁩"]) {
-      expect(sanitizeTerminalText(`a${codePoint}b`)).toBe("a b");
+      expect(sanitizeTerminalText(`a${codePoint}b`)).toBe(
+        `a\\u${codePoint.charCodeAt(0).toString(16).padStart(4, "0")}b`,
+      );
     }
-    expect(sanitizeDisplayText(RTL_OVERRIDE, 300)).toBe("gnp.exe");
+    expect(sanitizeDisplayText(RTL_OVERRIDE, 300)).toBe("\\u202egnp.exe");
   });
 
   it("sanitizes before truncating so a straddling escape cannot leave a dangling introducer", () => {
@@ -49,8 +51,8 @@ describe("terminal sanitization of child-agent text", () => {
     expect([...safe]).toHaveLength(300);
   });
 
-  it("collapses newlines so multi-line results stay on one rendered row", () => {
-    expect(sanitizeDisplayText("one\ntwo\r\nthree", 300)).toBe("one two three");
+  it("encodes newlines so multi-line results stay on one rendered row", () => {
+    expect(sanitizeDisplayText("one\ntwo\r\nthree", 300)).toBe("one\\u000atwo\\u000d\\u000athree");
   });
 
   it("truncates by code point so a surrogate pair is never split", () => {

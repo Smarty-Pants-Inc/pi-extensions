@@ -7,7 +7,7 @@ import { Key, matchesKey, type TUI } from "@earendil-works/pi-tui";
 import { afterEach, test, vi } from "vitest";
 import history, { HistoryPopupComponent } from "../src/index.js";
 
-function setupShortcut() {
+function setupShortcut(content: unknown = "remembered prompt") {
   let editorText = "draft";
   const renderedEditorText: string[] = [];
   let popup: HistoryPopupComponent | undefined;
@@ -20,7 +20,7 @@ function setupShortcut() {
     mode: "tui",
     hasUI: true,
     sessionManager: {
-      getBranch: () => [{ type: "message", message: { role: "user", content: "remembered prompt" } }],
+      getBranch: () => [{ type: "message", message: { role: "user", content } }],
     },
     ui: {
       // Like Pi's overlay close: repaint is requested before custom() resolves.
@@ -82,6 +82,18 @@ test("cancelling reverse search keeps the draft and does not request an extra re
 
   assert.equal(getEditorText(), "draft");
   assert.equal(renderedEditorText.length, rendersAfterClose);
+});
+
+test("branch recall preserves all ordered text parts and exact multiline whitespace", async () => {
+  const { open, getEditorText } = setupShortcut([
+    { type: "text", text: "  leading\n" },
+    { type: "image", data: "not restored" },
+    { type: "text", text: "\ntrailing  " },
+  ]);
+  const { popup, running } = await open();
+  popup.handleInput("\r");
+  await running;
+  assert.equal(getEditorText(), "  leading\n\ntrailing  ");
 });
 
 const sessionDirectories: string[] = [];

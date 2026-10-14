@@ -23,18 +23,14 @@
  * than overwrite, preserving settings owned by Pi and other extensions.
  */
 
-import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
-
-import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
-import lockfile from "proper-lockfile";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { readEnabled, writeEnabled } from "./settings.js";
 
 const STATUS_KEY = "gpt-fast";
-const SETTINGS_KEY = "pi-gpt-fast";
 
 /**
- * Exact provider/model pairs known to accept the priority tier. An allowlist,
+ * Exact provider/model pairs known to accept the priority tier on their
+ * supported Responses APIs. An allowlist,
  * not a prefix match: sending `service_tier` to a provider that rejects unknown
  * fields fails the whole request, so a wrong guess costs a turn rather than
  * degrading quietly. krill is deliberately absent — it is an OpenAI-compatible
@@ -60,87 +56,20 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function currentModel(ctx: ExtensionContext): string | undefined {
-  const model = ctx.model as { provider?: string; id?: string } | undefined;
+  const model = ctx.model;
   return model?.provider && model?.id ? `${model.provider}/${model.id}` : undefined;
 }
 
 function modelSupportsPriority(ctx: ExtensionContext): boolean {
   const name = currentModel(ctx);
-  return name !== undefined && PRIORITY_MODELS.has(name);
-}
-
-function settingsPath(): string {
-  return join(getAgentDir(), "settings.json");
-}
-
-function readSettings(path: string): Record<string, unknown> {
-  let content: string;
-  try {
-    content = readFileSync(path, "utf8");
-  } catch (error) {
-    if (isRecord(error) && error.code === "ENOENT") return {};
-    throw error;
-  }
-  const settings: unknown = JSON.parse(content.replace(/^\uFEFF/, ""));
-  if (!isRecord(settings)) throw new Error("settings.json must contain an object");
-  if (SETTINGS_KEY in settings && !isRecord(settings[SETTINGS_KEY])) {
-    throw new Error(`${SETTINGS_KEY} must contain an object`);
-  }
-  return settings;
-}
-
-function readEnabled(): boolean {
-  try {
-    const settings = readSettings(settingsPath());
-    const block = settings?.[SETTINGS_KEY];
-    return isRecord(block) && block.enabled === true;
-  } catch {
-    return false;
-  }
-}
-
-// Match Pi's settings lock path/options and bounded synchronous contention
-// retries. Never fall back to an unlocked write when another owner holds it.
-function acquireSettingsLock(path: string): () => void {
-  for (let attempt = 1; ; attempt++) {
-    try {
-      return lockfile.lockSync(path, { realpath: false });
-    } catch (error) {
-      if (!isRecord(error) || error.code !== "ELOCKED" || attempt === 10) throw error;
-      const start = Date.now();
-      while (Date.now() - start < 20) {
-        // Pi's settings storage also retries synchronously.
-      }
-    }
-  }
-}
-
-/**
- * Merge the latest settings while holding Pi's shared lock, then atomically
- * rename a unique same-directory temp file. Malformed or unreadable settings
- * must fail rather than replacing unrelated configuration with an empty object.
- */
-function writeEnabled(enabled: boolean): void {
-  const path = settingsPath();
-  // realpath:false lets the shared lock cover creation of an absent file too.
-  mkdirSync(dirname(path), { recursive: true });
-  const temporaryPath = join(dirname(path), `.${basename(path)}.${randomUUID()}.tmp`);
-  const release = acquireSettingsLock(path);
-  try {
-    const settings = readSettings(path);
-    const block = isRecord(settings[SETTINGS_KEY]) ? settings[SETTINGS_KEY] : {};
-    settings[SETTINGS_KEY] = { ...block, enabled };
-    const document = `${JSON.stringify(settings, null, 2)}\n`;
-    writeFileSync(temporaryPath, document, { encoding: "utf8", flag: "wx" });
-    renameSync(temporaryPath, path);
-  } finally {
-    try {
-      rmSync(temporaryPath, { force: true });
-    } catch {
-      // Best-effort cleanup must not replace the write result.
-    }
-    release();
-  }
+  if (name === undefined || !PRIORITY_MODELS.has(name)) return false;
+  // Provider/API pairing follows mavam/pi-service-tier domain.ts at immutable
+  // 318ce1ef00693d34956f5fb39a8d1a71684b90a8. Keep our exact model allowlist:
+  // compatible providers and alternate APIs are not evidence of tier support.
+  return (
+    (ctx.model?.provider === "openai" && ctx.model.api === "openai-responses") ||
+    (ctx.model?.provider === "openai-codex" && ctx.model.api === "openai-codex-responses")
+  );
 }
 
 export default function (pi: ExtensionAPI) {

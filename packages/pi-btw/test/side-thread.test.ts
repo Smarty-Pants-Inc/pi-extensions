@@ -1355,7 +1355,8 @@ test.each([
     ctx: {
       ui: { notify() {} },
       sessionManager: {
-        getBranch: () => assert.fail("parent branch must not be read"),
+        // Ownership checks read entry IDs only, never the parent projection.
+        getBranch: () => [],
         buildSessionProjection: () => assert.fail("parent projection must not be read"),
       },
     } as never,
@@ -1655,7 +1656,7 @@ test("explicit parent sharing falls back to the raw branch on pre-projection Pi 
     },
   });
   assert.match(request, /User: Legacy context/);
-  assert.equal(branchReads, 1);
+  assert.ok(branchReads > 1, "live origin checks also inspect the raw branch IDs");
 });
 
 test("explicitly shared projected context still respects the 40k character budget", async () => {
@@ -1849,7 +1850,7 @@ test("side-thread command loop updates resumable title, activity, and local thin
     state,
     ctx: {
       ui: { notify() {} },
-      sessionManager: { getBranch: () => assert.fail("resumed state owns its original context") },
+      sessionManager: { getBranch: () => [] },
     } as never,
     dependencies: {
       now: () => 42,
@@ -1899,7 +1900,7 @@ test("side-thread command loop retains a visible error as resumable activity", a
     state,
     ctx: {
       ui: { notify() {} },
-      sessionManager: { getBranch: () => assert.fail("provided state owns its context") },
+      sessionManager: { getBranch: () => [] },
     } as never,
     dependencies: {
       now: () => 9,
@@ -3943,4 +3944,31 @@ test("answering steering rejects blank questions and bounds unsafe queue display
   view.dispose();
   assert.equal(cancelled, 1);
   assert.equal(view.signal.aborted, true);
+});
+
+test.each(["answered", "throws"] as const)("retired side provider %s cannot publish a side turn", async (outcome) => {
+  const thread = createSideThread();
+  let current = true;
+  let reads = 0;
+  const result = await completeSideThreadTurn({
+    thread,
+    question: "old side question",
+    model: { provider: "test", id: "side" } as Model<Api>,
+    thinkingLevel: "off",
+    auth: {},
+    isCurrent: () => current,
+    prepareContext: () => {
+      reads++;
+      return "authorized original parent";
+    },
+    completeSimple: async () => {
+      await Promise.resolve();
+      current = false;
+      if (outcome === "throws") throw new Error("retired provider failed");
+      return response("stale answer");
+    },
+  });
+  assert.deepEqual(result, { kind: "aborted" });
+  assert.deepEqual(thread.turns, []);
+  assert.equal(reads, 1, "post-response validation must not reread parent history");
 });

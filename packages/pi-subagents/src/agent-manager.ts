@@ -43,6 +43,7 @@ import {
   assertParentModelRuntimeAvailable,
   parentModelSessionOptions,
 } from "./model-runtime-bridge.js";
+import type { ParentQuestionHandler } from "./parent-questions.js";
 import { shutdownAndDisposeSession } from "./session-lifecycle.js";
 import type { TierThinking } from "./settings.js";
 import type {
@@ -314,6 +315,7 @@ interface SpawnArgs {
   prompt: string;
   options: SpawnOptions;
   internalOverride?: InternalAgentConfigOverride;
+  parentQuestion?: ParentQuestionHandler;
 }
 
 export type ManagedSpawnRequest = ProtocolManagedSpawnRequest;
@@ -912,6 +914,8 @@ export interface SpawnOptions {
   /** Named sequential-thread hint for workflow orchestration. */
   thread?: string;
   isBackground?: boolean;
+  /** Explicit clarification routing. Parent mode requires a fresh root background spawn. */
+  supervisorQuestions?: boolean | "parent";
   /**
    * Skip the maxConcurrent queue check for this spawn — start immediately even
    * if the configured concurrency limit would otherwise queue it. Used by the
@@ -1074,6 +1078,13 @@ export class AgentManager {
   private rememberAgents = true;
   /** Whether spawned agents get `contact_supervisor` (settings). */
   private supervisorQuestions = true;
+  private parentQuestionFactory?: (record: AgentRecord, ctx: ExtensionContext) => ParentQuestionHandler;
+  private parentQuestionAgents = new WeakSet<AgentRecord>();
+
+  /** Package-local root capability; no managed RPC schema or global settings change. */
+  setParentQuestionFactory(factory: (record: AgentRecord, ctx: ExtensionContext) => ParentQuestionHandler): void {
+    this.parentQuestionFactory = factory;
+  }
   /**
    * Descendants spawned so far under each top-level agent, keyed by that
    * agent's id. Cumulative for the branch's lifetime — see the budget check in
@@ -1663,6 +1674,14 @@ export class AgentManager {
     // Legacy in-process callers omitted description before it became required.
     // Normalize that shape to an inert string while rejecting reference values.
     options = { ...options, description: options.description ?? type };
+    if (options.supervisorQuestions !== undefined && typeof options.supervisorQuestions !== "boolean" && options.supervisorQuestions !== "parent") {
+      throw new Error('supervisorQuestions must be boolean or "parent".');
+    }
+    if (options.supervisorQuestions === "parent" &&
+        (options.isBackground !== true || options.parentAgentId !== undefined || options.resumeSessionFile ||
+          options.isolated || getAgentConfig(type)?.isolated || !this.supervisorQuestions || !this.parentQuestionFactory)) {
+      throw new Error('Parent clarification requires a fresh, non-isolated top-level background Agent with supervisor questions enabled. Set run_in_background: true; foreground calls cannot answer while blocked.');
+    }
     // Covers top-level, nested, managed, and queued spawns before allocating a
     // record, consuming a branch budget, or creating an isolation worktree.
     assertNoRawInheritance(
@@ -1811,7 +1830,9 @@ export class AgentManager {
       prompt,
       options,
       internalOverride,
+      ...(options.supervisorQuestions === "parent" ? { parentQuestion: this.parentQuestionFactory!(record, ctx) } : {}),
     };
+    if (options.supervisorQuestions === "parent") this.parentQuestionAgents.add(record);
     // Lifecycle observers may synchronously stop or dispose a freshly allocated
     // record. Do not let the normal queue/start path resurrect that decision.
     if (
@@ -2215,7 +2236,7 @@ export class AgentManager {
   private startAgent(
     id: string,
     record: AgentRecord,
-    { pi, ctx, type, prompt, options, internalOverride }: SpawnArgs,
+    { pi, ctx, type, prompt, options, internalOverride, parentQuestion }: SpawnArgs,
   ) {
     if (this.disposed || record.detached || this.agents.get(id) !== record)
       return;
@@ -2330,7 +2351,8 @@ export class AgentManager {
         // Top-level conversations persist by default so `@handle` has something
         // to reopen after the record is evicted; frontmatter still overrides.
         rememberAgents: this.rememberAgents,
-        supervisorQuestions: this.supervisorQuestions,
+        supervisorQuestions: options.supervisorQuestions ?? this.supervisorQuestions,
+        parentQuestion,
         resumeSessionFile: options.resumeSessionFile,
         toolset: options.toolset,
         excludeTools: options.excludeTools,
@@ -2948,6 +2970,9 @@ export class AgentManager {
     )
       return undefined;
     if (!record.session) return undefined;
+    if (this.parentQuestionAgents.has(record) && options?.isBackground !== true) {
+      throw new Error('This child uses parent clarification; resume it with run_in_background: true to avoid blocking the answering model.');
+    }
     assertSafeChildSession(
       record.session,
       record.invocation?.inheritContext === true,

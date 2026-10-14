@@ -3,7 +3,8 @@
  *
  * A workflow is a raw JavaScript module. The runtime parses it under an acorn
  * gate (deterministic literal `export const meta` first, no nondeterministic
- * builtins), then executes the body inside a `node:vm` realm with a bounded set
+ * builtins), then executes the body/callbacks in an owned Node helper's vm realm
+ * with validated IPC proxies to the parent-owned bounded set
  * of orchestration globals (`agent`, `parallel`, `pipeline`, `workflow`,
  * quality/control helpers, `phase`, `log`, `args`, `cwd`, restricted
  * `process`, `budget`). The vm is a determinism guardrail, not a security
@@ -20,7 +21,6 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
-import vm from "node:vm";
 import type { ManagedRoutingPolicy } from "@signalridge/pi-subagents-protocol";
 import { agentTierPolicyIdentity, isManagedAgentTier } from "@signalridge/pi-subagents-protocol";
 import { parse } from "acorn";
@@ -40,6 +40,7 @@ import {
   type WorkflowStrength,
   type WorkflowStrengthTable,
 } from "./strengths.js";
+import { executeOwnedVm } from "./vm-helper.js";
 
 // ── Meta contract ────────────────────────────────────────────────────────────
 
@@ -895,7 +896,8 @@ export function normalizeMaxAgents(value: unknown): number {
 export function normalizeAgentTimeout(value: unknown): number | null {
   if (value === null) return null;
   if (value === undefined) return DEFAULT_AGENT_TIMEOUT_MS;
-  if (typeof value !== "number" || !Number.isFinite(value) || value < 1) return DEFAULT_AGENT_TIMEOUT_MS;
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 1 || value > 2_147_483_647)
+    return DEFAULT_AGENT_TIMEOUT_MS;
   return Math.floor(value);
 }
 
@@ -1237,6 +1239,12 @@ export async function runWorkflow<T = unknown>(
   options: WorkflowRunOptions = {},
 ): Promise<WorkflowRunResult<T>> {
   const started = Date.now();
+  // Each frame owns cancellation, even when a parent catches a nested failure.
+  const frameController = new AbortController();
+  options = {
+    ...options,
+    signal: options.signal ? AbortSignal.any([options.signal, frameController.signal]) : frameController.signal,
+  };
   const { meta, body } = parseWorkflowScript(script);
   const maxAgents = normalizeMaxAgents(options.maxAgents ?? MAX_AGENTS_PER_RUN);
   const agentTimeoutMs = normalizeAgentTimeout(options.agentTimeoutMs);
@@ -1616,7 +1624,8 @@ export async function runWorkflow<T = unknown>(
       throwIfAborted();
       if (batch?.cancelled) throw agentLimitError();
 
-      const timeout = agentOptions.timeoutMs !== undefined ? agentOptions.timeoutMs : agentTimeoutMs;
+      const timeout =
+        agentOptions.timeoutMs !== undefined ? normalizeAgentTimeout(agentOptions.timeoutMs) : agentTimeoutMs;
       const retryAttempts = normalizeAgentRetries(agentOptions.retries ?? options.agentRetries ?? 0);
       const maxAttempts = retryAttempts + 1;
 
@@ -1709,7 +1718,10 @@ export async function runWorkflow<T = unknown>(
               agentType: agentOptions.agentType,
               isolation: resolvedIsolation,
               toolset: options.toolset ?? agentOptions.toolset,
-              excludeTools: options.excludeTools ?? agentOptions.excludeTools,
+              excludeTools:
+                options.excludeTools === undefined && agentOptions.excludeTools === undefined
+                  ? undefined
+                  : [...new Set([...(options.excludeTools ?? []), ...(agentOptions.excludeTools ?? [])])],
               runId,
               callIndex,
               callHash,
@@ -2220,15 +2232,20 @@ export async function runWorkflow<T = unknown>(
         if (code === WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED || code === WorkflowErrorCode.AGENT_LIMIT_EXCEEDED) break;
         throw error;
       }
-      const fresh = (Array.isArray(items) ? items : []).filter((x) => x != null && !seen.has(key(x)));
+      const fresh: Array<{ item: unknown; key: string }> = [];
+      for (const item of Array.isArray(items) ? items : []) {
+        if (item == null) continue;
+        const identity = await key(item);
+        if (!seen.has(identity)) fresh.push({ item, key: identity });
+      }
       if (!fresh.length) {
         dry++;
         continue;
       }
       dry = 0;
-      for (const x of fresh) {
-        seen.add(key(x));
-        all.push(x);
+      for (const entry of fresh) {
+        seen.add(entry.key);
+        all.push(entry.item);
       }
     }
     return all;
@@ -2265,7 +2282,7 @@ export async function runWorkflow<T = unknown>(
     for (let i = 0; i < attempts; i++) {
       throwIfAborted();
       last = await thunk(i);
-      const accepted = !opts.until || opts.until(last);
+      const accepted = !opts.until || (await opts.until(last));
       emitRuntimeEvent({ type: "control-attempt", helper: "retry", attempt: i + 1, accepted });
       if (accepted) return last;
     }
@@ -2397,18 +2414,20 @@ export async function runWorkflow<T = unknown>(
     );
   }
 
-  const context = vm.createContext({
-    ...runtimeBindings,
-    // Object/Array/JSON/Math/Date/Promise/Set/Map/etc. come from the vm realm
-    // itself — we deliberately do NOT inject host built-ins, whose
-    // .constructor would be the host Function (a determinism-guard bypass).
-    // Math/Date are neutered in-realm by DETERMINISM_PRELUDE below.
-  });
-
   const wrapped = `${DETERMINISM_PRELUDE}\n(async () => {\n${body}\n})()`;
   try {
-    const result = await new vm.Script(wrapped, { filename: `${meta.name || "workflow"}.js` }).runInContext(context, {
-      timeout: MAX_SCRIPT_SYNC_MS,
+    const result = await executeOwnedVm({
+      script: wrapped,
+      filename: `${meta.name || "workflow"}.js`,
+      args: options.args,
+      cwd: baseCwd,
+      bindings: { ...runtimeBindings },
+      total: budget.total,
+      spent: budget.spent,
+      cancel: () => frameController.abort(),
+      signal: options.signal
+        ? AbortSignal.any([options.signal, shared.runFatalController.signal])
+        : shared.runFatalController.signal,
     });
     try {
       const serialized = JSON.stringify(result);
@@ -2439,6 +2458,7 @@ export async function runWorkflow<T = unknown>(
     // reaching here does NOT seal anything (the parent may still catch
     // workflow()'s rejection). Idempotent: aborting an already-aborted
     // controller is a no-op.
+    frameController.abort();
     if (isTopLevelRun) shared.runFatalController.abort();
     throw error;
   } finally {

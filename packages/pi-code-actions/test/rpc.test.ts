@@ -12,6 +12,7 @@ test("RPC insertion confirms replacement without reading the client draft; cance
     },
   } as never);
   const notices: string[] = [];
+  const snippet = process.platform === "win32" ? "Write-Output 'ran successfully'" : "printf 'ran successfully'";
   let inserted = "client draft";
   let confirmed = false;
   let replacements = 0;
@@ -19,6 +20,7 @@ test("RPC insertion confirms replacement without reading the client draft; cance
   const ctx = {
     mode: "rpc",
     hasUI: true,
+    cwd: process.cwd(),
     sessionManager: {
       getSessionId: () => "session",
       getLeafId: () => "a",
@@ -27,7 +29,7 @@ test("RPC insertion confirms replacement without reading the client draft; cance
           type: "message",
           id: "a",
           timestamp: "",
-          message: { role: "assistant", content: "```ts\nconst a = 1;\n```" },
+          message: { role: "assistant", content: `\`\`\`sh\n${snippet}\n\`\`\`` },
         },
       ],
     },
@@ -57,7 +59,7 @@ test("RPC insertion confirms replacement without reading the client draft; cance
   assert.match(confirmations[0] ?? "", /cannot read or append/i);
   confirmed = true;
   await handler("last insert 1", ctx as never);
-  assert.equal(inserted, "const a = 1;");
+  assert.equal(inserted, snippet);
   assert.equal(replacements, 1);
   await handler("last run 1", ctx as never);
   assert.match(notices.at(-1) ?? "", /ran successfully/);

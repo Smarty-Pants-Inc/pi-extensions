@@ -537,6 +537,8 @@ function parseTerminalResult(raw: unknown, runId: string): RecoveryTerminalResul
 }
 
 function parseRunRecovery(raw: Record<string, unknown>, run: ScriptRun, timestamp: number): RunRecoveryEvent {
+  if (run.status === "completed" || run.nonResumable || run.terminalIntent === "stop")
+    throw new Error("cannot recover a completed or non-resumable workflow run");
   if (raw.status !== "interrupted") throw new Error("run recovery status is invalid");
   if (typeof raw.branchGeneration !== "number" || !Number.isInteger(raw.branchGeneration) || raw.branchGeneration < 0) {
     throw new Error("run recovery branchGeneration is invalid");
@@ -1140,6 +1142,8 @@ export function applyRecoveryEvent(run: ScriptRun, event: RunRecoveryEvent | Att
   if (event.kind === "run_recovery") {
     run.status = "interrupted";
     run.terminalIntent = undefined;
+    run.error = undefined;
+    run.finalResult = undefined;
     for (const rotation of event.rotations) applyRecoveryRotation(run, rotation);
     applyRecoveryTerminalResults(run, event.terminalResults ?? []);
   } else {
@@ -1218,6 +1222,7 @@ function applyJournalEvent(runs: Map<string, ScriptRun>, event: JournalEvent): v
       break;
     case "workflow_transition":
       run.status = event.status;
+      if (event.status === "running") run.error = undefined;
       if (event.error !== undefined) run.error = event.error;
       if (event.finalResult !== undefined) run.finalResult = structuredClone(event.finalResult);
       if (event.terminalIntent !== undefined) run.terminalIntent = event.terminalIntent;

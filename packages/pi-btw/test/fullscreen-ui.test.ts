@@ -326,7 +326,7 @@ test.each([
   "new session before completion",
   "new session after completion",
   "tree navigation after completion",
-] as const)("fullscreen %s does not restore a cached obsolete draft", async (transitionAt) => {
+] as const)("fullscreen %s respects invalid identity or a later observable writer", async (transitionAt) => {
   const session = SessionManager.inMemory();
   const earlier = session.appendMessage({ role: "user", content: "Earlier", timestamp: 1 });
   session.appendMessage({ role: "user", content: "Later", timestamp: 2 });
@@ -350,7 +350,9 @@ test.each([
   const ctx = {
     sessionManager: session,
     ui: {
-      getEditorText: () => cachedEditor,
+      // Same-session tree navigation keeps the public editor live. Only an
+      // invalid replacement context can expose an obsolete cached value.
+      getEditorText: () => (transitionAt === "tree navigation after completion" ? liveEditor : cachedEditor),
       setEditorText: (text: string) => {
         writes.push(text);
         liveEditor = text;

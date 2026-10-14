@@ -9,10 +9,23 @@
  *  - pre-v4 journals are quarantined on restore
  */
 
+import { setTimeout as realDelay } from "node:timers/promises";
 import type { ManagedRoutingPolicy } from "@signalridge/pi-subagents-protocol";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi as vitest } from "vitest";
+
+// Advance engine clocks only after real helper I/O has had a turn, then flush
+// its replies. Helper execution is intentionally not governed by fake timers.
+const vi = {
+  ...vitest,
+  async advanceTimersByTimeAsync(ms: number) {
+    await realDelay(150);
+    await vitest.advanceTimersByTimeAsync(ms);
+    await realDelay(150);
+  },
+};
+
 import { WorkflowEngine } from "../src/engine.js";
-import { JOURNAL_ENTRY_TYPE, type JournalEvent } from "../src/journal.js";
+import { deriveRecoveryId, JOURNAL_ENTRY_TYPE, JOURNAL_SCHEMA_VERSION, type JournalEvent } from "../src/journal.js";
 import {
   createManagedSpawnClient,
   type DispatchTask,
@@ -20,6 +33,12 @@ import {
   type ManagedSpawnClient,
   type WorkflowEventBus,
 } from "../src/rpc-client.js";
+
+// These tests previously used a same-thread setImmediate as a VM flush. A Node
+// execution frame needs real I/O turns (also while engine timers are faked).
+function setImmediate(callback: () => void): void {
+  void realDelay(150).then(callback);
+}
 
 function makeBus(): WorkflowEventBus {
   const listeners = new Map<string, Set<(data: unknown) => void>>();
@@ -228,6 +247,229 @@ async function completeAllInflight(client: FakeClient): Promise<void> {
 }
 
 describe("workflow engine", () => {
+  it("drains ordered call facts before terminal completion under the root smoke's transient append failures", async () => {
+    const bus = makeBus();
+    const client = makeClient(bus, { answers: { "call-0": { result: "first" }, "call-1": { result: "second" } } });
+    const facts: JournalEvent[] = [];
+    let failures = 2;
+    const engine = new WorkflowEngine(bus, client, {
+      append(event) {
+        if (failures > 0 && (event.kind === "call_attempt" || event.kind === "call_result")) {
+          failures--;
+          throw new Error("transient smoke journal failure");
+        }
+        facts.push(structuredClone(event));
+      },
+    });
+    try {
+      const started = await engine.start(SIMPLE_SCRIPT);
+      expect(started.status).toBe("completed");
+      expect(failures).toBe(0);
+      const completed = facts.findIndex(
+        (event) => event.kind === "workflow_transition" && event.status === "completed",
+      );
+      for (const nodeId of ["0", "1"]) {
+        const attempt = facts.findIndex((event) => event.kind === "call_attempt" && event.nodeId === nodeId);
+        const result = facts.findIndex((event) => event.kind === "call_result" && event.nodeId === nodeId);
+        expect(attempt).toBeGreaterThan(-1);
+        expect(result).toBeGreaterThan(attempt);
+        expect(completed).toBeGreaterThan(result);
+      }
+      engine.restore(facts.map(asSessionEntry));
+      expect(engine.getRun(started.runId)).toMatchObject({
+        status: "completed",
+        callStatus: { "0": "completed", "1": "completed" },
+      });
+    } finally {
+      engine.dispose();
+    }
+  });
+
+  it("does not publish an unawaited nested helper while it can still dispatch managed work", async () => {
+    const { engine, client, entries } = makeEngine({ manual: true });
+    const header = 'export const meta = {name:"nested-drain",description:"test"};';
+    try {
+      const pending = engine.start(`${header} void workflow("saved"); return 1;`, {
+        loadSavedWorkflow: () => `${header} void parallel([()=>agent("child")]); return 2;`,
+      });
+      await vi.waitFor(() => expect(client.spawned).toHaveLength(1));
+      expect(engine.getRun(client.spawned[0].runId)?.status).toBe("running");
+      expect((entries as JournalEvent[]).some((event) => event.kind === "workflow_result")).toBe(false);
+      client.complete(client.spawned[0].id, "child");
+      const started = await pending;
+      expect(started.status).toBe("completed");
+      const facts = entries as JournalEvent[];
+      expect(facts.find((event) => event.kind === "workflow_result")).toMatchObject({
+        result: { status: "completed", result: 2 },
+        agentCount: 1,
+      });
+      engine.restore(facts.map(asSessionEntry));
+      expect(engine.getRun(started.runId)).toMatchObject({ status: "completed", callStatus: { "0": "completed" } });
+      expect(client.stopped).toEqual([]);
+    } finally {
+      engine.dispose();
+    }
+  });
+
+  it("restores terminal timeout and local checkpoint facts without active calls", async () => {
+    const { engine, client, entries } = makeEngine({ manual: true });
+    try {
+      const started = await engine.start(
+        'export const meta = {name:"terminal-facts",description:"test"}; await agent("timeout",{timeoutMs:10}); return await checkpoint("continue",{default:false});',
+      );
+      expect(started.status).toBe("completed");
+      expect(client.stopped).toHaveLength(1);
+      const facts = entries as JournalEvent[];
+      expect(facts.find((event) => event.kind === "call_result" && event.nodeId === "0")).toMatchObject({
+        result: { status: "stopped" },
+      });
+      expect(facts.find((event) => event.kind === "call_result" && event.nodeId === "1")).toMatchObject({
+        result: { status: "completed", result: false },
+      });
+      engine.restore(facts.map(asSessionEntry));
+      expect(engine.getRun(started.runId)).toMatchObject({
+        status: "completed",
+        callStatus: { "0": "stopped", "1": "completed" },
+      });
+    } finally {
+      engine.dispose();
+    }
+  });
+
+  it("does not reclassify VM-thrown quota words as a native provider pause after IPC", async () => {
+    const { engine, client } = makeEngine();
+    const run = await engine.start(
+      'export const meta = {name:"script-error",description:"test"}; throw new Error("rate limit described by the script");',
+    );
+    expect(run.status).toBe("failed");
+    expect(client.spawned).toEqual([]);
+    engine.dispose();
+  });
+  it("accepts recoverable stopped history through a durable recovery, but never revives completed history", async () => {
+    const { engine, entries, client } = makeEngine({ answers: { "call-0": { result: "fixed" } } });
+    const header = 'export const meta = { name: "stopped-recovery", description: "test" };';
+    const started = await engine.start(`${header} return "old";`);
+    const completed = (entries as JournalEvent[]).map(asSessionEntry);
+    const stopped = (entries as JournalEvent[]).flatMap((event) =>
+      event.kind === "workflow_transition" && event.status === "completed"
+        ? [
+            asSessionEntry({ ...event, status: "stopping", finalResult: undefined, terminalIntent: "failure" }),
+            asSessionEntry({ ...event, status: "stopped", finalResult: undefined, terminalIntent: "failure" }),
+          ]
+        : [asSessionEntry(event)],
+    );
+    engine.restore(stopped);
+    expect(engine.getRun(started.runId)?.status).toBe("stopped");
+    expect(
+      await engine.resume(started.runId, stopped, { background: true }, `${header} return await agent("fixed");`),
+    ).toBeDefined();
+    expect((await engine.waitFor(started.runId)).status).toBe("completed");
+    expect(client.stopped).toEqual([]);
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const timestamp = Date.now();
+      engine.restore([
+        ...completed,
+        asSessionEntry({
+          kind: "run_recovery",
+          schemaVersion: JOURNAL_SCHEMA_VERSION,
+          runId: started.runId,
+          status: "interrupted",
+          branchGeneration: 0,
+          rotations: [],
+          timestamp,
+          recoveryId: deriveRecoveryId({ runId: started.runId, rotations: [], timestamp }),
+        }),
+      ]);
+      expect(engine.getRun(started.runId)).toBeUndefined();
+      expect(warning).toHaveBeenCalledWith(expect.stringContaining("cannot recover a completed"));
+    } finally {
+      warning.mockRestore();
+      engine.dispose();
+    }
+  });
+  it("durably recovers a failed run before live resume and restores its cached prefix", async () => {
+    const { engine, client, entries } = makeEngine({
+      answers: { "call-0": { result: "first" }, "call-1": { result: "fixed" } },
+    });
+    const header = 'export const meta = { name: "failed-resume", description: "test" };';
+    const started = await engine.start(`${header} await agent("first"); throw new Error("broken");`);
+    expect(started.status).toBe("failed");
+    const prior = (entries as JournalEvent[]).map(asSessionEntry);
+    const resumed = await engine.resume(
+      started.runId,
+      prior,
+      { background: true },
+      `${header} await agent("first"); return await agent("fixed");`,
+    );
+    expect(resumed?.status).toBe("running");
+    expect((await engine.waitFor(started.runId)).status).toBe("completed");
+    expect(client.spawned.map(({ task }) => task.prompt)).toEqual(["first", "fixed"]);
+    expect(client.stopped).toEqual([]); // No historical completed child is stopped.
+    const facts = entries as JournalEvent[];
+    const recovery = facts.findIndex((event) => event.kind === "run_recovery");
+    expect(recovery).toBeGreaterThan(
+      facts.findIndex((event) => event.kind === "workflow_transition" && event.status === "failed"),
+    );
+    expect(facts.slice(recovery + 1)).toContainEqual(
+      expect.objectContaining({ kind: "workflow_transition", status: "running" }),
+    );
+    engine.restore(facts.map(asSessionEntry));
+    expect(engine.getRun(started.runId)).toMatchObject({ status: "completed", finalResult: "fixed" });
+    engine.dispose();
+  });
+
+  it("journals local checkpoint attempt identity after an agent and restores both without phantom managed stops", async () => {
+    const { engine, client, entries } = makeEngine({ answers: { "call-0": { result: "first" } } });
+    const started = await engine.start(
+      'export const meta = { name: "local-checkpoint", description: "test" }; await agent("first"); return await checkpoint("continue?",{default:false});',
+    );
+    expect(started.status).toBe("completed");
+    const facts = entries as JournalEvent[];
+    const attempt = facts.findIndex((event) => event.kind === "call_attempt" && event.nodeId === "1");
+    const result = facts.findIndex((event) => event.kind === "call_result" && event.nodeId === "1");
+    expect(attempt).toBeGreaterThan(-1);
+    expect(result).toBeGreaterThan(attempt);
+    expect(client.stopped).toEqual([]);
+    engine.restore(facts.map(asSessionEntry));
+    expect(engine.getRun(started.runId)).toMatchObject({
+      status: "completed",
+      finalResult: false,
+      callResults: { "0": { status: "completed", result: "first" }, "1": { status: "completed", result: false } },
+    });
+    engine.dispose();
+  });
+
+  it("records timeout terminal failure after exact-owner quiescence before null continuation and restores completion", async () => {
+    const { engine, client, entries } = makeEngine({ manual: true });
+    let quiescent = false;
+    client.quiesceOwned = async (_runId, ids, _timeout, owners) => {
+      expect(ids).toEqual(["agent-1"]);
+      expect(owners).toMatchObject([{ extension: "pi-workflows", nodeId: "call-0", attemptId: "attempt-1" }]);
+      quiescent = true;
+      return { settled: true, pending: [] };
+    };
+    const started = await engine.start(
+      'export const meta = { name: "timeout-restore", description: "test" }; const value=await agent("slow",{timeoutMs:10}); return value===null ? "done" : "wrong";',
+    );
+    expect(quiescent).toBe(true);
+    expect(started.status).toBe("completed");
+    const facts = entries as JournalEvent[];
+    expect(facts).toContainEqual(
+      expect.objectContaining({
+        kind: "call_result",
+        nodeId: "0",
+        result: expect.objectContaining({ status: "stopped" }),
+      }),
+    );
+    engine.restore(facts.map(asSessionEntry));
+    expect(engine.getRun(started.runId)).toMatchObject({
+      status: "completed",
+      finalResult: "done",
+      callStatus: { "0": "stopped" },
+    });
+    engine.dispose();
+  });
   it("keeps the session cwd for control and automatic provider resumes, including nested frames", async () => {
     const cwd = "/session-project-b";
     expect(process.cwd()).not.toBe(cwd);
@@ -997,15 +1239,23 @@ return await workflow("child");`;
       signal.abort();
       await vi.advanceTimersByTimeAsync(12_000);
       expect(returned).toBe(true);
-      expect(engine.getRun(runId)?.nonResumable).toBe(true);
-      expect(await engine.resume(runId, (entries as JournalEvent[]).map(asSessionEntry))).toBeUndefined();
+      expect(engine.getRun(runId)?.nonResumable).not.toBe(true);
+      expect(engine.getRun(runId)?.status).toBe("interrupted");
+      const resumed = await engine.resume(
+        runId,
+        (entries as JournalEvent[]).map(asSessionEntry),
+        { background: true },
+        'export const meta = { name: "fixed", description: "d" }; return "done";',
+      );
+      expect(resumed).toBeDefined();
+      expect((await engine.waitFor(runId)).status).toBe("completed");
     } finally {
       engine.dispose();
       vi.useRealTimers();
     }
   });
 
-  it("foreground resume also bounds unresolved execution and persists its fence", async () => {
+  it("foreground resume bounds unresolved helper execution and restores a resumable interruption", async () => {
     const { engine, client, entries } = makeEngine({ manual: true });
     const started = await engine.start(SIMPLE_SCRIPT, { background: true });
     await new Promise((resolve) => setImmediate(resolve));
@@ -1032,8 +1282,8 @@ return await workflow("child");`;
       expect(client.spawned).toHaveLength(count);
       const persisted = (entries as JournalEvent[]).map(asSessionEntry);
       engine.restore(persisted);
-      expect(engine.getRun(started.runId)?.nonResumable).toBe(true);
-      expect(await engine.resume(started.runId, persisted)).toBeUndefined();
+      expect(engine.getRun(started.runId)?.nonResumable).not.toBe(true);
+      expect(engine.getRun(started.runId)?.status).toBe("interrupted");
     } finally {
       engine.dispose();
       vi.useRealTimers();
@@ -1084,40 +1334,50 @@ return await workflow("child");`;
     }
   });
 
-  it.each([false, true])("fatal script failure during timeout cleanup is not resumable (nested=%s)", async (nested) => {
-    const { engine, client, entries } = makeEngine({ manual: true });
-    let release = () => {};
-    const cleanup = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    client.quiesceOwned = async () => {
-      await cleanup;
-      return { settled: true, pending: [] };
-    };
-    const body = `void agent("slow", { timeoutMs: 10 });
+  it.each([false, true])(
+    "pause preserves a sealed root failure but cancels a nested rejection still behind cleanup (nested=%s)",
+    async (nested) => {
+      const { engine, client, entries } = makeEngine({ manual: true });
+      let release = () => {};
+      const cleanup = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      client.quiesceOwned = async () => {
+        await cleanup;
+        return { settled: true, pending: [] };
+      };
+      const body = `void agent("slow", { timeoutMs: 10 });
       await new Promise(resolve => setTimeout(resolve, 20)); throw new Error("fatal script failure");`;
-    const child = `export const meta = { name: "fatal-child", description: "d" }; ${body}`;
-    const script = `export const meta = { name: "fatal-root", description: "d" };
+      const child = `export const meta = { name: "fatal-child", description: "d" }; ${body}`;
+      const script = `export const meta = { name: "fatal-root", description: "d" };
       ${nested ? `await workflow(${JSON.stringify(child)});` : body}`;
-    vi.useFakeTimers();
-    try {
-      await engine.start(script, { background: true });
-      await vi.advanceTimersByTimeAsync(21);
-      const runId = client.spawned[0].runId;
-      const paused = engine.control("pause", runId);
-      release();
-      await vi.advanceTimersByTimeAsync(1);
-      await paused;
-      expect(engine.getRun(runId)?.status).toBe("failed");
-      await expect(engine.control("resume", runId, (entries as JournalEvent[]).map(asSessionEntry))).rejects.toThrow(
-        /cannot resume/,
-      );
-    } finally {
-      release();
-      engine.dispose();
-      vi.useRealTimers();
-    }
-  });
+      vi.useFakeTimers();
+      try {
+        await engine.start(script, { background: true });
+        await vi.advanceTimersByTimeAsync(21);
+        const runId = client.spawned[0].runId;
+        const paused = engine.control("pause", runId);
+        release();
+        await vi.advanceTimersByTimeAsync(1);
+        await paused;
+        if (nested) {
+          // A nested frame does not seal the root: its rejection has not crossed
+          // the root's VM boundary yet. Pause terminates that pending root await.
+          expect(engine.getRun(runId)?.status).toBe("interrupted");
+          expect(engine.getRun(runId)?.nonResumable).not.toBe(true);
+        } else {
+          expect(engine.getRun(runId)?.status).toBe("failed");
+          await expect(
+            engine.control("resume", runId, (entries as JournalEvent[]).map(asSessionEntry)),
+          ).rejects.toThrow(/cannot resume/);
+        }
+      } finally {
+        release();
+        engine.dispose();
+        vi.useRealTimers();
+      }
+    },
+  );
 
   it("pause during unconfirmed timeout cleanup remains non-resumable", async () => {
     const { engine, client, entries } = makeEngine({ manual: true });

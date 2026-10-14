@@ -1275,6 +1275,31 @@ test("buildUserPrompt omits parent context unless explicitly supplied", () => {
   assert.match(buildUserPrompt("What now?", "User: shared"), /<conversation_context>\nUser: shared/);
 });
 
+test.each(["auth error", "auth throws"] as const)("retired %s cannot resolve fallback credentials", async (outcome) => {
+  let current = true;
+  const reads: string[] = [];
+  const warnings: string[] = [];
+  const result = await resolveBtwModel({
+    settings: { model: "configured/side" },
+    currentModel: { provider: "fallback", id: "main" } as Model<Api>,
+    modelRegistry: {
+      find: () => ({ provider: "configured", id: "side" }) as Model<Api>,
+      getApiKeyAndHeaders: async (model: Model<Api>) => {
+        reads.push(model.provider);
+        await Promise.resolve();
+        current = false;
+        if (outcome === "auth throws") throw new Error("old auth failed");
+        return { ok: false as const, error: "old auth failed" };
+      },
+    } as never,
+    isCurrent: () => current,
+    warn: (warning) => warnings.push(warning),
+  });
+  assert.equal(result, undefined);
+  assert.deepEqual(reads, ["configured"]);
+  assert.deepEqual(warnings, []);
+});
+
 test("sanitizeSingleLine removes controls and collapses whitespace", () => {
   assert.equal(sanitizeSingleLine(" /btw\nhello\t\u0000 world  "), "/btw hello world");
 });

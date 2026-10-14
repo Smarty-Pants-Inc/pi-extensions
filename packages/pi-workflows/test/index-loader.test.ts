@@ -85,6 +85,7 @@ function createPi(child: boolean, appendFailures = 0, branch: unknown[] = [], pr
   });
   const pi = {
     events: bus,
+    registerMessageRenderer: vi.fn(),
     appendEntry: (_type: string, data: unknown) => {
       if (appendFailures > 0) {
         appendFailures -= 1;
@@ -160,6 +161,23 @@ function workflowTool(fixture: ReturnType<typeof createPi>): WorkflowTool {
 }
 
 describe("pi-workflows loader context isolation", () => {
+  it("encodes delivery display copies without changing persisted content or membership", async () => {
+    const fixture = createPi(false);
+    piWorkflows(fixture.pi as never);
+    await fixture.lifecycle.get("session_start")?.({}, fixture.ctx);
+    const render = fixture.pi.registerMessageRenderer.mock.calls.find(
+      ([type]) => type === "pi-workflows:delivery",
+    )?.[1] as (message: unknown, options: unknown, theme: unknown) => { render(width: number): string[] };
+    const message = { content: "raw\u001b[2J\u009b\u202e result", details: { runIds: ["raw-run"] } };
+    const before = structuredClone(message);
+    const displayed = render(message, { expanded: true }, { fg: (_token: string, text: string) => text })
+      .render(120)
+      .join("\n");
+    for (const control of ["\u001b", "\u009b", "\u202e"]) expect(displayed).not.toContain(control);
+    expect(displayed).toContain("raw\\u001b[2J\\u009b\\u202e result");
+    expect(message).toEqual(before);
+    await fixture.lifecycle.get("session_shutdown")?.({}, fixture.ctx);
+  });
   it("binds every code-review git/gh discovery command to the command session cwd", async () => {
     const root = mkdtempSync(join(tmpdir(), "workflows-review-cwd-"));
     const a = join(root, "a");
@@ -524,7 +542,7 @@ return { local: [cwd, process.cwd()], nested: await workflow(${JSON.stringify(ch
     await fixture.lifecycle.get("session_shutdown")?.({}, fixture.ctx);
   });
 
-  it("deduplicates the workflow marker at the final context boundary", async () => {
+  it("preserves literal workflow markers at the final context boundary", async () => {
     const fixture = createPi(false);
     piWorkflows(fixture.pi as never);
     await fixture.lifecycle.get("session_start")?.({}, fixture.ctx);
@@ -542,12 +560,11 @@ return { local: [cwd, process.cwd()], nested: await workflow(${JSON.stringify(ch
       fixture.ctx,
     )) as { messages?: Array<{ content?: unknown }> } | undefined;
 
-    expect(result?.messages?.[0]?.content).toBe(`keep this\n\n${WORKFLOW_ARMED_DIRECTIVE}\nOther plugin guidance\n\n`);
-    expect(result?.messages?.[1]?.content).toEqual([]);
+    expect(result).toBeUndefined(); // No transform: native input/context is opaque.
     await fixture.lifecycle.get("session_shutdown")?.({}, fixture.ctx);
   });
 
-  it("deduplicates only its marker across text parts without joining or dropping images", async () => {
+  it("preserves every text part and image, including repeated exact directives", async () => {
     const fixture = createPi(false);
     piWorkflows(fixture.pi as never);
     await fixture.lifecycle.get("session_start")?.({}, fixture.ctx);
@@ -566,16 +583,10 @@ return { local: [cwd, process.cwd()], nested: await workflow(${JSON.stringify(ch
     )) as {
       messages: Array<{ content: unknown }>;
     };
-    expect(result.messages[0]).toBe(older);
-    expect(result.messages[1]?.content).toEqual([
-      parts[0],
-      image,
-      { type: "text", text: `second  ${unrelated} ` },
-      { type: "text", text: "" },
-    ]);
-    expect((result.messages[1]?.content as unknown[])?.[1]).toBe(image);
+    expect(result).toBeUndefined();
+    expect(parts[1]).toBe(image);
     expect(parts[2]?.text).toContain(WORKFLOW_ARMED_DIRECTIVE);
-    expect(await fixture.lifecycle.get("context")?.({ messages: result.messages }, fixture.ctx)).toBeUndefined();
+    expect(older.content).toBe(parts);
     await fixture.lifecycle.get("session_shutdown")?.({}, fixture.ctx);
   });
 

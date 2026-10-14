@@ -115,7 +115,7 @@ for (const reason of ["error", "length"] as const) {
       const state = {
         kind: "missing" as const,
         path: "/tmp/unused-codex-settings.json",
-        settings: { ...DEFAULT_CODEX_COMPACT_SETTINGS, enabled: true },
+        settings: { ...DEFAULT_CODEX_COMPACT_SETTINGS, enabled: true, allowCanonicalHistory: true },
       };
       createCodexCompactExtension({
         settingsRuntime: {
