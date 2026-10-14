@@ -26,7 +26,12 @@ describe.skipIf(!["1.0.4", "1.1.0"].includes(VERSION) || process.platform === "w
       for (const dispose of cleanup.splice(0).reverse()) await dispose();
     });
 
-    async function fixture(inputGate?: (pi: ExtensionAPI) => void, laterGate?: (pi: ExtensionAPI) => void) {
+    // null leaves the setting missing; omitted arguments keep existing shell tests explicitly opted in.
+    async function fixture(
+      inputGate?: (pi: ExtensionAPI) => void,
+      laterGate?: (pi: ExtensionAPI) => void,
+      allowShellTools: boolean | null = true,
+    ) {
       const cwd = mkdtempSync(join(tmpdir(), "background-host-"));
       const agentDir = join(cwd, "agent");
       mkdirSync(agentDir);
@@ -77,7 +82,13 @@ describe.skipIf(!["1.0.4", "1.1.0"].includes(VERSION) || process.platform === "w
       });
       await loader.reload();
       expect(loader.getExtensions().errors).toEqual([]);
-      const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } });
+      // A structural variable (not a literal) carries the extension-owned key through Pi's Settings type.
+      const settings = {
+        compaction: { enabled: false },
+        retry: { enabled: false },
+        ...(allowShellTools === null ? {} : { piBackground: { allowShellTools } }),
+      };
+      const settingsManager = SettingsManager.inMemory(settings);
       const { session } = await createAgentSession({
         cwd,
         agentDir,
@@ -85,7 +96,7 @@ describe.skipIf(!["1.0.4", "1.1.0"].includes(VERSION) || process.platform === "w
         modelRuntime: runtime,
         resourceLoader: loader,
         sessionManager: SessionManager.inMemory(cwd),
-        tools: ["bash_background", "background_list"],
+        tools: ["bash_background", "monitor", "background_list"],
         settingsManager,
       });
       cleanup.push(async () => {
@@ -103,6 +114,66 @@ describe.skipIf(!["1.0.4", "1.1.0"].includes(VERSION) || process.platform === "w
         },
       );
       return { session, host, faux, errors, prompts, inputs };
+    }
+
+    const registered = (session: Awaited<ReturnType<typeof fixture>>["session"]) => ({
+      all: session.getAllTools().map((tool) => tool.name),
+      runner: session.extensionRunner.getAllRegisteredTools().map((tool) => tool.definition.name),
+      active: session.getActiveToolNames(),
+    });
+
+    it("registers bash_background and runs a bounded command only after explicit opt-in", async () => {
+      const { session, faux, errors } = await fixture(undefined, undefined, true);
+      const tools = registered(session);
+      expect(tools.all).toContain("bash_background");
+      expect(tools.runner).toContain("bash_background");
+      expect(tools.active).toEqual(expect.arrayContaining(["bash_background", "monitor", "background_list"]));
+      faux.setResponses([
+        fauxAssistantMessage(fauxToolCall("bash_background", { command: "printf opted-in", notify: "context" }), {
+          stopReason: "toolUse",
+        }),
+        fauxAssistantMessage("Started."),
+      ]);
+      await session.prompt("Start opted-in job.");
+      const result = session.messages.find(
+        (message) => message.role === "toolResult" && message.toolName === "bash_background",
+      );
+      expect(result).toMatchObject({ isError: false });
+      expect(errors).toEqual([]);
+    });
+
+    for (const [label, value] of [
+      ["missing", null],
+      ["false", false],
+    ] as const) {
+      it(`does not register bash_background and rejects monitor commands when the gate is ${label}`, async () => {
+        const { session, faux, errors } = await fixture(undefined, undefined, value);
+        const tools = registered(session);
+        expect(tools.all).not.toContain("bash_background");
+        expect(tools.runner).not.toContain("bash_background");
+        expect(tools.active).not.toContain("bash_background");
+        expect(tools.active).toEqual(expect.arrayContaining(["monitor", "background_list"]));
+        faux.setResponses([
+          fauxAssistantMessage(fauxToolCall("monitor", { command: "printf should-not-run", patterns: ["x"] }), {
+            stopReason: "toolUse",
+          }),
+          fauxAssistantMessage("Refused."),
+          fauxAssistantMessage(fauxToolCall("background_list", {}), { stopReason: "toolUse" }),
+          fauxAssistantMessage("Listed."),
+        ]);
+        await session.prompt("Try a monitor command.");
+        const refused = session.messages.find(
+          (message) => message.role === "toolResult" && message.toolName === "monitor",
+        );
+        expect(refused).toMatchObject({ role: "toolResult", isError: true });
+        expect(JSON.stringify(refused)).toContain("piBackground.allowShellTools");
+        await session.prompt("Inspect jobs.");
+        const list = [...session.messages]
+          .reverse()
+          .find((message) => message.role === "toolResult" && message.toolName === "background_list");
+        expect(list).toMatchObject({ isError: false, details: { jobs: [], pendingNotifications: 0 } });
+        expect(errors).toEqual([]);
+      });
     }
 
     it("wakes once at idle exit, delivers the matching custom message and has a valid structured tool result", async () => {

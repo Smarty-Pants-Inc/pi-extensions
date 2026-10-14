@@ -29,12 +29,44 @@ deliberately outside this first version. Bun-based and standalone Pi hosts requi
 a `node` executable on `PATH` for the owned supervisor; missing or stalled startup
 fails rather than silently starting an unmanaged command.
 
+## Shell tool opt-in
+
+Shell tools are **disabled by default** in this fork. `bash_background` is not
+registered, and `monitor({ command: ... })` returns a clear refusal without
+starting a process. `monitor({ id: ... })` can still watch an existing owned job;
+inspection and job-control tools remain available. This package does not add a
+separate file-watching mode.
+
+To opt in, add the following to your Pi settings and run `/reload`:
+
+```json
+{
+  "piBackground": {
+    "allowShellTools": true
+  }
+}
+```
+
+Only the boolean `true` enables shell tools. A missing setting, `false`, an
+invalid value, or an unreadable settings snapshot leaves them disabled. The
+extension uses Pi's public effective settings API; user and trusted project
+settings follow Pi's normal merge rules. Registration happens at session startup,
+when that API is bound. Each shell launch also checks the setting, so disabling
+it prevents new launches even if a tool was previously registered.
+
+**Keep `piBackground.allowShellTools` false until the host's command-approval
+policy covers both `bash_background` and command-mode `monitor`.** Opt-in does
+not install an approval policy or make these tools inherit builtin `bash` guards.
+
+**ponytail:** this is a fork-local, default-deny gate: the smallest safe change
+while command-policy integration is incomplete, not a new shell sandbox.
+
 ## Tools
 
 | Tool | Purpose |
 | --- | --- |
-| `bash_background` | Start a finite command; return an ID without waiting for completion |
-| `monitor` | Start a long-lived command or replace the watch rules of an existing job |
+| `bash_background` | With explicit shell opt-in, start a finite command and return its ID |
+| `monitor` | Watch an existing job; starting a command requires explicit shell opt-in |
 | `background_list` | Inspect running and retained completed jobs, optionally by ID |
 | `background_logs` | Read a bounded tail of stdout/stderr, optionally select a stream |
 | `background_stop` | Stop an owned process group, wait for exit, retain its logs |
@@ -48,6 +80,8 @@ remains. If a command's result is needed immediately, use foreground `bash` rath
 than starting a job and repeatedly inspecting its status.
 
 ### Finite work
+
+The following shell examples require `piBackground.allowShellTools: true`.
 
 ```js
 bash_background({
@@ -205,7 +239,9 @@ it for remote commands or to bypass a rejected foreground command.
 
 Tools publish read-only/destructive/open-world annotations for permission
 extensions. **Annotations are hints, not a sandbox.** An approval policy that
-handles only `bash` must explicitly cover `bash_background` and `monitor` too.
+handles only `bash` must explicitly cover `bash_background` and command-mode
+`monitor` too. Until that coverage exists, keep `piBackground.allowShellTools`
+false; the fork-local gate prevents shell launches by default.
 Plan-mode users must not opt these mutating tools into a read-only loadout.
 There is no automatic change to any other extension's tool selection or settings.
 

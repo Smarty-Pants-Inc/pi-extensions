@@ -90,6 +90,31 @@ export const TOOL_NAMES = [
   "background_clear",
 ] as const;
 
+const SHELL_GATE_SETTING = "piBackground.allowShellTools";
+
+// ponytail: smallest fork-local deny gate, not a bash guard or sandbox. It only keeps
+// shell-starting tools off unless effective trusted Pi settings opt in with literal
+// `true`; host permission policy must still cover these tools separately from bash.
+/** Reads the live public effective settings; any read error or non-`true` value denies. */
+function shellToolsAllowed(pi: ExtensionAPI): boolean {
+  try {
+    const settings: unknown = pi.getSettings();
+    if (typeof settings !== "object" || settings === null || !("piBackground" in settings)) return false;
+    const section: unknown = settings.piBackground;
+    if (typeof section !== "object" || section === null || !("allowShellTools" in section)) return false;
+    return section.allowShellTools === true;
+  } catch {
+    return false;
+  }
+}
+
+function requireShellTools(pi: ExtensionAPI, tool: string): void {
+  if (!shellToolsAllowed(pi))
+    throw new Error(
+      `${tool} cannot start commands: shell tools are disabled by default. Set ${SHELL_GATE_SETTING} to true in trusted Pi settings to opt in; host permission policy must also allow these tools separately from bash.`,
+    );
+}
+
 export function registerTools(pi: ExtensionAPI, runtime: ToolRuntime): () => void {
   const schemas = new Map<string, unknown>();
   const register: ExtensionAPI["registerTool"] = (tool) => {
@@ -104,45 +129,47 @@ export function registerTools(pi: ExtensionAPI, runtime: ToolRuntime): () => voi
   };
   const mutate = { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true };
   const readOnly = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
-  register(
-    defineTool({
-      name: "bash_background",
-      label: "Background shell",
-      namespace,
-      annotations: mutate,
-      description:
-        "Start a finite local shell command and return its job ID immediately. Default timeout 30 minutes; exit notifies once. Use monitor for servers/watchers. Session shutdown/reload kills jobs; output is bounded in memory.",
-      promptGuidelines: [
-        "Use background execution only when requested or when useful independent work remains; otherwise use foreground bash.",
-        "Background jobs execute with full local process permissions. Do not use this tool to bypass a blocked bash call or remote workspace policy.",
-        "No sleep-and-poll: completion arrives automatically. Inspect progress with background_logs or background_list.",
-      ],
-      parameters: Type.Object({
-        command: Type.String({ minLength: 1, maxLength: 32768 }),
-        cwd: Type.Optional(Type.String({ minLength: 1 })),
-        description: Type.Optional(Type.String({ maxLength: 200 })),
-        timeout_ms: Type.Optional(timeout),
-        notify: Type.Optional(attention),
-      }),
-      outputSchema,
-      async execute(_call, params, signal, _update, ctx) {
-        const job = await runtime.manager(ctx).start(
-          {
-            command: params.command,
-            cwd: resolve(ctx.cwd, params.cwd ?? "."),
-            description: params.description,
-            timeoutMs: params.timeout_ms ?? 30 * 60 * 1000,
-            attention: params.notify ?? "turn",
-          },
-          signal,
-        );
-        return result(
-          { jobs: [job], ...runtime.pending() },
-          "Background job started; do useful independent work while it runs.",
-        );
-      },
+  // Built now, registered only after binding when the gate is literally true.
+  const shellTool = defineTool({
+    name: "bash_background",
+    label: "Background shell",
+    namespace,
+    annotations: mutate,
+    description:
+      "Start a finite local shell command and return its job ID immediately. Default timeout 30 minutes; exit notifies once. Use monitor for servers/watchers. Session shutdown/reload kills jobs; output is bounded in memory.",
+    promptGuidelines: [
+      "Use background execution only when requested or when useful independent work remains; otherwise use foreground bash.",
+      "Background jobs execute with full local process permissions. Do not use this tool to bypass a blocked bash call or remote workspace policy.",
+      "No sleep-and-poll: completion arrives automatically. Inspect progress with background_logs or background_list.",
+    ],
+    parameters: Type.Object({
+      command: Type.String({ minLength: 1, maxLength: 32768 }),
+      cwd: Type.Optional(Type.String({ minLength: 1 })),
+      description: Type.Optional(Type.String({ maxLength: 200 })),
+      timeout_ms: Type.Optional(timeout),
+      notify: Type.Optional(attention),
     }),
-  );
+    outputSchema,
+    async execute(_call, params, signal, _update, ctx) {
+      // Re-read live: an already-registered tool must not run after opt-in is revoked.
+      requireShellTools(pi, "bash_background");
+      const job = await runtime.manager(ctx).start(
+        {
+          command: params.command,
+          cwd: resolve(ctx.cwd, params.cwd ?? "."),
+          description: params.description,
+          timeoutMs: params.timeout_ms ?? 30 * 60 * 1000,
+          attention: params.notify ?? "turn",
+        },
+        signal,
+      );
+      return result(
+        { jobs: [job], ...runtime.pending() },
+        "Background job started; do useful independent work while it runs.",
+      );
+    },
+  });
+  let shellRegistered = false;
   register(
     defineTool({
       name: "monitor",
@@ -150,7 +177,7 @@ export function registerTools(pi: ExtensionAPI, runtime: ToolRuntime): () => voi
       namespace,
       annotations: mutate,
       description:
-        "Start a long-lived local command OR attach a literal line matcher to an existing job. Supply exactly one of command/id and patterns. Each pattern notifies once by default; repeat uses a cooldown. Not regex; no model calls during monitoring. Attaching replaces prior rules; only future output matches.",
+        "Start a long-lived local command (requires piBackground.allowShellTools: true) OR attach a literal line matcher to an existing job. Supply exactly one of command/id and patterns. Each pattern notifies once by default; repeat uses a cooldown. Not regex; no model calls during monitoring. Attaching replaces prior rules; only future output matches.",
       parameters: Type.Object({
         command: Type.Optional(Type.String({ minLength: 1, maxLength: 32768 })),
         id: Type.Optional(id),
@@ -183,6 +210,7 @@ export function registerTools(pi: ExtensionAPI, runtime: ToolRuntime): () => voi
           cooldownMs: params.cooldown_ms ?? LIMITS.cooldownMs,
           attention: params.notify ?? "turn",
         };
+        if (params.command !== undefined) requireShellTools(pi, "monitor");
         const manager = runtime.manager(ctx);
         let job: JobSnapshot;
         if (params.id !== undefined) {
@@ -293,8 +321,13 @@ export function registerTools(pi: ExtensionAPI, runtime: ToolRuntime): () => voi
       },
     }),
   );
-  // Discovery is an action API: only call after runtime binding, not in the factory.
+  // Discovery and settings are action APIs: only call after runtime binding, not in the factory.
+  // A late public registerTool refreshes the host tool set, so opt-in takes effect at session_start.
   return () => {
+    if (!shellRegistered && shellToolsAllowed(pi)) {
+      shellRegistered = true;
+      register(shellTool);
+    }
     const collisions = pi
       .getAllTools()
       .filter((tool) => schemas.has(tool.name) && tool.parameters !== schemas.get(tool.name));

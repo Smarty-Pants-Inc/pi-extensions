@@ -67,7 +67,15 @@ interface Tool {
   }>;
 }
 
+const OPT_IN = { piBackground: { allowShellTools: true } };
+
+// Shell-behavior tests opt in explicitly; gate tests override settings per case.
 function harness(mode = "tui") {
+  let settings: unknown = OPT_IN;
+  const getSettings = vi.fn(() => {
+    if (settings instanceof Error) throw settings;
+    return settings;
+  });
   const handlers = new Map<string, Handler>();
   const tools = new Map<string, Tool>();
   const commands = new Map<string, { handler(args: string, ctx: ExtensionContext): Promise<void> }>();
@@ -110,6 +118,7 @@ function harness(mode = "tui") {
     waitForIdle: () => waitForIdle(),
   } as unknown as ExtensionContext;
   const pi = {
+    getSettings,
     getAllTools: () => [],
     getCommands: () => [],
     registerTool: (tool: Tool) => tools.set(tool.name, tool),
@@ -133,6 +142,10 @@ function harness(mode = "tui") {
   extension(pi);
   return {
     pi,
+    getSettings,
+    setSettings: (value: unknown) => {
+      settings = value;
+    },
     ctx,
     tools,
     commands,
@@ -175,20 +188,24 @@ afterEach(() => {
 });
 
 describe("extension lifecycle", () => {
-  it("registers tools without starting resources in the factory", () => {
+  it("registers tools without starting resources or reading settings in the factory", async () => {
     const h = harness();
     expect(fake.managers).toHaveLength(0);
+    expect(h.getSettings).not.toHaveBeenCalled();
     expect([...h.tools.keys()]).toEqual([
-      "bash_background",
       "monitor",
       "background_list",
       "background_logs",
       "background_stop",
       "background_clear",
     ]);
+    await h.emit("session_start");
+    expect(h.getSettings).toHaveBeenCalled();
+    expect([...h.tools.keys()]).toContain("bash_background");
     expect(h.tools.get("bash_background")?.annotations.readOnlyHint).toBe(false);
     expect(h.tools.get("background_logs")?.annotations.readOnlyHint).toBe(true);
     expect([...h.tools.values()].every((tool) => tool.outputSchema)).toBe(true);
+    await h.emit("session_shutdown");
   });
 
   it("coalesces notifications until fully settled and queues are drained", async () => {
@@ -531,6 +548,83 @@ describe("extension lifecycle", () => {
       tool?.execute("call", { id: "job", cwd: ".", patterns: ["ready"] }, undefined, undefined, h.ctx),
     ).rejects.toThrow("apply only");
     expect(fake.managers[0].manager.start).not.toHaveBeenCalled();
+    await h.emit("session_shutdown");
+  });
+
+  it("denies shell tools by default and for malformed or unreadable settings", async () => {
+    for (const settings of [
+      {},
+      undefined,
+      null,
+      "true",
+      { piBackground: true },
+      { piBackground: { allowShellTools: "true" } },
+      { piBackground: { allowShellTools: 1 } },
+      { piBackground: { allowShellTools: false } },
+      new Error("settings unavailable"),
+    ]) {
+      fake.managers.length = 0;
+      const h = harness();
+      h.setSettings(settings);
+      await h.emit("session_start");
+      expect(h.tools.has("bash_background")).toBe(false);
+      expect([...h.tools.keys()]).toEqual([
+        "monitor",
+        "background_list",
+        "background_logs",
+        "background_stop",
+        "background_clear",
+      ]);
+      await expect(
+        h.tools
+          .get("monitor")
+          ?.execute("call", { command: "sleep 1", patterns: ["ready"] }, undefined, undefined, h.ctx),
+      ).rejects.toThrow(
+        /piBackground\.allowShellTools.*disabled by default|disabled by default.*piBackground\.allowShellTools/,
+      );
+      await expect(
+        h.tools
+          .get("monitor")
+          ?.execute("call", { command: "sleep 1", patterns: ["ready"] }, undefined, undefined, h.ctx),
+      ).rejects.toThrow("host permission policy");
+      expect(fake.managers[0].manager.start).not.toHaveBeenCalled();
+      await expect(
+        h.tools.get("background_list")?.execute("call", {}, undefined, undefined, h.ctx),
+      ).resolves.toBeDefined();
+      await h.emit("session_shutdown");
+    }
+  });
+
+  it("registers both shell paths at startup only after explicit opt-in", async () => {
+    const h = harness();
+    await h.emit("session_start");
+    await h.emit("session_start");
+    expect([...h.tools.keys()].filter((name) => name === "bash_background")).toHaveLength(1);
+    await h.tools.get("bash_background")?.execute("call", { command: "true" }, undefined, undefined, h.ctx);
+    await h.tools
+      .get("monitor")
+      ?.execute("call", { command: "sleep 1", patterns: ["ready"] }, undefined, undefined, h.ctx);
+    expect(fake.managers.at(-1)?.manager.start).toHaveBeenCalledTimes(2);
+    await h.emit("session_shutdown");
+  });
+
+  it("monitors existing jobs while gated and denies shell starts after revocation", async () => {
+    const h = harness();
+    await h.emit("session_start");
+    await h.tools.get("bash_background")?.execute("call", { command: "sleep 1" }, undefined, undefined, h.ctx);
+    const manager = fake.managers[0].manager;
+    h.setSettings({ piBackground: { allowShellTools: false } });
+    const watched = await h.tools
+      .get("monitor")
+      ?.execute("call", { id: "job-0", patterns: ["ready"] }, undefined, undefined, h.ctx);
+    expect(watched?.details.jobs[0]).toMatchObject({ id: "job-0", watch: { patterns: ["ready"] } });
+    await expect(
+      h.tools.get("bash_background")?.execute("call", { command: "true" }, undefined, undefined, h.ctx),
+    ).rejects.toThrow("piBackground.allowShellTools");
+    await expect(
+      h.tools.get("monitor")?.execute("call", { command: "sleep 1", patterns: ["ready"] }, undefined, undefined, h.ctx),
+    ).rejects.toThrow("disabled by default");
+    expect(manager.start).toHaveBeenCalledTimes(1);
     await h.emit("session_shutdown");
   });
 
