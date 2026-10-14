@@ -9,7 +9,7 @@ import {
   PROTOCOL_VERSION,
   routingPolicyFingerprint,
 } from "@signalridge/pi-subagents-protocol";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WORKFLOW_ARMED_DIRECTIVE } from "../src/arming.js";
 import { WorkflowEngine } from "../src/engine.js";
 import piWorkflows from "../src/index.js";
@@ -156,8 +156,38 @@ type WorkflowTool = {
   }>;
 };
 
+// The workflow tool refuses inline `script` input (node:vm is not a sandbox)
+// and runs only saved workflow files from the Pi agent directory. These cases
+// exercise the runtime, so each script is first written as such a trusted file
+// under a per-test agent directory and invoked by `name`.
+let testAgentDir: string | undefined;
+let previousAgentDir: string | undefined;
+let savedCounter = 0;
+beforeEach(() => {
+  previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  testAgentDir = mkdtempSync(join(tmpdir(), "workflows-agent-dir-"));
+  process.env.PI_CODING_AGENT_DIR = testAgentDir;
+});
+afterEach(() => {
+  if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+  else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+  if (testAgentDir) rmSync(testAgentDir, { recursive: true, force: true });
+  testAgentDir = undefined;
+});
+
+function asTrustedFile(params: unknown): unknown {
+  const { script, ...rest } = params as { script?: string } & Record<string, unknown>;
+  if (script === undefined || !testAgentDir) return params;
+  const name = `trusted-${++savedCounter}`;
+  const dir = join(testAgentDir, "workflows", "saved");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, `${name}.js`), script);
+  return { ...rest, name };
+}
+
 function workflowTool(fixture: ReturnType<typeof createPi>): WorkflowTool {
-  return fixture.toolDefinitions.find((tool) => (tool as { name: string }).name === "workflow") as WorkflowTool;
+  const tool = fixture.toolDefinitions.find((tool) => (tool as { name: string }).name === "workflow") as WorkflowTool;
+  return { execute: (id, params, ...rest) => tool.execute(id, asTrustedFile(params), ...rest) };
 }
 
 describe("pi-workflows loader context isolation", () => {
@@ -374,21 +404,16 @@ return { local: [cwd, process.cwd()], nested: await workflow(${JSON.stringify(ch
           const control = fixture.toolDefinitions.find(
             (tool) => (tool as { name: string }).name === "workflow_control",
           ) as WorkflowTool;
-          await control.execute(
+          // workflow_control resume would replay the journal-stored script, so
+          // the model-callable control tool refuses it.
+          const refused = await control.execute(
             "resume",
             { action: "resume", run_id: runId },
             new AbortController().signal,
             undefined,
             ctx,
           );
-          await vi.waitFor(() =>
-            expect(
-              fixture.entries.some((entry) => {
-                const fact = entry as { kind?: string; status?: string };
-                return fact.kind === "workflow_transition" && fact.status === "completed";
-              }),
-            ).toBe(true),
-          );
+          expect(refused.content[0]?.text).toContain("workflow_control resume is disabled");
         }
         await fixture.lifecycle.get("session_shutdown")?.({}, ctx);
       });
@@ -605,7 +630,7 @@ return { local: [cwd, process.cwd()], nested: await workflow(${JSON.stringify(ch
       execute: (id: string, params: unknown, signal?: unknown, onUpdate?: unknown, ctx?: unknown) => Promise<unknown>;
     };
     const script = "export const meta = { name: 'probe', description: 'no agents' }\nreturn 1";
-    await workflow.execute("call-1", { script, background: false }, undefined, undefined, fixture.ctx);
+    await workflow.execute("call-1", asTrustedFile({ script, background: false }), undefined, undefined, fixture.ctx);
     expect(fixture.routing.pings).toBe(activationPings + 1);
 
     // A tier the activation snapshot did not contain must be usable now.
@@ -614,7 +639,7 @@ return { local: [cwd, process.cwd()], nested: await workflow(${JSON.stringify(ch
       profiles: { ...ROUTING_POLICY.profiles, added: { model: "inherit", thinking: "high" } },
     };
     fixture.routing.snapshot = { policy: extended, fingerprint: routingPolicyFingerprint(extended) };
-    await workflow.execute("call-2", { script, background: false }, undefined, undefined, fixture.ctx);
+    await workflow.execute("call-2", asTrustedFile({ script, background: false }), undefined, undefined, fixture.ctx);
     expect(fixture.routing.pings).toBe(activationPings + 2);
 
     await fixture.lifecycle.get("session_shutdown")?.({}, fixture.ctx);

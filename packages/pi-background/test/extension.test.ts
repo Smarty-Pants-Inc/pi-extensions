@@ -67,11 +67,16 @@ interface Tool {
   }>;
 }
 
-const OPT_IN = { piBackground: { allowShellTools: true } };
+const LEGACY_OPT_IN = { piBackground: { allowShellTools: true } };
+const TOOLS = ["monitor", "background_list", "background_logs", "background_stop", "background_clear"];
 
-// Shell-behavior tests opt in explicitly; gate tests override settings per case.
+/** Seeds an existing job through the in-memory fake manager; no process is launched. */
+function seed(index = 0, description = "job") {
+  return fake.managers[index].manager.start({ command: "fake", cwd: ".", description });
+}
+
 function harness(mode = "tui") {
-  let settings: unknown = OPT_IN;
+  let settings: unknown = {};
   const getSettings = vi.fn(() => {
     if (settings instanceof Error) throw settings;
     return settings;
@@ -192,17 +197,10 @@ describe("extension lifecycle", () => {
     const h = harness();
     expect(fake.managers).toHaveLength(0);
     expect(h.getSettings).not.toHaveBeenCalled();
-    expect([...h.tools.keys()]).toEqual([
-      "monitor",
-      "background_list",
-      "background_logs",
-      "background_stop",
-      "background_clear",
-    ]);
+    expect([...h.tools.keys()]).toEqual(TOOLS);
     await h.emit("session_start");
     expect(h.getSettings).toHaveBeenCalled();
-    expect([...h.tools.keys()]).toContain("bash_background");
-    expect(h.tools.get("bash_background")?.annotations.readOnlyHint).toBe(false);
+    expect([...h.tools.keys()]).toEqual(TOOLS);
     expect(h.tools.get("background_logs")?.annotations.readOnlyHint).toBe(true);
     expect([...h.tools.values()].every((tool) => tool.outputSchema)).toBe(true);
     await h.emit("session_shutdown");
@@ -415,12 +413,13 @@ describe("extension lifecycle", () => {
       attention: "off",
       droppedBytes: 0,
     };
-    vi.mocked(old.manager.start).mockImplementationOnce(async () => {
+    await seed();
+    vi.mocked(old.manager.stop).mockImplementationOnce(async () => {
       await gate;
       return job;
     });
     h.setWaitForIdle(() => gate);
-    const tool = h.tools.get("bash_background")?.execute("call", { command: "true" }, undefined, undefined, h.ctx);
+    const tool = h.tools.get("background_stop")?.execute("call", { id: "job-0" }, undefined, undefined, h.ctx);
     const retry = h.commands.get("background")?.handler("retry", h.ctx);
     h.setBranch(["other"]);
     h.status.mockClear();
@@ -489,7 +488,7 @@ describe("extension lifecycle", () => {
     vi.useFakeTimers();
     const h = harness();
     await h.emit("session_start");
-    await h.tools.get("bash_background")?.execute("call", { command: "true" }, undefined, undefined, h.ctx);
+    await seed();
     await h.emit("session_before_fork");
     fake.managers[0].emit(event());
     vi.advanceTimersByTime(2000);
@@ -523,7 +522,10 @@ describe("extension lifecycle", () => {
     await a.emit("session_start");
     await b.emit("session_start");
     expect(fake.managers[0].manager).not.toBe(fake.managers[1].manager);
-    await a.tools.get("bash_background")?.execute("call", { command: "sleep 1" }, undefined, undefined, a.ctx);
+    await seed(0);
+    await expect(
+      b.tools.get("background_logs")?.execute("call", { id: "job-0" }, undefined, undefined, b.ctx),
+    ).rejects.toThrow("unknown job");
     expect(fake.managers[0].manager.list()).toHaveLength(1);
     expect(fake.managers[1].manager.list()).toHaveLength(0);
     a.setSession("another");
@@ -538,21 +540,26 @@ describe("extension lifecycle", () => {
     const h = harness();
     await h.emit("session_start");
     const tool = h.tools.get("monitor");
+    const manager = fake.managers[0].manager;
     await expect(tool?.execute("call", { patterns: ["ready"] }, undefined, undefined, h.ctx)).rejects.toThrow(
-      "exactly one",
+      "requires the id",
     );
-    await expect(
-      tool?.execute("call", { id: "job", command: "sleep 1", patterns: ["ready"] }, undefined, undefined, h.ctx),
-    ).rejects.toThrow("exactly one");
-    await expect(
-      tool?.execute("call", { id: "job", cwd: ".", patterns: ["ready"] }, undefined, undefined, h.ctx),
-    ).rejects.toThrow("apply only");
-    expect(fake.managers[0].manager.start).not.toHaveBeenCalled();
+    for (const forged of [
+      { command: "sleep 1", patterns: ["ready"] },
+      { id: "job", command: "sleep 1", patterns: ["ready"] },
+      { id: "job", cwd: ".", patterns: ["ready"] },
+      { id: "job", timeout_ms: 1000, patterns: ["ready"] },
+    ]) {
+      await expect(tool?.execute("call", forged, undefined, undefined, h.ctx)).rejects.toThrow("cannot start commands");
+    }
+    expect(manager.start).not.toHaveBeenCalled();
+    expect(manager.watch).not.toHaveBeenCalled();
     await h.emit("session_shutdown");
   });
 
-  it("denies shell tools by default and for malformed or unreadable settings", async () => {
+  it("never registers or runs shell tools, including with the legacy opt-in", async () => {
     for (const settings of [
+      LEGACY_OPT_IN,
       {},
       undefined,
       null,
@@ -567,27 +574,15 @@ describe("extension lifecycle", () => {
       const h = harness();
       h.setSettings(settings);
       await h.emit("session_start");
+      await h.emit("session_start");
       expect(h.tools.has("bash_background")).toBe(false);
-      expect([...h.tools.keys()]).toEqual([
-        "monitor",
-        "background_list",
-        "background_logs",
-        "background_stop",
-        "background_clear",
-      ]);
+      expect([...h.tools.keys()]).toEqual(TOOLS);
       await expect(
         h.tools
           .get("monitor")
           ?.execute("call", { command: "sleep 1", patterns: ["ready"] }, undefined, undefined, h.ctx),
-      ).rejects.toThrow(
-        /piBackground\.allowShellTools.*disabled by default|disabled by default.*piBackground\.allowShellTools/,
-      );
-      await expect(
-        h.tools
-          .get("monitor")
-          ?.execute("call", { command: "sleep 1", patterns: ["ready"] }, undefined, undefined, h.ctx),
-      ).rejects.toThrow("host permission policy");
-      expect(fake.managers[0].manager.start).not.toHaveBeenCalled();
+      ).rejects.toThrow("host command authorization");
+      expect(fake.managers.every(({ manager }) => vi.mocked(manager.start).mock.calls.length === 0)).toBe(true);
       await expect(
         h.tools.get("background_list")?.execute("call", {}, undefined, undefined, h.ctx),
       ).resolves.toBeDefined();
@@ -595,36 +590,37 @@ describe("extension lifecycle", () => {
     }
   });
 
-  it("registers both shell paths at startup only after explicit opt-in", async () => {
-    const h = harness();
-    await h.emit("session_start");
-    await h.emit("session_start");
-    expect([...h.tools.keys()].filter((name) => name === "bash_background")).toHaveLength(1);
-    await h.tools.get("bash_background")?.execute("call", { command: "true" }, undefined, undefined, h.ctx);
-    await h.tools
-      .get("monitor")
-      ?.execute("call", { command: "sleep 1", patterns: ["ready"] }, undefined, undefined, h.ctx);
-    expect(fake.managers.at(-1)?.manager.start).toHaveBeenCalledTimes(2);
-    await h.emit("session_shutdown");
+  it("warns by name when the retired setting is present, for any value", async () => {
+    for (const [settings, warned] of [
+      [LEGACY_OPT_IN, true],
+      [{ piBackground: { allowShellTools: false } }, true],
+      [{}, false],
+    ] as const) {
+      const h = harness();
+      h.setSettings(settings);
+      await h.emit("session_start");
+      const warnings = h.notify.mock.calls.filter(([, level]) => level === "warning").map(([text]) => text);
+      expect(warnings.some((text) => String(text).includes("piBackground.allowShellTools is retired"))).toBe(warned);
+      await h.emit("session_shutdown");
+    }
   });
 
-  it("monitors existing jobs while gated and denies shell starts after revocation", async () => {
+  it("monitors and reads logs of an existing job with the legacy opt-in, without starting commands", async () => {
     const h = harness();
+    h.setSettings(LEGACY_OPT_IN);
     await h.emit("session_start");
-    await h.tools.get("bash_background")?.execute("call", { command: "sleep 1" }, undefined, undefined, h.ctx);
+    await seed();
     const manager = fake.managers[0].manager;
-    h.setSettings({ piBackground: { allowShellTools: false } });
     const watched = await h.tools
       .get("monitor")
       ?.execute("call", { id: "job-0", patterns: ["ready"] }, undefined, undefined, h.ctx);
     expect(watched?.details.jobs[0]).toMatchObject({ id: "job-0", watch: { patterns: ["ready"] } });
-    await expect(
-      h.tools.get("bash_background")?.execute("call", { command: "true" }, undefined, undefined, h.ctx),
-    ).rejects.toThrow("piBackground.allowShellTools");
+    const logs = await h.tools.get("background_logs")?.execute("call", { id: "job-0" }, undefined, undefined, h.ctx);
+    expect(logs?.details).toMatchObject({ jobs: [expect.objectContaining({ id: "job-0" })], output: "hello" });
     await expect(
       h.tools.get("monitor")?.execute("call", { command: "sleep 1", patterns: ["ready"] }, undefined, undefined, h.ctx),
-    ).rejects.toThrow("disabled by default");
-    expect(manager.start).toHaveBeenCalledTimes(1);
+    ).rejects.toThrow("cannot start commands");
+    expect(manager.start).toHaveBeenCalledTimes(1); // Only the fixture seed.
     await h.emit("session_shutdown");
   });
 
@@ -632,7 +628,7 @@ describe("extension lifecycle", () => {
     vi.useFakeTimers();
     const h = harness();
     await h.emit("session_start");
-    await h.tools.get("bash_background")?.execute("call", { command: "sleep 1" }, undefined, undefined, h.ctx);
+    await seed();
     fake.managers[0].emit(event());
     await h.tools.get("background_stop")?.execute("call", { id: "job-0" }, undefined, undefined, h.ctx);
     vi.advanceTimersByTime(2000);

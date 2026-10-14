@@ -12,6 +12,13 @@ that asks one agent to do every step. Keep semantic work in agents and keep
 identity, ordering, bounds, failure handling, and aggregation deterministic in
 JavaScript.
 
+**Build restriction.** This fork's `workflow` tool refuses inline `script`
+input and `workflow_control` `resume` (node:vm is not a sandbox). Write the
+script as a file, ask the user to review it and place it in their trusted saved
+workflows directory (`<agentDir>/workflows/saved/<name>.js`, or via
+`/workflows save`), then call `workflow` with that `name`. Resume with `name`
+plus `resumeFromRunId`. The examples here are file contents, not tool payloads.
+
 ## Operating contract
 
 - Use a workflow only when the task benefits from multiple agents, explicit
@@ -89,7 +96,8 @@ JavaScript.
    `completenessCheck`) is not the effort that gate deserves.
 7. **Aggregate and report.** Return a bounded JSON result containing the answer,
    coverage, and important failures. If the workflow runs in the background,
-   the run ID is the handle for later control/resume.
+   the run ID is the handle for later control, and for a resume through
+   `workflow` with the saved `name` and `resumeFromRunId`.
 8. **Review the script.** Use [the review checklist](references/review.md), then
    test with deterministic fake agents when changing topology or recovery.
 

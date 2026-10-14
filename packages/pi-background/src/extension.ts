@@ -197,8 +197,10 @@ export default function backgroundExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("session_start", async (_event, ctx) => {
-    verifyToolOwnership();
+    const warning = verifyToolOwnership();
     await open(ctx);
+    if (warning && ctx.hasUI) ctx.ui.notify(warning, "warning");
+    else if (warning) console.warn(warning);
   });
   pi.on("session_tree", async (_event, ctx) => {
     await open(ctx);

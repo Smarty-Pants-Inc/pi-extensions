@@ -32,9 +32,20 @@ import {
   type WorkflowSettings,
 } from "./workflow-settings.js";
 
+/**
+ * Refusal for any tool call that carries `script`. The runtime executes workflow
+ * code with `node:vm`, which is not a security boundary, so code supplied in a
+ * tool call is never executed. Only saved workflow files under the user's Pi
+ * agent directory run through the model-callable tool; built-ins remain user commands.
+ */
+export const INLINE_WORKFLOW_DISABLED_MESSAGE =
+  "inline workflow scripts are disabled in this build: node:vm is not a sandbox";
+
 const WorkflowToolSchema = Type.Object(
   {
-    script: Type.Optional(Type.String({ maxLength: 200_000 })),
+    script: Type.Optional(
+      Type.String({ maxLength: 200_000, description: "Disabled: inline scripts are always refused. Use `name`." }),
+    ),
     name: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
     args: Type.Optional(Type.Any()),
     background: Type.Optional(Type.Boolean()),
@@ -85,7 +96,9 @@ const ControlSchema = Type.Object(
         Type.Literal("get", { description: "Get details for one run" }),
         Type.Literal("status", { description: "Alias for get — inspect one run" }),
         Type.Literal("pause", { description: "Pause a running workflow" }),
-        Type.Literal("resume", { description: "Resume a paused/interrupted workflow" }),
+        Type.Literal("resume", {
+          description: "Disabled: resume through the workflow tool with a saved `name` and resumeFromRunId",
+        }),
         Type.Literal("stop", { description: "Stop a running workflow" }),
         Type.Literal("rm", { description: "Remove a workflow run and its journal" }),
       ],
@@ -500,28 +513,22 @@ export default function piWorkflows(pi: ExtensionAPI): void {
   const resolveNestedWorkflow = (name: string): string | undefined =>
     loadSavedWorkflow(name, sessionCwd) ?? BUILTIN_WORKFLOWS[name]?.script;
 
-  const resolveScript = (
-    script: string | undefined,
-    name: string | undefined,
-    args: unknown,
-  ): { script: string; source: string; toolset?: string } => {
-    if (script !== undefined && name !== undefined) {
-      throw new Error("Provide either `script` or `name`, not both.");
+  /**
+   * Trust boundary for the model-callable `workflow` tool: only a saved file
+   * under the user's Pi agent directory (`workflows/saved/` or the project's
+   * `workflows/projects/<id>/saved/`) resolves. Built-ins stay reachable through
+   * their user-typed slash commands; journal-stored scripts are never replayed
+   * without a fresh saved-file resolution.
+   */
+  const resolveTrustedSavedScript = (name: string | undefined): { script: string; source: string } => {
+    if (name === undefined) {
+      throw new Error("Provide the `name` of a saved workflow file; the workflow tool runs nothing else.");
     }
-    if (script !== undefined) return { script, source: "inline" };
-    if (name !== undefined) {
-      const saved = loadSavedWorkflow(name, sessionCwd);
-      if (saved) return { script: saved, source: `saved:${name}` };
-      const builtin = BUILTIN_WORKFLOWS[name];
-      if (builtin) {
-        // Validate named invocations before starting a potentially expensive fleet.
-        // Slash commands provide the same shape through their descriptor primaryArg.
-        validateBuiltinArgs(name, args);
-        return { script: builtin.script, source: `builtin:${name}`, toolset: builtin.toolset };
-      }
-      throw new Error(`Unknown workflow name "${name}". It is neither a saved workflow nor a built-in.`);
-    }
-    throw new Error("Provide either `script` or `name`.");
+    const saved = loadSavedWorkflow(name, sessionCwd);
+    if (saved) return { script: saved, source: `saved:${name}` };
+    throw new Error(
+      `Unknown workflow name "${name}": the workflow tool runs only saved workflow files from the Pi agent directory. Built-in workflows run through their slash commands.`,
+    );
   };
 
   const registerSurface = (): void => {
@@ -560,15 +567,15 @@ export default function piWorkflows(pi: ExtensionAPI): void {
         name: "workflow",
         label: "Workflow",
         description:
-          "Run a JavaScript workflow script through the pi-subagents managed spawning protocol. The script declares `export const meta = { name, description, phases }` first and uses the runtime globals agent(), parallel(), pipeline(), orchestrate(), workflow(), verify(), judgePanel(), loopUntilDry(), completenessCheck(), retry(), gate(), checkpoint(), phase(), log(), args, cwd, process, and budget. Determinism is enforced: Date.now()/Math.random()/new Date() are unavailable.",
-        promptSnippet: "Run a JavaScript workflow script",
+          "Run a saved workflow file (from the Pi agent directory) by `name` through the pi-subagents managed spawning protocol. Inline `script` input is refused: node:vm is not a sandbox. A workflow script declares `export const meta = { name, description, phases }` first and uses the runtime globals agent(), parallel(), pipeline(), orchestrate(), workflow(), verify(), judgePanel(), loopUntilDry(), completenessCheck(), retry(), gate(), checkpoint(), phase(), log(), args, cwd, process, and budget. Determinism is enforced: Date.now()/Math.random()/new Date() are unavailable.",
+        promptSnippet: "Run a saved workflow file by name",
         promptGuidelines: [
-          "Provide either a full `script` (raw JavaScript with the meta contract first) or a `name` of a saved/built-in workflow.",
+          "Provide the `name` of a saved workflow file. Never pass `script`: inline workflow scripts are always refused. Built-in workflows run only through their slash commands.",
           "Use orchestrate([{ id, dependsOn, run }]) for named dependency graphs; use parallel(() => agent(...), ...) for a simple fan-out and pipeline(items, ...stages) for sequential per-item stages.",
           "Size the fan-out to the work: one agent per independent piece of evidence the task actually has. Ten to thirty agents is an ordinary review or audit, and a script that splits a broad task four ways is usually four agents each doing one agent's job. The gain is coverage, not speed — how many run at once is the host's pool, not the script's choice.",
-          "Pass script/name/args/background and nothing else unless the user named a specific limit. maxAgents, concurrency, agentRetries, tokenBudget and agentTimeoutMs already default to tuned values, and each one stops or fails the run when it is set too low.",
+          "Pass name/args/background and nothing else unless the user named a specific limit. maxAgents, concurrency, agentRetries, tokenBudget and agentTimeoutMs already default to tuned values, and each one stops or fails the run when it is set too low.",
           "Use background: true for long runs; retrieve results with workflow_control.",
-          "Use resumeFromRunId with an edited script to replay the unchanged prefix from cache and re-run the rest live.",
+          "Use resumeFromRunId together with the saved workflow `name` to replay the unchanged prefix from cache and re-run the rest live.",
           "Inside the script, never name a model, a thinking level, or a turn limit: `strength` is the only routing a call may express.",
         ],
         parameters: WorkflowToolSchema,
@@ -592,19 +599,17 @@ export default function piWorkflows(pi: ExtensionAPI): void {
           );
         },
         async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+          // ponytail: remove inline execution at the tool boundary, not a pretend VM sandbox.
+          // Refuse every call that carries `script` (alone, with `name`, or with
+          // `resumeFromRunId`) before any resolution, vm.Script, or helper spawn.
+          if (params.script !== undefined) {
+            return textResult(INLINE_WORKFLOW_DISABLED_MESSAGE, { status: "failed", error: "inline-script-disabled" });
+          }
           try {
             const workflowEngine = currentEngine();
-            const resolved =
-              params.resumeFromRunId && params.script === undefined && params.name === undefined
-                ? (() => {
-                    const prior = workflowEngine.getRun(params.resumeFromRunId);
-                    if (!prior) throw new Error(`Workflow run not found: ${params.resumeFromRunId}`);
-                    // Resume replays the stored script; only the shared shape
-                    // has to be satisfied here.
-                    return { script: prior.script, source: "resume", toolset: prior.toolset };
-                  })()
-                : resolveScript(params.script, params.name, params.args);
-            const { script, source, toolset } = resolved;
+            // Start and resume both require a fresh saved-file resolution; a
+            // resume without `name` would replay a journal-stored script.
+            const { script, source } = resolveTrustedSavedScript(params.name);
             const options: ScriptStartOptions = {
               args: params.args,
               background: params.background ?? true,
@@ -613,7 +618,6 @@ export default function piWorkflows(pi: ExtensionAPI): void {
               agentRetries: params.agentRetries,
               tokenBudget: params.tokenBudget,
               agentTimeoutMs: params.agentTimeoutMs,
-              toolset,
               excludeTools: [...DEFAULT_EXCLUDED_TOOLS],
               signal,
               mainModel: ctx?.model?.id,
@@ -633,12 +637,11 @@ export default function piWorkflows(pi: ExtensionAPI): void {
               strengths: workflowSettings.strengths,
             };
             if (params.resumeFromRunId) {
-              const replacement = params.script !== undefined || params.name !== undefined ? script : undefined;
               const resumed = await workflowEngine.resume(
                 params.resumeFromRunId,
                 ctx.sessionManager.getBranch(),
                 options,
-                replacement,
+                script,
               );
               if (!resumed) return textResult(`Workflow run not found: ${params.resumeFromRunId}`);
               return textResult(formatStart(resumed), resumed);
@@ -687,8 +690,15 @@ export default function piWorkflows(pi: ExtensionAPI): void {
               | "resume"
               | "stop"
               | "rm";
-            if (!["list", "get", "pause", "resume", "stop", "rm"].includes(action)) {
+            if (!(["list", "get", "pause", "resume", "stop", "rm"] as string[]).includes(action)) {
               throw new Error(`unknown workflow_control action: ${params.action}`);
+            }
+            if (action === "resume") {
+              // control("resume") replays the journal-stored script, which may be
+              // model-supplied inline code from an earlier build.
+              throw new Error(
+                "workflow_control resume is disabled: resume through the workflow tool with `name` of a saved workflow file and `resumeFromRunId`.",
+              );
             }
             const runId = normalizeControlRunId(params as unknown as Record<string, unknown>);
             const workflowEngine = currentEngine();

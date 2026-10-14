@@ -1,9 +1,10 @@
 # pi-background
 
-Opt-in, experimental background shell jobs and low-noise log monitors for the
-[Pi coding agent](https://pi.dev). Runs ordinary local processes, not child agents.
-There are no model calls while a job is running or a monitor is waiting. Only an
-exit or a configured literal log match can request another agent turn.
+Opt-in, experimental observation and control of session-owned background jobs,
+with low-noise log monitors, for the [Pi coding agent](https://pi.dev). **This
+version exposes no tool that starts a command** (see below). There are no model
+calls while a monitor is waiting. Only an exit or a configured literal log match
+can request another agent turn.
 
 ## Try from this checkout
 
@@ -18,9 +19,9 @@ The package refuses to start if Pi resolves one of its tool names to an earlier
 extension. Pi can disambiguate duplicate commands; load only one background
 manager rather than relying on registration order.
 
-The workspace test baseline is Pi **1.0.4**. Real-SDK tests cover delivery,
-committed-tree suspended input, and cancelled fork recovery using an offline
-faux provider; they are enabled for **1.0.4** and **1.1.0**. Host peers use `"*"`
+The workspace test baseline is Pi **1.0.4**. Real-SDK tests cover tool
+registration with the retired setting, refusal of forged command calls, and
+monitoring an existing in-memory fixture job using an offline faux provider; they are enabled for **1.0.4** and **1.1.0**. Host peers use `"*"`
 for module ownership, not a promise of compatibility with every host version.
 This version targets local macOS/Linux; baseline acceptance ran on macOS/Pi
 1.0.4, not Linux.
@@ -29,44 +30,31 @@ deliberately outside this first version. Bun-based and standalone Pi hosts requi
 a `node` executable on `PATH` for the owned supervisor; missing or stalled startup
 fails rather than silently starting an unmanaged command.
 
-## Shell tool opt-in
+## No command-starting tools
 
-Shell tools are **disabled by default** in this fork. `bash_background` is not
-registered, and `monitor({ command: ... })` returns a clear refusal without
-starting a process. `monitor({ id: ... })` can still watch an existing owned job;
-inspection and job-control tools remain available. This package does not add a
-separate file-watching mode.
+This fork registers **no tool that starts a command**. `bash_background` is never
+registered, and `monitor` accepts only the `id` of an existing job; it has no
+`command`, `cwd`, `description` or `timeout_ms` parameter. A call that still
+supplies one of those fields is refused before any job manager access. This
+package does not add a separate file-watching mode.
 
-To opt in, add the following to your Pi settings and run `/reload`:
+The reason is technical: a command started by an extension does not pass through
+the host's command-authorization checks for builtin `bash`, so it could run a
+command those checks would reject. Command-starting tools return only once the
+host can authorize them.
 
-```json
-{
-  "piBackground": {
-    "allowShellTools": true
-  }
-}
-```
+The former `piBackground.allowShellTools` setting is **retired and ignored**,
+including the value `true`. If it is still present, the extension warns by name
+at session start. Remove it from your settings.
 
-Only the boolean `true` enables shell tools. A missing setting, `false`, an
-invalid value, or an unreadable settings snapshot leaves them disabled. The
-extension uses Pi's public effective settings API; user and trusted project
-settings follow Pi's normal merge rules. Registration happens at session startup,
-when that API is bound. Each shell launch also checks the setting, so disabling
-it prevents new launches even if a tool was previously registered.
-
-**Keep `piBackground.allowShellTools` false until the host's command-approval
-policy covers both `bash_background` and command-mode `monitor`.** Opt-in does
-not install an approval policy or make these tools inherit builtin `bash` guards.
-
-**ponytail:** this is a fork-local, default-deny gate: the smallest safe change
-while command-policy integration is incomplete, not a new shell sandbox.
+**ponytail:** this is a fork-local removal, the smallest safe change until host
+command authorization exists, not a new shell sandbox.
 
 ## Tools
 
 | Tool | Purpose |
 | --- | --- |
-| `bash_background` | With explicit shell opt-in, start a finite command and return its ID |
-| `monitor` | Watch an existing job; starting a command requires explicit shell opt-in |
+| `monitor` | Attach literal line matchers to an existing job; never starts a command |
 | `background_list` | Inspect running and retained completed jobs, optionally by ID |
 | `background_logs` | Read a bounded tail of stdout/stderr, optionally select a stream |
 | `background_stop` | Stop an owned process group, wait for exit, retain its logs |
@@ -75,48 +63,15 @@ while command-policy integration is incomplete, not a new shell sandbox.
 Tools return structured results as well as model-facing text. IDs are opaque and
 unique to an extension runtime. There is no tool accepting an arbitrary PID.
 
-Use background execution when the user asks for it or useful independent work
-remains. If a command's result is needed immediately, use foreground `bash` rather
-than starting a job and repeatedly inspecting its status.
-
-### Finite work
-
-The following shell examples require `piBackground.allowShellTools: true`.
-
-```js
-bash_background({
-  command: "bun run check",
-  description: "Repository checks",
-  timeout_ms: 1800000,
-  notify: "turn"
-})
-```
-
-The default timeout is 30 minutes, with a maximum of 24 hours. `notify` accepts:
-
-- `turn` (default): an exit requests an agent turn after current work settles;
-- `context`: record the event in the transcript without starting a model turn;
-- `off`: do not send an exit notification; inspect status and logs explicitly.
-
-A successful start reports a spawned process, not command success. Command
-failures appear as a completed job with its exit code/error, and an exit event
-unless disabled. Launch validation failures throw a tool error.
+Use foreground `bash` to run commands.
 
 ### Event-driven monitoring
 
 ```js
-monitor({
-  command: "bun run dev",
-  description: "Development server",
-  patterns: ["ready", "ERROR"],
-  stream: "both"
-})
-
-// Or attach rules to an existing job, without starting another process:
 monitor({ id: "<job-id>", patterns: ["FAIL", "Tests passed"] })
 ```
 
-Supply **exactly one** of `command` or `id`. Patterns are case-sensitive literal
+`id` is required. Patterns are case-sensitive literal
 substrings of future output lines, not regular expressions. Whitespace is
 preserved exactly: `" ERROR "` and `"ERROR"` are different patterns. Only exact
 duplicates are removed; bounds apply to the original pattern. Matching happens
@@ -134,11 +89,9 @@ cooldown are consumed, not delayed. The extension also
 limits automatic wake batches to at most one every ten seconds. Patterns that
 never occur remain silent: inspect the actual output to choose accurate markers.
 
-New monitor commands have **no timeout by default**. An optional `timeout_ms`
-bounds their lifetime. When attaching to an existing job, its original timeout
-and exit-notification policy remain unchanged. `notify` on the watch controls
-match notifications (`turn` or `context`); a newly started monitor uses it for
-exits too. Attaching cannot change launch cwd/description/timeout.
+Attaching to an existing job leaves its original timeout and exit-notification
+policy unchanged. `notify` on the watch controls match notifications (`turn` or
+`context`). Attaching cannot change launch cwd/description/timeout.
 
 ```js
 background_logs({ id: "<job-id>", tail: 200, stream: "stderr" })
@@ -232,16 +185,12 @@ it. Use an interactive or long-lived RPC session for asynchronous work.
 
 ## Security and integration
 
-Commands run with Pi's full local operating-system permissions using
-`/bin/bash -c`. This package does not replace builtin `bash`, inherit its shell
-path/prefix override, or detect another extension's remote workspace. Do not use
-it for remote commands or to bypass a rejected foreground command.
+No tool in this package starts a command. It does not replace builtin `bash`,
+inherit its shell path/prefix override, or detect another extension's remote
+workspace.
 
 Tools publish read-only/destructive/open-world annotations for permission
-extensions. **Annotations are hints, not a sandbox.** An approval policy that
-handles only `bash` must explicitly cover `bash_background` and command-mode
-`monitor` too. Until that coverage exists, keep `piBackground.allowShellTools`
-false; the fork-local gate prevents shell launches by default.
+extensions. **Annotations are hints, not a sandbox.**
 Plan-mode users must not opt these mutating tools into a read-only loadout.
 There is no automatic change to any other extension's tool selection or settings.
 

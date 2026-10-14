@@ -168,7 +168,8 @@ user's own LLM and run on the user's own machine.
 A script edit replays the longest unchanged prefix from the journal and runs
 live from the first changed or inserted `agent()`/`checkpoint()` call. The
 original invocation `args` and execution limits are frozen and reused on manual
-or automatic resume. Pass `resumeFromRunId` with the edited script; unchanged
+or automatic resume. Save the edited script as a workflow file, then pass
+`resumeFromRunId` with its `name` to the `workflow` tool; unchanged
 calls report zero tokens,
 and edited calls rotate their managed spawn key generation so pi-subagents
 never raises a fingerprint conflict. A failed run accepted through
@@ -196,13 +197,21 @@ workflow, and the review skill before accepting a topology or recovery change.
 
 ## Tools and commands
 
-- `workflow`: run a script (`script`) or a saved/built-in workflow (`name`),
+- `workflow`: run a saved workflow file (`name`) from the Pi agent directory
+  (`workflows/saved/` or the project's `workflows/projects/<id>/saved/`),
   with `args`, `background` (default true), `maxAgents` (default 1000),
   `concurrency` (defaults to the host's pool size), `agentRetries` (default 0),
   `tokenBudget` (default unlimited), `agentTimeoutMs` (default 1800000, `null`
   disables), and `resumeFromRunId`. The execution limits are tuned defaults: a
   caller that names one narrower than the script needs stops the run rather
   than shaping it.
+
+  The tool refuses any call that carries `script` (alone or with `name` or
+  `resumeFromRunId`) with "inline workflow scripts are disabled in this build:
+  node:vm is not a sandbox", before anything is executed. Workflow code runs in
+  `node:vm`, which is not a security boundary, so the tool runs only files the
+  user saved. Built-in workflows run through their slash commands, and a resume
+  must name a saved file rather than replay the stored script.
 
   Concurrency is not configured here at all. A workflow agent occupies one of
   pi-subagents' `maxConcurrent` background slots like any other background
@@ -222,7 +231,7 @@ workflow, and the review skill before accepting a topology or recovery change.
 
   `agentTimeoutMs` counts from the moment the host reports the agent left its
   queue, so waiting for a slot is never charged against the work.
-- `workflow_control`: `list`, `get`, `pause`, `resume`, `stop`, or `rm` a run; `rm` writes a durable removal tombstone.
+- `workflow_control`: `list`, `get`, `pause`, `stop`, or `rm` a run; `rm` writes a durable removal tombstone. Its `resume` action is refused because it would replay the stored script; use `/workflows resume` or the `workflow` tool with a saved `name`.
 - `pi.events` emits `pi-workflows:runtime` snapshots (`{ runId, event }`) for phase, task, quality, retry, and nested-workflow progress; observer failures are contained.
 - `/workflows`: TUI navigator plus `run`, `status`, `watch`, `stop`, `pause`,
   `resume`, `rm`, `save <name> [runId]`, and `strength` subcommands.

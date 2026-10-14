@@ -252,7 +252,7 @@ export const WORKFLOW_CAPABILITIES: readonly CapabilityEntry[] = [
     classification: "workflow-tool-input",
     signature: "script?: string",
     options: [],
-    constraints: ["required raw JavaScript workflow source unless `name` is given"],
+    constraints: ["disabled in this build: every inline script tool call is refused because node:vm is not a sandbox"],
   },
   {
     name: "name",
@@ -260,8 +260,8 @@ export const WORKFLOW_CAPABILITIES: readonly CapabilityEntry[] = [
     signature: "name?: string",
     options: [],
     constraints: [
-      "resolves a saved workflow first, then one of the 5 built-in patterns",
-      "mutually exclusive with script and resumeFromRunId",
+      "required for start and resume; resolves only a saved workflow file under the user's Pi agent directory",
+      "inline script is always refused; built-ins remain user slash commands",
     ],
   },
   { name: "args", classification: "workflow-tool-input", signature: "args?: unknown", options: [], constraints: [] },
@@ -325,7 +325,7 @@ export const WORKFLOW_CAPABILITIES: readonly CapabilityEntry[] = [
     signature: "resumeFromRunId?: string",
     options: [],
     constraints: [
-      "resumes a prior incomplete run with an edited script",
+      "requires name to resolve a trusted saved-file replacement; journal-only and workflow_control resume are refused",
       "original args and execution limits are reused on resume",
       "unchanged positional calls replay from cache until the first changed call",
       "always runs in the background",

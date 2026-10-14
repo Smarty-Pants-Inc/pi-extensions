@@ -28,7 +28,11 @@ custom dependency graph. Use the ordinary agent tool for small work and load
 
 ## Invocation contract
 
-The model-facing call is a `workflow` tool call, not JavaScript:
+In this build the `workflow` tool runs only a saved workflow file from the Pi
+agent directory, by `name`; inline `script` is always refused because node:vm
+is not a sandbox. Built-ins are not reachable through the tool: ask the user to
+run the built-in's slash command (for example `/deep-research`), or to place a
+reviewed copy in their saved workflows directory and then call it by name:
 
 ```json
 {
@@ -38,9 +42,7 @@ The model-facing call is a `workflow` tool call, not JavaScript:
 }
 ```
 
-`name` resolves a saved workflow before the built-in. A saved workflow with the
-same name intentionally overrides the built-in. Do not send `script` together
-with `name`; choose one form. `background` defaults to `true`; use
+Never send `script`. `background` defaults to `true`; use
 `background: false` only when the caller needs the result inline or a human
 checkpoint must be shown.
 
@@ -62,9 +64,11 @@ checkpoint must be shown.
 Every built-in returns a bounded aggregate of successful intermediate results
 and a final report. Failed worker calls can remain `null` or be omitted from that
 aggregate, but stay visible in run details. A background call returns a run ID
-immediately; inspect it with `workflow_control` (`get`, `pause`, `resume`, or
-`stop`) rather than starting a duplicate run. If a provider limit pauses the run, resume the same
-run after the configured retry window. A changed script or saved workflow
+immediately; inspect it with `workflow_control` (`get`, `pause`, or `stop`)
+rather than starting a duplicate run. `workflow_control` `resume` is refused in
+this build; resume with a `workflow` call carrying the saved `name` and
+`resumeFromRunId`, or let the user run `/workflows resume`. If a provider limit
+pauses the run, resume the same run after the configured retry window. A changed script or saved workflow
 replays only its unchanged journal prefix, so preserve the original inputs when
 resuming.
 

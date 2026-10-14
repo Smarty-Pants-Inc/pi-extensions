@@ -1,6 +1,34 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PROTOCOL_CAPABILITIES, PROTOCOL_VERSION, routingPolicyFingerprint } from "@signalridge/pi-subagents-protocol";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import piWorkflows from "../src/index.js";
+
+// The model-callable workflow tool refuses inline `script` input and runs only
+// saved workflow files from the Pi agent directory. Each script below is a named
+// trusted-file fixture written under a private per-test agent directory.
+let testAgentDir: string | undefined;
+let previousAgentDir: string | undefined;
+beforeEach(() => {
+  previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  testAgentDir = mkdtempSync(join(tmpdir(), "workflows-navigation-agent-dir-"));
+  process.env.PI_CODING_AGENT_DIR = testAgentDir;
+});
+afterEach(() => {
+  if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+  else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+  if (testAgentDir) rmSync(testAgentDir, { recursive: true, force: true });
+  testAgentDir = undefined;
+});
+
+function trustedWorkflow(name: string, script: string): string {
+  if (!testAgentDir) throw new Error("test agent directory missing");
+  const dir = join(testAgentDir, "workflows", "saved");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, `${name}.js`), script);
+  return name;
+}
 
 class Bus {
   private handlers = new Map<string, Set<(value: unknown) => void>>();
@@ -144,7 +172,10 @@ function fixture(subagentsFirst: boolean, hangQuiesce = false) {
       const result = await tools.get("workflow")?.execute(
         "navigation-run",
         {
-          script: 'export const meta = { name: "navigation", description: "test" }; return await agent("work");',
+          name: trustedWorkflow(
+            "navigation",
+            'export const meta = { name: "navigation", description: "test" }; return await agent("work");',
+          ),
           background: true,
         },
         undefined,
@@ -257,7 +288,7 @@ describe("workflow navigation preflight", () => {
       const retired = await f.tools.get("workflow")?.execute(
         "retired",
         {
-          script: 'export const meta = { name: "retired", description: "test" }; return 1;',
+          name: trustedWorkflow("retired", 'export const meta = { name: "retired", description: "test" }; return 1;'),
           background: true,
         },
         undefined,
@@ -313,15 +344,16 @@ describe("workflow navigation preflight", () => {
       await new Promise((resolve) => setImmediate(resolve));
       expect(f.ctx.sessionManager.getBranch()).toEqual([]);
       expect(f.entries.some((entry) => (entry.data as { runId?: string }).runId === oldRunId)).toBe(true);
-      const fresh = await f.tools
-        .get("workflow")
-        ?.execute(
-          "fresh",
-          { script: 'export const meta = { name: "fresh", description: "test" }; return 1;', background: false },
-          undefined,
-          undefined,
-          f.ctx,
-        );
+      const fresh = await f.tools.get("workflow")?.execute(
+        "fresh",
+        {
+          name: trustedWorkflow("fresh", 'export const meta = { name: "fresh", description: "test" }; return 1;'),
+          background: false,
+        },
+        undefined,
+        undefined,
+        f.ctx,
+      );
       expect(fresh?.details.status).toBe("completed");
       expect(
         f.ctx.sessionManager.getBranch().some((entry) => (entry.data as { runId?: string }).runId === oldRunId),

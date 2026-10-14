@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fauxAssistantMessage, fauxProvider, fauxToolCall, type TranscriptContext } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
 import {
   AgentSessionRuntime,
   createAgentSession,
@@ -14,23 +14,67 @@ import {
   VERSION,
 } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { JobManager, JobSnapshot, StartOptions } from "../src/contracts.js";
 import background from "../src/extension.js";
-import { MESSAGE_TYPE, Notifications } from "../src/notifications.js";
 
-// Real host loader, lifecycle, provider dispatch and tool pipeline. No paid model.
+// Controlled in-memory manager: existing jobs are seeded directly and no process is ever launched.
+const fake = vi.hoisted(() => ({ managers: [] as JobManager[] }));
+vi.mock("../src/manager.js", () => ({
+  createJobManager: (): JobManager => {
+    const jobs: JobSnapshot[] = [];
+    const get = (id: string) => {
+      const job = jobs.find((entry) => entry.id === id);
+      if (!job) throw new Error(`unknown job ${id}`);
+      return job;
+    };
+    const manager: JobManager = {
+      start: vi.fn(async (options: StartOptions) => {
+        const job: JobSnapshot = {
+          id: `seed-${jobs.length}`,
+          command: options.command,
+          cwd: options.cwd,
+          description: options.description ?? "seeded",
+          status: "running",
+          startedAt: 1,
+          attention: "off",
+          droppedBytes: 0,
+        };
+        jobs.push(job);
+        return job;
+      }),
+      watch: vi.fn((id, watch) => Object.assign(get(id), { watch })),
+      list: () => jobs,
+      get,
+      logs: (id) => {
+        get(id);
+        return { text: "seeded-log-line", droppedBytes: 0 };
+      },
+      stop: async (id) => Object.assign(get(id), { status: "stopped" as const }),
+      clear: () => 0,
+      shutdown: async () => {
+        jobs.length = 0;
+      },
+    };
+    fake.managers.push(manager);
+    return manager;
+  },
+}));
+
+// Real host loader, lifecycle, provider dispatch and tool pipeline. No paid model, no shell launch.
 describe.skipIf(!["1.0.4", "1.1.0"].includes(VERSION) || process.platform === "win32")(
   "background on supported installed Pi",
   () => {
     const cleanup: (() => Promise<void>)[] = [];
     afterEach(async () => {
       for (const dispose of cleanup.splice(0).reverse()) await dispose();
+      fake.managers.length = 0;
     });
 
-    // null leaves the setting missing; omitted arguments keep existing shell tests explicitly opted in.
+    // null leaves the retired setting missing; true is the legacy opt-in that must not override.
     async function fixture(
       inputGate?: (pi: ExtensionAPI) => void,
       laterGate?: (pi: ExtensionAPI) => void,
-      allowShellTools: boolean | null = true,
+      allowShellTools: boolean | null = null,
     ) {
       const cwd = mkdtempSync(join(tmpdir(), "background-host-"));
       const agentDir = join(cwd, "agent");
@@ -96,7 +140,8 @@ describe.skipIf(!["1.0.4", "1.1.0"].includes(VERSION) || process.platform === "w
         modelRuntime: runtime,
         resourceLoader: loader,
         sessionManager: SessionManager.inMemory(cwd),
-        tools: ["bash_background", "monitor", "background_list"],
+        // Allowlisting the retired name must not resurrect it.
+        tools: ["bash_background", "monitor", "background_list", "background_logs"],
         settingsManager,
       });
       cleanup.push(async () => {
@@ -122,51 +167,40 @@ describe.skipIf(!["1.0.4", "1.1.0"].includes(VERSION) || process.platform === "w
       active: session.getActiveToolNames(),
     });
 
-    it("registers bash_background and runs a bounded command only after explicit opt-in", async () => {
-      const { session, faux, errors } = await fixture(undefined, undefined, true);
-      const tools = registered(session);
-      expect(tools.all).toContain("bash_background");
-      expect(tools.runner).toContain("bash_background");
-      expect(tools.active).toEqual(expect.arrayContaining(["bash_background", "monitor", "background_list"]));
-      faux.setResponses([
-        fauxAssistantMessage(fauxToolCall("bash_background", { command: "printf opted-in", notify: "context" }), {
-          stopReason: "toolUse",
-        }),
-        fauxAssistantMessage("Started."),
-      ]);
-      await session.prompt("Start opted-in job.");
-      const result = session.messages.find(
-        (message) => message.role === "toolResult" && message.toolName === "bash_background",
-      );
-      expect(result).toMatchObject({ isError: false });
-      expect(errors).toEqual([]);
-    });
-
     for (const [label, value] of [
+      ["legacy opt-in true", true],
       ["missing", null],
       ["false", false],
     ] as const) {
-      it(`does not register bash_background and rejects monitor commands when the gate is ${label}`, async () => {
+      it(`never registers bash_background or runs forged commands when the retired setting is ${label}`, async () => {
         const { session, faux, errors } = await fixture(undefined, undefined, value);
         const tools = registered(session);
-        expect(tools.all).not.toContain("bash_background");
-        expect(tools.runner).not.toContain("bash_background");
-        expect(tools.active).not.toContain("bash_background");
-        expect(tools.active).toEqual(expect.arrayContaining(["monitor", "background_list"]));
+        for (const list of [tools.all, tools.runner, tools.active]) {
+          expect(list).not.toContain("bash_background");
+          expect(list).toEqual(expect.arrayContaining(["monitor", "background_list", "background_logs"]));
+        }
+        const monitor = session.getAllTools().find((tool) => tool.name === "monitor");
+        expect(JSON.stringify(monitor?.parameters)).not.toMatch(/"(command|cwd|timeout_ms)"/);
         faux.setResponses([
-          fauxAssistantMessage(fauxToolCall("monitor", { command: "printf should-not-run", patterns: ["x"] }), {
-            stopReason: "toolUse",
-          }),
+          fauxAssistantMessage(
+            [
+              fauxToolCall("bash_background", { command: "printf should-not-run" }),
+              fauxToolCall("monitor", { command: "printf should-not-run", patterns: ["x"] }),
+              fauxToolCall("monitor", { id: "seed-0", command: "printf should-not-run", patterns: ["x"] }),
+            ],
+            { stopReason: "toolUse" },
+          ),
           fauxAssistantMessage("Refused."),
           fauxAssistantMessage(fauxToolCall("background_list", {}), { stopReason: "toolUse" }),
           fauxAssistantMessage("Listed."),
         ]);
-        await session.prompt("Try a monitor command.");
-        const refused = session.messages.find(
-          (message) => message.role === "toolResult" && message.toolName === "monitor",
+        await session.prompt("Try forged commands.");
+        const refused = session.messages.filter(
+          (message) => message.role === "toolResult" && ["bash_background", "monitor"].includes(message.toolName),
         );
-        expect(refused).toMatchObject({ role: "toolResult", isError: true });
-        expect(JSON.stringify(refused)).toContain("piBackground.allowShellTools");
+        expect(refused).toHaveLength(3);
+        expect(refused.every((message) => message.role === "toolResult" && message.isError)).toBe(true);
+        expect(fake.managers.every((manager) => vi.mocked(manager.start).mock.calls.length === 0)).toBe(true);
         await session.prompt("Inspect jobs.");
         const list = [...session.messages]
           .reverse()
@@ -176,242 +210,32 @@ describe.skipIf(!["1.0.4", "1.1.0"].includes(VERSION) || process.platform === "w
       });
     }
 
-    it("wakes once at idle exit, delivers the matching custom message and has a valid structured tool result", async () => {
-      const { session, faux, errors, prompts, inputs } = await fixture();
-      const wake = vi.fn((_context: TranscriptContext) => fauxAssistantMessage("Exit received."));
+    it("monitors and reads logs of an existing job through the real tool pipeline with the legacy opt-in", async () => {
+      const { session, faux, errors } = await fixture(undefined, undefined, true);
+      const manager = fake.managers.at(-1);
+      if (!manager) throw new Error("missing background manager");
+      await manager.start({ command: "seeded fixture, never executed", cwd: "." });
       faux.setResponses([
         fauxAssistantMessage(
-          fauxToolCall("bash_background", { command: "sleep 0.1; printf complete", notify: "turn" }),
-          {
-            stopReason: "toolUse",
-          },
-        ),
-        fauxAssistantMessage("Job started."),
-        wake,
-      ]);
-      await session.prompt("Run in background.");
-      await vi.waitFor(() => expect(wake).toHaveBeenCalledOnce(), { timeout: 5000 });
-      await vi.waitFor(() => expect(session.isStreaming).toBe(false), { timeout: 5000 });
-      const notification = session.messages.find(
-        (message) => message.role === "custom" && message.customType === MESSAGE_TYPE,
-      );
-      expect(notification).toMatchObject({ role: "custom", customType: MESSAGE_TYPE });
-      expect(JSON.stringify(wake.mock.calls[0][0].messages)).toContain("[exit:");
-      expect(prompts).toHaveLength(2); // Idle custom-message wakes would skip this hook.
-      expect(prompts[1]).toContain("Background process wake [");
-      expect(inputs).toEqual(["interactive", "extension"]);
-      const result = session.messages.find(
-        (message) => message.role === "toolResult" && message.toolName === "bash_background",
-      );
-      expect(result).toMatchObject({ role: "toolResult", isError: false });
-      // An additional user turn must not replay the already acknowledged wake.
-      faux.setResponses([
-        fauxAssistantMessage(fauxToolCall("background_list", {}), { stopReason: "toolUse" }),
-        fauxAssistantMessage("Listed."),
-      ]);
-      await session.prompt("Inspect jobs.");
-      const list = [...session.messages]
-        .reverse()
-        .find((message) => message.role === "toolResult" && message.toolName === "background_list");
-      expect(list).toMatchObject({ isError: false, details: { pendingNotifications: 0, deliveryPaused: false } });
-      expect(errors).toEqual([]);
-    });
-
-    it("consumes old input after the new leaf commits but before an earlier tree handler returns", async () => {
-      let release!: () => void;
-      let entered!: () => void;
-      const gate = new Promise<void>((resolve) => {
-        release = resolve;
-      });
-      const blocked = new Promise<void>((resolve) => {
-        entered = resolve;
-      });
-      let releaseTree!: () => void;
-      let enteredTree!: () => void;
-      const treeGate = new Promise<void>((resolve) => {
-        releaseTree = resolve;
-      });
-      const treeBlocked = new Promise<void>((resolve) => {
-        enteredTree = resolve;
-      });
-      const { session, faux, errors, prompts } = await fixture((pi) => {
-        pi.on("input", async (event) => {
-          if (event.source !== "extension") return;
-          entered();
-          await gate;
-        });
-        pi.on("session_tree", async () => {
-          enteredTree();
-          await treeGate;
-        });
-      });
-      const ack = vi.spyOn(Notifications.prototype, "acknowledge");
-      cleanup.push(async () => {
-        ack.mockRestore();
-      });
-      const staleWake = vi.fn(() => fauxAssistantMessage("Stale wake."));
-      faux.setResponses([
-        fauxAssistantMessage(fauxToolCall("bash_background", { command: "printf complete", notify: "turn" }), {
-          stopReason: "toolUse",
-        }),
-        fauxAssistantMessage("Started."),
-        staleWake,
-      ]);
-      try {
-        await session.prompt("Start a job.");
-        await blocked;
-        const target = session.getUserMessagesForForking()[0]?.entryId;
-        if (!target) throw new Error("missing tree target");
-        const oldLeaf = session.sessionManager.getLeafId();
-        const navigation = session.navigateTree(target);
-        await treeBlocked;
-        expect(session.sessionManager.getLeafId()).not.toBe(oldLeaf);
-        expect(session.sessionManager.getLeafId()).toBe(session.sessionManager.getEntry(target)?.parentId);
-        // Deliberately release input first: background's tree handler has NOT run.
-        release();
-        await new Promise<void>((resolve) => setImmediate(resolve));
-        expect(staleWake).not.toHaveBeenCalled();
-        expect(prompts).toHaveLength(1);
-        expect(ack).not.toHaveBeenCalled();
-        const runner = session.extensionRunner;
-        const tool = runner.getToolDefinition("background_list");
-        if (!tool) throw new Error("missing background tool");
-        await expect(
-          tool.execute("old-access", {}, undefined, undefined, runner.createToolContext("old-access", undefined)),
-        ).rejects.toThrow("No active background manager");
-        releaseTree();
-        await navigation;
-        faux.setResponses([fauxAssistantMessage("New branch.")]);
-        await session.prompt("Continue on the new branch.");
-        expect(prompts).toEqual(["Start a job.", "Continue on the new branch."]);
-        expect(errors).toEqual([]);
-      } finally {
-        release();
-        releaseTree();
-      }
-    });
-
-    it("keeps jobs and the outbox through an awaited cancelled fork, then explicitly retries once", async () => {
-      let release!: () => void;
-      let entered!: () => void;
-      const gate = new Promise<void>((resolve) => {
-        release = resolve;
-      });
-      const blocked = new Promise<void>((resolve) => {
-        entered = resolve;
-      });
-      const { session, host, faux, errors } = await fixture(undefined, (pi) => {
-        pi.on("session_before_fork", async () => {
-          entered();
-          await gate;
-          return { cancel: true };
-        });
-      });
-      const wake = vi.fn(() => fauxAssistantMessage("Recovered once."));
-      faux.setResponses([
-        fauxAssistantMessage(
-          fauxToolCall("bash_background", { command: "sleep .1; printf completed", notify: "turn" }),
+          [
+            fauxToolCall("monitor", { id: "seed-0", patterns: ["ready"] }),
+            fauxToolCall("background_logs", { id: "seed-0" }),
+          ],
           { stopReason: "toolUse" },
         ),
-        fauxAssistantMessage("Started."),
-        wake,
+        fauxAssistantMessage("Observed."),
       ]);
-      const flush = vi.spyOn(Notifications.prototype, "flush");
-      cleanup.push(async () => {
-        flush.mockRestore();
+      await session.prompt("Watch the existing job.");
+      const result = (name: string) =>
+        session.messages.find((message) => message.role === "toolResult" && message.toolName === name);
+      expect(result("monitor")).toMatchObject({
+        isError: false,
+        details: {
+          jobs: [expect.objectContaining({ id: "seed-0", watch: expect.objectContaining({ patterns: ["ready"] }) })],
+        },
       });
-      try {
-        await session.prompt("Start before forking.");
-        const target = session.getUserMessagesForForking()[0]?.entryId;
-        if (!target) throw new Error("missing fork target");
-        const oldLeaf = session.sessionManager.getLeafId();
-        const fork = host.fork(target);
-        await blocked;
-        await vi.waitFor(() => expect(flush).toHaveBeenCalled(), { timeout: 5000 });
-        expect(wake).not.toHaveBeenCalled();
-        expect(
-          session.messages.some((message) => message.role === "custom" && message.customType === MESSAGE_TYPE),
-        ).toBe(false);
-        release();
-        expect(await fork).toEqual({ cancelled: true });
-        expect(session.sessionManager.getLeafId()).toBe(oldLeaf);
-        const runner = session.extensionRunner;
-        const tool = runner.getToolDefinition("background_list");
-        if (!tool) throw new Error("missing background tool");
-        const before = await tool.execute(
-          "inspect",
-          {},
-          undefined,
-          undefined,
-          runner.createToolContext("inspect", undefined),
-        );
-        expect(before.details).toMatchObject({
-          jobs: [expect.objectContaining({ status: "exited", exitCode: 0 })],
-          pendingNotifications: 1,
-        });
-        await session.prompt("/background retry");
-        await vi.waitFor(() => expect(wake).toHaveBeenCalledOnce(), { timeout: 5000 });
-        await vi.waitFor(() => expect(session.isStreaming).toBe(false));
-        const after = await tool.execute(
-          "inspect",
-          {},
-          undefined,
-          undefined,
-          runner.createToolContext("inspect", undefined),
-        );
-        expect(after.details).toMatchObject({
-          jobs: [expect.objectContaining({ status: "exited", exitCode: 0 })],
-          pendingNotifications: 0,
-        });
-        await session.prompt("/background retry");
-        expect(wake).toHaveBeenCalledOnce();
-        expect(errors).toEqual([]);
-      } finally {
-        release();
-      }
-    });
-
-    it("records context-only exits without a model turn and discards jobs on session-tree navigation", async () => {
-      const { session, faux, errors } = await fixture();
-      const unexpected = vi.fn(() => fauxAssistantMessage("Unexpected wake."));
-      faux.setResponses([
-        fauxAssistantMessage(
-          fauxToolCall("bash_background", { command: "sleep 0.1; printf complete", notify: "context" }),
-          { stopReason: "toolUse" },
-        ),
-        fauxAssistantMessage("Job started."),
-        unexpected,
-      ]);
-      await session.prompt("Run without waking.");
-      await vi.waitFor(
-        () =>
-          expect(
-            session.messages.some((message) => message.role === "custom" && message.customType === MESSAGE_TYPE),
-          ).toBe(true),
-        { timeout: 5000 },
-      );
-      expect(unexpected).not.toHaveBeenCalled();
-      faux.setResponses([
-        fauxAssistantMessage(fauxToolCall("background_list", {}), { stopReason: "toolUse" }),
-        fauxAssistantMessage("Inspected."),
-      ]);
-      await session.prompt("Inspect context-only delivery.");
-      const beforeTree = [...session.messages]
-        .reverse()
-        .find((message) => message.role === "toolResult" && message.toolName === "background_list");
-      expect(beforeTree).toMatchObject({ isError: false, details: { pendingNotifications: 0, deliveryPaused: false } });
-      const target = session.getUserMessagesForForking()[0]?.entryId;
-      if (!target) throw new Error("missing tree target");
-      await session.navigateTree(target);
-      faux.setResponses([
-        fauxAssistantMessage(fauxToolCall("background_list", {}), { stopReason: "toolUse" }),
-        fauxAssistantMessage("Empty."),
-      ]);
-      await session.prompt("Inspect new session.");
-      const list = [...session.messages]
-        .reverse()
-        .find((message) => message.role === "toolResult" && message.toolName === "background_list");
-      expect(list).toMatchObject({ isError: false, details: { jobs: [], pendingNotifications: 0 } });
+      expect(result("background_logs")).toMatchObject({ isError: false, details: { output: "seeded-log-line" } });
+      expect(manager.start).toHaveBeenCalledTimes(1); // Only the fixture seed.
       expect(errors).toEqual([]);
     });
   },

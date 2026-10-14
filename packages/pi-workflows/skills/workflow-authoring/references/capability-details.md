@@ -224,7 +224,7 @@ Every exact fact below is projected from the installed extension's capability co
 - Classification: `workflow-tool-input`
 - Support: `supported`
 - Signature: `script?: string`
-- Constraint: required raw JavaScript workflow source unless `name` is given
+- Constraint: disabled in this build: every inline script tool call is refused because node:vm is not a sandbox
 
 <a id="workflow-tool-input-name"></a>
 ## name
@@ -232,8 +232,8 @@ Every exact fact below is projected from the installed extension's capability co
 - Classification: `workflow-tool-input`
 - Support: `supported`
 - Signature: `name?: string`
-- Constraint: resolves a saved workflow first, then one of the 5 built-in patterns
-- Constraint: mutually exclusive with script and resumeFromRunId
+- Constraint: required for start and resume; resolves only a saved workflow file under the user's Pi agent directory
+- Constraint: inline script is always refused; built-ins remain user slash commands
 
 <a id="workflow-tool-input-args"></a>
 ## args
@@ -301,7 +301,7 @@ Every exact fact below is projected from the installed extension's capability co
 - Classification: `workflow-tool-input`
 - Support: `supported`
 - Signature: `resumeFromRunId?: string`
-- Constraint: resumes a prior incomplete run with an edited script
+- Constraint: requires name to resolve a trusted saved-file replacement; journal-only and workflow_control resume are refused
 - Constraint: original args and execution limits are reused on resume
 - Constraint: unchanged positional calls replay from cache until the first changed call
 - Constraint: always runs in the background
