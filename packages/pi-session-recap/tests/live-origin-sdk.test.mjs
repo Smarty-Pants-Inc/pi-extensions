@@ -21,7 +21,7 @@ function gate() {
 }
 
 for (const stage of ["auth", "response"]) {
-  for (const navigation of ["sibling", "append", "cancelled"]) {
+  for (const navigation of ["sibling", "descendant", "append", "cancelled"]) {
     test(`SDK ${navigation} validates recap ${stage} independently of delayed tree delivery`, async () => {
       const cwd = await mkdtemp(join(tmpdir(), "recap-live-origin-"));
       const entered = gate();
@@ -109,8 +109,11 @@ for (const stage of ["auth", "response"]) {
         const root = manager.appendMessage({ role: "user", content: "same projected task", timestamp: 1 });
         const origin = manager.appendCustomEntry("origin metadata");
         const originMessages = manager.buildSessionProjection().messages;
-        manager.branch(root);
-        const destination = manager.appendCustomEntry("destination metadata");
+        let destination;
+        if (navigation !== "descendant") {
+          manager.branch(root);
+          destination = manager.appendCustomEntry("destination metadata");
+        }
         assert.deepEqual(manager.buildSessionProjection().messages, originMessages);
         manager.branch(origin);
         ({ session } = await createAgentSession({
@@ -131,6 +134,14 @@ for (const stage of ["auth", "response"]) {
             },
           },
         });
+        if (navigation === "descendant") {
+          // Session startup appends entries, so create the descendant beneath the live leaf,
+          // then return to its ancestor without a tree event: unchanged projection, existing child.
+          const ancestor = manager.getLeafId();
+          destination = manager.appendCustomEntry("existing descendant metadata");
+          manager.branch(ancestor);
+          assert.deepEqual(manager.buildSessionProjection().messages, originMessages);
+        }
         const ctx = session.extensionRunner.createCommandContext();
         ctx.modelRegistry.find = (provider, id) =>
           provider === model.provider && id === model.id ? { ...model } : undefined;
@@ -150,7 +161,7 @@ for (const stage of ["auth", "response"]) {
         const pending = session.extensionRunner.getCommand("recap").handler("", ctx);
         await entered.promise;
         let tree;
-        if (navigation === "sibling") {
+        if (navigation === "sibling" || navigation === "descendant") {
           tree = session.navigateTree(destination);
           await treeEntered.promise;
           assert.equal(manager.getLeafId(), destination);
@@ -165,7 +176,7 @@ for (const stage of ["auth", "response"]) {
         releaseWork.resolve();
         await pending;
         assert.equal(ownTree, false);
-        if (navigation === "sibling") {
+        if (navigation === "sibling" || navigation === "descendant") {
           assert.equal(reads, before, "stale continuations cannot reproject destination history");
           assert.equal(calls, stage === "response" ? 1 : 0);
           assert.deepEqual(widgets, []);

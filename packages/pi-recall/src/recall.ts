@@ -42,9 +42,12 @@ export function createRecallExtension(dependencies: Partial<RecallDependencies> 
         const branch = owner.getBranch();
         const leafId = owner.getLeafId();
         const branchIds = branch.map(({ id }) => id);
+        // Every entry that already exists at capture. Navigating into an existing descendant
+        // keeps the origin path as a prefix, so only genuinely new entries may extend it.
+        const existingIds = new Set(owner.getEntries().map(({ id }) => id));
         let retired = false;
         const isCurrent = () => {
-          retired ||= !(isSessionCurrent() && ownsBranch(owner, sessionId, leafId, branchIds));
+          retired ||= !(isSessionCurrent() && ownsBranch(owner, sessionId, leafId, branchIds, existingIds));
           return !retired;
         };
         if (!isCurrent()) throw new Error("Pi Recall session is no longer active.");
@@ -97,6 +100,7 @@ function ownsBranch(
   sessionId: string,
   leafId: string | null,
   branchIds: readonly string[],
+  existingIds: ReadonlySet<string>,
 ): boolean {
   try {
     const liveLeafId = owner.getLeafId();
@@ -108,7 +112,8 @@ function ownsBranch(
       owner.getSessionId() === sessionId &&
       (branchIds.at(-1) ?? null) === leafId &&
       (liveBranch.at(-1)?.id ?? null) === liveLeafId &&
-      branchIds.every((id, index) => liveBranch[index]?.id === id)
+      branchIds.every((id, index) => liveBranch[index]?.id === id) &&
+      liveBranch.slice(branchIds.length).every(({ id }) => !existingIds.has(id))
     );
   } catch {
     return false;

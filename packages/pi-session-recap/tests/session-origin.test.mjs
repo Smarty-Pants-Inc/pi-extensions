@@ -32,6 +32,33 @@ for (const boundary of ["sibling", "ancestor", "empty", "session", "invalid leaf
   });
 }
 
+test("navigating from an ancestor into a pre-existing descendant retires the recap origin", () => {
+  const manager = SessionManager.inMemory();
+  manager.appendMessage({ role: "user", content: "shared task", timestamp: 1 });
+  const origin = manager.appendCustomEntry("origin metadata");
+  const descendant = manager.appendCustomEntry("existing descendant metadata");
+  manager.branch(origin);
+  const isCurrent = captureSessionOrigin({ sessionManager: manager });
+  assert.equal(isCurrent(), true);
+  manager.branch(descendant);
+  assert.equal(isCurrent(), false);
+  manager.branch(origin);
+  assert.equal(isCurrent(), false);
+});
+
+test("a genuinely new append after an ancestor navigation remains current", () => {
+  const manager = SessionManager.inMemory();
+  manager.appendMessage({ role: "user", content: "shared task", timestamp: 1 });
+  const origin = manager.appendCustomEntry("origin metadata");
+  manager.appendCustomEntry("existing descendant metadata");
+  manager.branch(origin);
+  const isCurrent = captureSessionOrigin({ sessionManager: manager });
+  manager.appendCustomEntry("new append beside the descendant");
+  assert.equal(isCurrent(), true);
+  manager.appendMessage({ role: "user", content: "new message", timestamp: 2 });
+  assert.equal(isCurrent(), true);
+});
+
 test("ordinary message and metadata appends retain the complete recap opening prefix", () => {
   const manager = SessionManager.inMemory();
   manager.appendMessage({ role: "user", content: "opening", timestamp: 1 });
