@@ -17,7 +17,11 @@ import {
 import { test } from "vitest";
 import { parseCheckpointDetails } from "../src/checkpoint.js";
 import { createCodexCompactExtension } from "../src/codex-compact.js";
-import { type CodexCompactSettingsRuntime, DEFAULT_CODEX_COMPACT_SETTINGS } from "../src/settings.js";
+import {
+  CODEX_COMPACT_SETTINGS_FILE,
+  type CodexCompactSettingsRuntime,
+  createCodexCompactSettingsRuntime,
+} from "../src/settings.js";
 
 const model = {
   id: "gpt-5.6",
@@ -31,22 +35,6 @@ const model = {
   contextWindow: 100_000,
   maxTokens: 10_000,
 } as Model<"openai-codex-responses">;
-
-const runtime: CodexCompactSettingsRuntime = {
-  get: () => ({
-    kind: "loaded",
-    path: "unused",
-    settings: DEFAULT_CODEX_COMPACT_SETTINGS,
-    document: {},
-  }),
-  async reload() {
-    return this.get();
-  },
-  async update() {
-    throw new Error("Not used");
-  },
-  async flush() {},
-};
 
 function inspectTool(parameters = Type.Object({ path: Type.String({ description: "Path to inspect" }) })) {
   return {
@@ -67,13 +55,21 @@ async function withPreparedLoadout(
     pi: ExtensionAPI;
     remoteContexts: Context[];
     fetches: () => number;
+    providerFetches: () => number;
+    compactSettings: CodexCompactSettingsRuntime;
   }) => Promise<void>,
+  // Fixture-only stand-in for a user's persisted opt-in; product default stays false.
+  fixtureAuthorizesCanonicalHistory = true,
 ) {
   const directory = mkdtempSync(join(tmpdir(), "pi-codex-prepared-loadout-"));
   let session: AgentSession | undefined;
   try {
     let pi!: ExtensionAPI;
     let fetches = 0;
+    let providerFetches = 0;
+    // Real per-fixture settings file under the private mkdtemp directory.
+    const compactSettings = createCodexCompactSettingsRuntime(join(directory, CODEX_COMPACT_SETTINGS_FILE));
+    if (fixtureAuthorizesCanonicalHistory) await compactSettings.update({ allowCanonicalHistory: true });
     const remoteContexts: Context[] = [];
     const provider = openaiCodexProvider();
     // Real provider serialization/remote streaming, but no network or stored credentials.
@@ -101,6 +97,7 @@ async function withPreparedLoadout(
           ...options,
           transport: "sse",
           fetch: async () => {
+            providerFetches++;
             const item = {
               type: "message",
               id: "fixture-answer",
@@ -148,7 +145,7 @@ async function withPreparedLoadout(
             });
           }
           createCodexCompactExtension({
-            settingsRuntime: runtime,
+            settingsRuntime: compactSettings,
             fetch: async () => {
               fetches++;
               const item = { type: "compaction", encrypted_content: "opaque" };
@@ -187,7 +184,14 @@ async function withPreparedLoadout(
       pi.getAllTools().find((tool) => tool.name === "inspect")?.description,
       "real Pi prepareLoadout must alter the persisted declaration",
     );
-    await run({ session, pi, remoteContexts, fetches: () => fetches });
+    await run({
+      session,
+      pi,
+      remoteContexts,
+      fetches: () => fetches,
+      providerFetches: () => providerFetches,
+      compactSettings,
+    });
   } finally {
     session?.dispose();
     rmSync(directory, { recursive: true, force: true });
@@ -204,6 +208,27 @@ for (const loadout of ["prepared", "codemode on"] as const) {
       assert.deepEqual(getCurrentTools(remoteContexts[0].messages), declarations);
       assert.equal(remoteContexts[0].tools, undefined, "modern providers use only transcript declarations");
     });
+  });
+
+  test(`real Pi ${loadout} without canonical-history opt-in cancels compaction`, async () => {
+    await withPreparedLoadout(
+      loadout,
+      async ({ session, remoteContexts, fetches, providerFetches, compactSettings }) => {
+        assert.equal(compactSettings.get().kind, "missing", "no opt-in file is written");
+        assert.equal(compactSettings.get().settings.allowCanonicalHistory, false, "default stays false");
+        const baseline = providerFetches();
+        assert.ok(baseline >= 2, "normal setup prompts reach the fake provider seam");
+        await assert.rejects(session.compact(), /cancel/i);
+        assert.equal(fetches(), 0, "unconsented compaction must not reach remote dispatch");
+        assert.equal(remoteContexts.length, 0);
+        assert.equal(providerFetches(), baseline, "no native summary fallback may call the provider");
+        assert.equal(
+          session.sessionManager.getBranch().some((entry) => entry.type === "compaction"),
+          false,
+        );
+      },
+      false,
+    );
   });
 
   for (const change of ["added tool", "removed tool", "parameter schema", "parameter description"] as const) {
