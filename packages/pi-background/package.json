@@ -1,7 +1,7 @@
 {
   "name": "@signalridge/pi-background",
   "version": "1.3.0",
-  "description": "Session-owned background shell jobs and low-noise, event-driven log monitors for Pi.",
+  "description": "Observe and control session-owned background jobs with low-noise, event-driven log monitors for Pi; registers no model tool that starts a command.",
   "type": "module",
   "license": "MIT",
   "private": false,

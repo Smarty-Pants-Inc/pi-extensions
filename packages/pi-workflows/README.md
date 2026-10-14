@@ -180,6 +180,17 @@ checkpoints journal attempt identity without inventing a managed child, and a
 timed-out call journals its terminal failure after quiescence before returning
 recoverable `null`.
 
+There are two resume paths with different trust. A model-callable resume (the
+`workflow` tool) must pass a saved `name`, which is freshly resolved from disk;
+it does not execute the script source stored in the journal. A user-typed
+`/workflows resume <runId>` or navigator resume is a deliberate trusted action:
+it executes the script stored in the run's journal as-is, including inline
+source recorded before inline scripts were disabled. The existing provider-limit
+retry also uses stored source for an already-started run. Only resume a run
+whose stored script you trust. Workflow code runs in the owned Node helper,
+which inherits the parent environment and permissions; the `node:vm` realm is
+not a sandbox.
+
 ## Skills
 
 The package ships three model-routable skills:
@@ -231,7 +242,7 @@ workflow, and the review skill before accepting a topology or recovery change.
 
   `agentTimeoutMs` counts from the moment the host reports the agent left its
   queue, so waiting for a slot is never charged against the work.
-- `workflow_control`: `list`, `get`, `pause`, `stop`, or `rm` a run; `rm` writes a durable removal tombstone. Its `resume` action is refused because it would replay the stored script; use `/workflows resume` or the `workflow` tool with a saved `name`.
+- `workflow_control`: `list`, `get`, `pause`, `stop`, or `rm` a run; `rm` writes a durable removal tombstone. Its `resume` action is refused because it would replay the stored script; resume through the `workflow` tool with a saved `name`, or, as a trusted user action that replays the stored script, `/workflows resume` (see [Resume](#resume)).
 - `pi.events` emits `pi-workflows:runtime` snapshots (`{ runId, event }`) for phase, task, quality, retry, and nested-workflow progress; observer failures are contained.
 - `/workflows`: TUI navigator plus `run`, `status`, `watch`, `stop`, `pause`,
   `resume`, `rm`, `save <name> [runId]`, and `strength` subcommands.

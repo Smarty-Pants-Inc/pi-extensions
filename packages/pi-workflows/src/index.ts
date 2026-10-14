@@ -664,8 +664,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
       defineTool({
         name: "workflow_control",
         label: "Workflow Control",
-        description:
-          "List, inspect, pause, resume, stop, or remove workflow runs with bounded machine-readable output.",
+        description: "List, inspect, pause, stop, or remove workflow runs with bounded machine-readable output.",
         parameters: ControlSchema,
         renderCall(args, theme) {
           return new Text(
