@@ -20,7 +20,7 @@ import {
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { streamToOutputFile, writeInitialEntry } from "../src/output-file.js";
+import { ensureOutputFile, streamToOutputFile, writeInitialEntry } from "../src/output-file.js";
 import { registerFauxProvider } from "./helpers/pi-ai.js";
 
 const TURNS_BEFORE_COMPACT = 6;
@@ -39,6 +39,103 @@ describe("output-file streaming across a real compaction (#145)", () => {
     if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
     rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it.each(["custom-turn", "handled-input", "late-user"])("streams real %s records and retains the later follow-up", async (initialInput) => {
+    const cwd = tmp;
+    const faux = registerFauxProvider({ provider: "faux", models: [{ id: "faux-1", contextWindow: 200_000 }] });
+    const model = faux.getModel();
+    faux.setResponses([
+      fauxAssistantMessage([fauxText("USERLESS-ANSWER")]),
+      fauxAssistantMessage([fauxText("FOLLOW-UP-ANSWER")]),
+    ]);
+    const custom = { customType: "handled-input", content: "replacement context", display: false, details: { raw: "\u001b[31m" } };
+    const errors: string[] = [];
+    const loader = new DefaultResourceLoader({
+      cwd,
+      agentDir: getAgentDir(),
+      systemPromptOverride: () => "You are a test agent.",
+      appendSystemPromptOverride: () => [],
+      noExtensions: true,
+      noSkills: true,
+      noPromptTemplates: true,
+      noThemes: true,
+      noContextFiles: true,
+      extensionFactories: [(pi) => {
+        pi.on("input", async (event) => {
+          if (event.text !== "seeded prompt") return { action: "continue" };
+          // Actual extension input handling, not a fake event or fabricated history.
+          // Await the SDK operation so prompt() waits for the replacement turn.
+          await session.sendCustomMessage(custom, { triggerTurn: true });
+          return { action: "handled" };
+        });
+      }],
+    });
+    await loader.reload();
+    const modelRuntime = {
+      getAuth: async () => ({ ok: true, apiKey: "faux", headers: {} }),
+      streamSimple: (fauxModel, context, streamOptions) =>
+        compatStreamSimple(fauxModel, context, { ...streamOptions, apiKey: "faux" }),
+      getModel: () => model,
+      getModels: () => [model],
+      getAvailable: async () => [model],
+      hasConfiguredAuth: () => true,
+      isUsingOAuth: () => false,
+      getProviders: () => [],
+      getProvider: () => undefined,
+    } as unknown as ModelRuntime;
+    const { session } = await createAgentSession({
+      cwd, agentDir: getAgentDir(), model, modelRuntime, resourceLoader: loader,
+      sessionManager: SessionManager.inMemory(cwd),
+      settingsManager: SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } }),
+    });
+    await session.bindExtensions({ mode: "print", onError: (error) => { errors.push(error.error); } });
+    const outPath = join(tmp, "userless.output");
+    const seededPrompt = initialInput === "late-user" ? "ordinary prompt" : "seeded prompt";
+    writeInitialEntry(outPath, "agent-userless", seededPrompt, cwd);
+    const cleanup = streamToOutputFile(session, outPath, "agent-userless", cwd);
+    const readMessages = () => readFileSync(outPath, "utf-8").trim().split("\n")
+      .map((line) => (JSON.parse(line) as { message: unknown }).message);
+    try {
+      const dispositions: string[] = [];
+      if (initialInput === "handled-input") {
+        await session.prompt("seeded prompt", { preflightResult: (result) => { dispositions.push(result); } });
+        expect(dispositions).toEqual(["handled"]);
+      } else if (initialInput === "late-user") {
+        expect(session.messages).toEqual([]);
+        // Context-only guidance is legal before the initial native user. It must
+        // survive flushing without making that user's seeded entry duplicate.
+        await session.sendCustomMessage(custom, { triggerTurn: false });
+        await session.prompt(seededPrompt);
+      } else {
+        await session.sendCustomMessage(custom, { triggerTurn: true });
+      }
+      expect(errors).toEqual([]);
+      expect(session.messages.some((message) => message.role === "system")).toBe(true);
+      if (initialInput !== "late-user") expect(session.messages[0]?.role).toBe("system");
+      expect(session.messages.some((message) => message.role === "user")).toBe(initialInput === "late-user");
+      const initialUser = initialInput === "late-user" ? session.messages.find((message) => message.role === "user") : undefined;
+      const originalMessages = session.messages.filter((message) => message.role !== "system" && message !== initialUser);
+      // Compare the authoritative SDK payloads, including custom details/timestamps.
+      expect(readMessages().slice(1)).toEqual(originalMessages);
+      expect(JSON.stringify(originalMessages)).toContain("USERLESS-ANSWER");
+
+      await session.prompt("later follow-up");
+      cleanup();
+      expect(readMessages().slice(1)).toEqual(session.messages.filter((message) => message.role !== "system" && message !== initialUser));
+      expect(readMessages().filter((message) => (message as { role: string }).role === "user")).toEqual([
+        { role: "user", content: seededPrompt },
+        session.messages.find((message) => message.role === "user" && message !== initialUser),
+      ]);
+      expect(JSON.stringify(readMessages())).toContain("FOLLOW-UP-ANSWER");
+      const before = readFileSync(outPath, "utf-8");
+      await session.sendCustomMessage({ ...custom, content: "after disposal" });
+      cleanup();
+      expect(readFileSync(outPath, "utf-8")).toBe(before);
+    } finally {
+      cleanup();
+      session.dispose();
+    }
   });
 
   it("keeps writing post-compaction messages to the output file", async () => {
@@ -80,6 +177,8 @@ describe("output-file streaming across a real compaction (#145)", () => {
       agentDir,
       systemPromptOverride: () => "You are a test agent.",
       appendSystemPromptOverride: () => [],
+      noExtensions: true,
+      noSkills: true,
       noPromptTemplates: true,
       noThemes: true,
       noContextFiles: true,
@@ -115,43 +214,69 @@ describe("output-file streaming across a real compaction (#145)", () => {
     });
 
     const outPath = join(tmp, "agent.output");
-    writeInitialEntry(outPath, "agent-145", "repro", cwd);
-    const cleanup = streamToOutputFile(session as never, outPath, "agent-145", cwd);
+    writeInitialEntry(outPath, "agent-145", "question 0", cwd);
+    const cleanup = streamToOutputFile(session, outPath, "agent-145", cwd);
+    try {
+      const readEntries = () =>
+        readFileSync(outPath, "utf-8")
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line) as Record<string, unknown>);
 
-    const readEntries = () =>
-      readFileSync(outPath, "utf-8")
-        .trim()
-        .split("\n")
-        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      // Build up history, streaming as we go (turn_end fires per prompt).
+      for (let i = 0; i < TURNS_BEFORE_COMPACT; i++) {
+        await session.prompt(`question ${i}`);
+      }
+      const writtenBeforeCompact = readEntries().length;
+      expect(session.messages[0]?.role).toBe("system"); // installed SDK's native leading record
+      expect(writtenBeforeCompact).toBe(TURNS_BEFORE_COMPACT * 2); // prompt once, answer once per turn
+      expect(readEntries().some((entry) => (entry.message as { role: string }).role === "system")).toBe(false);
 
-    // Build up history, streaming as we go (turn_end fires per prompt).
-    for (let i = 0; i < TURNS_BEFORE_COMPACT; i++) {
-      await session.prompt(`question ${i}`);
+      const lenBefore = session.messages.length;
+      const result = await session.compact();
+      expect(result?.summary).toContain("summary"); // sanity: real compaction ran
+      // Sanity: compaction actually shrank the array — the exact condition that
+      // used to strand writtenCount past the end and halt streaming (#145).
+      expect(session.messages.length).toBeLessThan(lenBefore);
+
+      // The run continues after compaction...
+      await session.prompt("final question");
+      cleanup();
+
+      // The post-compaction turn reaches the output file...
+      const entries = readEntries();
+      const all = JSON.stringify(entries);
+      expect(all).toContain("final question");
+      expect(all).toContain("POST-COMPACTION-ANSWER");
+      // ...and re-anchoring didn't double-write the compaction-kept tail: every
+      // pre-compaction answer and user prompt still appears exactly once.
+      for (let i = 0; i < TURNS_BEFORE_COMPACT; i++) {
+        expect(all.split(`answer-${i} `).length - 1).toBe(1);
+        expect(all.split(`question ${i}`).length - 1).toBe(1);
+      }
+      expect(entries.length).toBe(writtenBeforeCompact + 2); // + final question + its answer
+
+      // Resume the real compacted session, preserving the file and not replaying
+      // its native system records, summary, kept tail, or prior run's user prompt.
+      const beforeResume = readFileSync(outPath, "utf-8");
+      ensureOutputFile(outPath);
+      expect(readFileSync(outPath, "utf-8")).toBe(beforeResume);
+      const resumeCleanup = streamToOutputFile(session, outPath, "agent-145", cwd, session.messages.length);
+      try {
+        await session.prompt("final question after resume");
+      } finally {
+        resumeCleanup();
+      }
+      const resumed = readEntries();
+      expect(readFileSync(outPath, "utf-8").startsWith(beforeResume)).toBe(true);
+      expect(resumed).toHaveLength(entries.length + 2);
+      expect(resumed.at(-2)?.type).toBe("user");
+      expect(JSON.stringify(resumed.at(-2)?.message)).toContain("final question after resume");
+      expect(resumed.at(-1)?.type).toBe("assistant");
+      expect(resumed.some((entry) => (entry.message as { role: string }).role === "system")).toBe(false);
+    } finally {
+      cleanup();
+      session.dispose();
     }
-    const writtenBeforeCompact = readEntries().length;
-    expect(writtenBeforeCompact).toBeGreaterThan(TURNS_BEFORE_COMPACT); // sanity: streaming worked pre-compaction
-
-    const lenBefore = session.messages.length;
-    const result = await session.compact();
-    expect(result?.summary).toContain("summary"); // sanity: real compaction ran
-    // Sanity: compaction actually shrank the array — the exact condition that
-    // used to strand writtenCount past the end and halt streaming (#145).
-    expect(session.messages.length).toBeLessThan(lenBefore);
-
-    // The run continues after compaction...
-    await session.prompt("final question");
-    cleanup();
-
-    // The post-compaction turn reaches the output file...
-    const entries = readEntries();
-    const all = JSON.stringify(entries);
-    expect(all).toContain("final question");
-    expect(all).toContain("POST-COMPACTION-ANSWER");
-    // ...and re-anchoring didn't double-write the compaction-kept tail: every
-    // pre-compaction answer still appears exactly once.
-    for (let i = 0; i < TURNS_BEFORE_COMPACT; i++) {
-      expect(all.split(`answer-${i} `).length - 1).toBe(1);
-    }
-    expect(entries.length).toBe(writtenBeforeCompact + 2); // + final question + its answer
   }, 30_000);
 });

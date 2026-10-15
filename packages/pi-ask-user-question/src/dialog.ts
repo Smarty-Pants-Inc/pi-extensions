@@ -14,7 +14,11 @@ import {
   wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import {
+  MAX_DESCRIPTION_LENGTH,
   MAX_FREE_TEXT_LENGTH,
+  MAX_HEADER_LENGTH,
+  MAX_LABEL_LENGTH,
+  MAX_QUESTION_LENGTH,
   type Question,
   type QuestionAnswer,
   type QuestionSelection,
@@ -49,6 +53,8 @@ export class QuestionDialog implements Focusable {
   private settled = false;
   private isFocused = false;
   private editorAnswerSelections: QuestionSelection[] = [];
+  private editorError: string | undefined;
+  private inputDraft: string | undefined;
 
   private readonly tui: TUI;
   private readonly theme: Theme;
@@ -74,7 +80,9 @@ export class QuestionDialog implements Focusable {
       selectList: getSelectListTheme(),
     };
     this.editor = new Editor(tui, this.editorTheme, { paddingX: 0 });
-    this.editor.onSubmit = (text) => this.submitOther(text);
+    // Restore only native submit trimming, not intentional transformations
+    // such as the backslash-Enter workaround. Use only public editor APIs.
+    this.editor.onSubmit = (text) => this.submitOther(this.inputDraft?.trim() === text ? this.inputDraft : text);
     this.beginQuestion();
   }
 
@@ -111,7 +119,12 @@ export class QuestionDialog implements Focusable {
         this.tui.requestRender();
         return;
       }
-      this.editor.handleInput(data);
+      this.inputDraft = this.editor.getExpandedText();
+      try {
+        this.editor.handleInput(data);
+      } finally {
+        this.inputDraft = undefined;
+      }
       this.tui.requestRender();
       return;
     }
@@ -169,8 +182,13 @@ export class QuestionDialog implements Focusable {
       add("No question is available.");
     } else {
       const progress = this.questions.length > 1 ? ` [${this.questionIndex + 1}/${this.questions.length}]` : "";
-      add(this.theme.bold(this.theme.fg("accent", `${question.header}${progress}`)));
-      for (const line of this.wrapLines(question.question, innerWidth)) add(this.theme.fg("text", line));
+      add(
+        this.theme.bold(
+          this.theme.fg("accent", `${sanitizeDisplayText(question.header, MAX_HEADER_LENGTH)}${progress}`),
+        ),
+      );
+      for (const line of this.wrapLines(sanitizeDisplayText(question.question, MAX_QUESTION_LENGTH), innerWidth))
+        add(this.theme.fg("text", line));
 
       if (this.editorMode) {
         add(this.theme.fg("dim", "Type your response, then press Enter to submit."));
@@ -178,6 +196,10 @@ export class QuestionDialog implements Focusable {
         const cursorLine = editorLines.findIndex((line) => line.includes(CURSOR_MARKER));
         focusLine = lines.length + Math.max(0, cursorLine);
         for (const line of editorLines) add(line);
+        if (this.editorError) {
+          focusLine = lines.length;
+          add(this.theme.fg("warning", this.editorError));
+        }
         add(this.theme.fg("dim", "Esc cancel"));
       } else {
         add(
@@ -195,10 +217,16 @@ export class QuestionDialog implements Focusable {
             if (!option) continue;
             const checked = question.multiSelect ? (this.selectedOptions.has(row.index) ? "[x] " : "[ ] ") : "";
             const marker = this.theme.fg(selected ? "accent" : "border", prefix);
-            const label = this.theme.fg(selected ? "accent" : "text", `${checked}${option.label}`);
+            const label = this.theme.fg(
+              selected ? "accent" : "text",
+              `${checked}${sanitizeDisplayText(option.label, MAX_LABEL_LENGTH)}`,
+            );
             for (const line of this.wrapLines(`${marker}${label}`, innerWidth)) add(line);
             if (option.description) {
-              for (const line of this.wrapLines(`    ${option.description}`, innerWidth))
+              for (const line of this.wrapLines(
+                `    ${sanitizeDisplayText(option.description, MAX_DESCRIPTION_LENGTH)}`,
+                innerWidth,
+              ))
                 add(this.theme.fg("muted", line));
             }
           } else {
@@ -247,6 +275,7 @@ export class QuestionDialog implements Focusable {
     const question = this.questions[this.questionIndex];
     if (!question) return;
     this.editorMode = false;
+    this.editorError = undefined;
     this.editor.focused = false;
     this.selectedOptions = new Set<number>();
     this.selectedRow = 0;
@@ -295,6 +324,7 @@ export class QuestionDialog implements Focusable {
     if (!question) return;
     this.editorAnswerSelections = [...this.selectedSelections()];
     this.editorMode = true;
+    this.editorError = undefined;
     this.editor.setText("");
     this.editor.focused = this.isFocused;
   }
@@ -302,8 +332,15 @@ export class QuestionDialog implements Focusable {
   private submitOther(text: string): void {
     const question = this.questions[this.questionIndex];
     if (!question) return;
-    const freeText = sanitizeDisplayText(text, MAX_FREE_TEXT_LENGTH);
-    if (!freeText) return;
+    if (text.length > MAX_FREE_TEXT_LENGTH) {
+      this.editorError = `Response exceeds ${MAX_FREE_TEXT_LENGTH} UTF-16 code units; shorten it and try again.`;
+      // Native Editor clears before onSubmit; keep the rejected draft editable.
+      this.editor.setText(text);
+      this.tui.requestRender();
+      return;
+    }
+    if (!text.trim()) return;
+    const freeText = text;
     const answer: QuestionAnswer = {
       id: question.id,
       header: question.header,

@@ -22,7 +22,7 @@ test("registers one sequential tool with model guidance and bounded schema", () 
   assert.equal(ASK_USER_QUESTION_PARAMETERS.properties.questions.maxItems, 4);
 });
 
-test("normalizes defaults, trims display text, and rejects malformed batches", () => {
+test("normalizes defaults, preserves raw fields for display copies, and rejects malformed batches", () => {
   const normalized = normalizeQuestions({
     questions: [
       {
@@ -36,10 +36,10 @@ test("normalizes defaults, trims display text, and rejects malformed batches", (
     assert.deepEqual(normalized.questions[0], {
       id: "question-1",
       header: "Question 1",
-      question: "Choose now",
+      question: "  Choose  \u001b[31mnow\u001b[0m  ",
       options: [
-        { label: "A", value: "A" },
-        { label: "B", value: "b" },
+        { label: " A ", value: " A " },
+        { label: " B ", value: " b " },
       ],
       multiSelect: false,
       allowOther: true,

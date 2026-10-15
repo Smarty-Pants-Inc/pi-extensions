@@ -75,6 +75,8 @@ Then reference it in your settings:
 
 These tools are optional. If any are missing, the widget shows one warning per extension load in TUI mode, but `/readfiles` still opens. Without `bat`, files display as plain text with line numbers. Without `delta`, diffs use raw Git output (`git` is needed for Git status and diffs). Without `glow`, Markdown displays as source text, highlighted by `bat` when available. Installed tools continue to provide their richer rendering.
 
+The browser is TUI-only. Retained browser callbacks and polling retire their resources when the live context leaves TUI mode or loses UI access, even before this extension's next session handler runs. Retirement does not close a replacement UI or send comments, notifications, or Git requests.
+
 ## Commands
 
 - `/readfiles` - open the file browser in the current directory

@@ -271,8 +271,8 @@ export function createMockContext(overrides: Record<string, unknown> = {}) {
 
   const ctx = {
     cwd: overrides.cwd ?? process.cwd(),
-    mode: overrides.mode ?? (overrides.hasUI ? "tui" : undefined),
-    hasUI: overrides.hasUI ?? (overrides.mode === "tui" || overrides.mode === "rpc"),
+    mode: overrides.mode ?? "tui",
+    hasUI: overrides.hasUI ?? (overrides.mode === undefined || overrides.mode === "tui" || overrides.mode === "rpc"),
     model: overrides.model,
     ui: {
       notify(message: string, level?: string) {

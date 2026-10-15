@@ -95,17 +95,32 @@ export function streamToOutputFile(
   cwd: string,
   startIndex?: number,
 ): () => void {
-  // Index of the first message this stream is responsible for. A spawn writes
-  // messages[0] as the initial prompt entry, so it starts at 1. A resume hands
-  // in the session's length as of just before the run: the session already
-  // holds every prior turn, and re-emitting those would duplicate history that
-  // is already in the file.
-  let writtenCount = startIndex ?? 1;
+  if (startIndex !== undefined && (!Number.isSafeInteger(startIndex) || startIndex < 0)) {
+    throw new RangeError("startIndex must be a nonnegative safe integer");
+  }
+  // A resume supplies the index past history already on disk. A fresh spawn
+  // has seeded its prompt separately, but Pi may add the actual user later or
+  // handle the input via a custom-message turn with no user at all. Dedup is
+  // independent of the cursor so legitimate pre-user records still stream.
+  let writtenCount = startIndex ?? 0;
+  let initialUserPending = startIndex === undefined;
+  let disposed = false;
 
   const flush = () => {
+    if (disposed) return;
     const messages = session.messages;
     while (writtenCount < messages.length) {
-      const msg = messages[writtenCount];
+      const msg = messages[writtenCount++];
+      // Native prompt/tool-loadout records have no Claude Code transcript entry.
+      if (msg.role === "system") continue;
+      if (initialUserPending && msg.role === "user") {
+        initialUserPending = false;
+        continue;
+      }
+      // An actual assistant response proves a turn ran without the seeded user.
+      // Its later follow-up must be kept, even if both reach the same flush.
+      // Custom guidance alone is not that evidence: the user can still arrive.
+      if (msg.role === "assistant") initialUserPending = false;
       const entry = {
         isSidechain: true,
         agentId,
@@ -117,11 +132,11 @@ export function streamToOutputFile(
       try {
         appendFileSync(path, JSON.stringify(entry) + "\n", "utf-8");
       } catch { /* ignore write errors */ }
-      writtenCount++;
     }
   };
 
   const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
+    if (disposed) return;
     if (event.type === "turn_end") flush();
     // Compaction replaces session.messages with a shorter, summarized array,
     // leaving writtenCount past the new end — without re-anchoring, the flush
@@ -135,12 +150,16 @@ export function streamToOutputFile(
     // session.messages untouched, so only successful ones re-anchor.
     if (event.type === "compaction_start") flush();
     if (event.type === "compaction_end" && !event.aborted && event.result) {
-      queueMicrotask(() => { writtenCount = session.messages.length; });
+      queueMicrotask(() => {
+        if (!disposed) writtenCount = session.messages.length;
+      });
     }
   });
 
   return () => {
+    if (disposed) return;
     flush();
+    disposed = true;
     unsubscribe();
   };
 }

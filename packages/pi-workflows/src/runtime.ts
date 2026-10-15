@@ -3,7 +3,8 @@
  *
  * A workflow is a raw JavaScript module. The runtime parses it under an acorn
  * gate (deterministic literal `export const meta` first, no nondeterministic
- * builtins), then executes the body inside a `node:vm` realm with a bounded set
+ * builtins), then executes the body/callbacks in an owned Node helper's vm realm
+ * with validated IPC proxies to the parent-owned bounded set
  * of orchestration globals (`agent`, `parallel`, `pipeline`, `workflow`,
  * quality/control helpers, `phase`, `log`, `args`, `cwd`, restricted
  * `process`, `budget`). The vm is a determinism guardrail, not a security
@@ -20,7 +21,6 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
-import vm from "node:vm";
 import type { ManagedRoutingPolicy } from "@signalridge/pi-subagents-protocol";
 import { agentTierPolicyIdentity, isManagedAgentTier } from "@signalridge/pi-subagents-protocol";
 import { parse } from "acorn";
@@ -40,6 +40,7 @@ import {
   type WorkflowStrength,
   type WorkflowStrengthTable,
 } from "./strengths.js";
+import { executeOwnedVm } from "./vm-helper.js";
 
 // ── Meta contract ────────────────────────────────────────────────────────────
 
@@ -122,6 +123,11 @@ export interface WorkflowAgentRunner {
 
 export interface AgentRunOptions {
   label?: string;
+  /** Observation-only scope; never part of call hashing or dispatch policy. */
+  graphId?: string;
+  taskKey?: string;
+  taskId?: string;
+  phase?: string;
   sessionName?: string;
   /** Plain JSON Schema the result must satisfy; the runtime parses+validates client-side. */
   schema?: unknown;
@@ -211,6 +217,10 @@ export interface CheckpointOptions {
 
 export interface WorkflowRuntimeEvent {
   type: "phase" | "workflow" | "quality" | "control-attempt" | "task";
+  /** Resolver-proven source classification for nested workflow observations. */
+  sourceKind?: "saved" | "inline";
+  /** Observation-only frame-scoped hash of the exact attributed phase title. */
+  phaseKey?: string;
   [key: string]: unknown;
 }
 
@@ -290,6 +300,8 @@ export interface WorkflowRunOptions {
   agentTimeoutMs?: number | null;
   runId?: string;
   resumeJournal?: Map<string, JournalEntry>;
+  /** Accepted parent-frame nested generation watermarks, independent of replay eligibility. */
+  resumeWorkflowGenerations?: ReadonlyMap<number, number>;
   resumeFromRunId?: string;
   toolset?: string;
   excludeTools?: string[];
@@ -303,14 +315,23 @@ export interface WorkflowRunOptions {
   /** Resolve a nested `workflow(name)` reference to the script it names. */
   loadSavedWorkflow?: (name: string) => string | undefined;
   confirm?: (promptText: string, options: CheckpointOptions, signal?: AbortSignal) => Promise<unknown>;
-  onLog?: (message: string) => void;
+  onLog?: (message: string, scope?: { frameId: string }) => void;
   onPhase?: (title: string) => void;
   onRuntimeEvent?: (event: WorkflowRuntimeEvent) => void;
   onAgentStart?: (event: {
     id: string;
     label: string;
     phase?: string;
+    /** Observation-only exact title identity, scoped to this call's frame. */
+    phaseKey?: string;
     prompt: string;
+    frameId?: string;
+    callIndex?: number;
+    agentType?: string;
+    replayed?: boolean;
+    graphId?: string;
+    taskKey?: string;
+    taskId?: string;
     model?: string;
     tier?: string;
   }) => void;
@@ -318,6 +339,7 @@ export interface WorkflowRunOptions {
     id: string;
     label: string;
     phase?: string;
+    phaseKey?: string;
     tier?: string;
     result: unknown;
     tokens?: number;
@@ -391,6 +413,45 @@ export const MAX_AGENT_RETRIES = 3;
  */
 export const DEFAULT_AGENT_TIMEOUT_MS: number | null = 1_800_000;
 export const MAX_SCRIPT_SYNC_MS = 1_000;
+/** Identities are retained verbatim, never clipped like display text. */
+export const MAX_RUNTIME_IDENTITY_LENGTH = 2_048;
+const MAX_ROOT_FRAME_LENGTH = 1_024;
+const MAX_EXECUTION_NONCE_LENGTH = 512;
+const MAX_WORKFLOW_GENERATION = 1_000_000;
+
+function validateRuntimeIdentity(value: string, label: string, limit: number): void {
+  if (typeof value !== "string" || value.length === 0 || value.length > limit) {
+    throw new WorkflowError(
+      `${label} must be a non-empty identity of at most ${limit} characters`,
+      WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+      { recoverable: false },
+    );
+  }
+}
+
+function copyWorkflowGenerations(values?: ReadonlyMap<number, number>): Map<number, number> {
+  const generations = new Map<number, number>();
+  for (const [index, generation] of values ?? []) {
+    if (
+      !Number.isInteger(index) ||
+      index < 0 ||
+      index >= MAX_CALLS_PER_WORKFLOW ||
+      !Number.isInteger(generation) ||
+      generation < 1 ||
+      generation > MAX_WORKFLOW_GENERATION
+    ) {
+      throw new WorkflowError(
+        "Invalid nested workflow generation watermark",
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        {
+          recoverable: false,
+        },
+      );
+    }
+    generations.set(index, generation);
+  }
+  return generations;
+}
 
 // ── Determinism guardrail ────────────────────────────────────────────────────
 
@@ -895,7 +956,8 @@ export function normalizeMaxAgents(value: unknown): number {
 export function normalizeAgentTimeout(value: unknown): number | null {
   if (value === null) return null;
   if (value === undefined) return DEFAULT_AGENT_TIMEOUT_MS;
-  if (typeof value !== "number" || !Number.isFinite(value) || value < 1) return DEFAULT_AGENT_TIMEOUT_MS;
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 1 || value > 2_147_483_647)
+    return DEFAULT_AGENT_TIMEOUT_MS;
   return Math.floor(value);
 }
 
@@ -1028,7 +1090,10 @@ function validateValue(value: unknown, schema: SchemaNode, path: string): string
   if (type !== undefined) {
     const types = Array.isArray(type) ? type : [type];
     const typeOf = (v: unknown): string => (v === null ? "null" : Array.isArray(v) ? "array" : typeof v);
-    if (!types.includes(typeOf(value))) {
+    const matches = types.some((expected) =>
+      expected === "integer" ? typeof value === "number" && Number.isInteger(value) : expected === typeOf(value),
+    );
+    if (!matches) {
       errors.push(`${path}: expected type ${types.join("/")}, got ${typeOf(value)}`);
       return errors;
     }
@@ -1228,7 +1293,13 @@ export interface WorkflowRuntimeBindings {
 /** Fan-out cancellation scope: parallel()/pipeline() batches mark themselves. */
 const fanoutScope = new AsyncLocalStorage<{ cancelled: boolean }>();
 /** Task-local phase attribution for named orchestration callbacks. */
-const orchestrationScope = new AsyncLocalStorage<{ taskId: string; phase?: string }>();
+const orchestrationScope = new AsyncLocalStorage<{
+  frameId: string;
+  graphId: string;
+  taskKey: string;
+  taskId: string;
+  phase?: string;
+}>();
 
 // ── The run ──────────────────────────────────────────────────────────────────
 
@@ -1237,10 +1308,24 @@ export async function runWorkflow<T = unknown>(
   options: WorkflowRunOptions = {},
 ): Promise<WorkflowRunResult<T>> {
   const started = Date.now();
+  // Each frame owns cancellation, even when a parent catches a nested failure.
+  const frameController = new AbortController();
+  options = {
+    ...options,
+    signal: options.signal ? AbortSignal.any([options.signal, frameController.signal]) : frameController.signal,
+  };
   const { meta, body } = parseWorkflowScript(script);
   const maxAgents = normalizeMaxAgents(options.maxAgents ?? MAX_AGENTS_PER_RUN);
   const agentTimeoutMs = normalizeAgentTimeout(options.agentTimeoutMs);
   const runId = options.runId ?? `run-${started.toString(36)}`;
+  // Reserve room for the one supported child level, nonce and graph/call suffixes.
+  validateRuntimeIdentity(
+    runId,
+    "runId",
+    options.workflowDepth ? MAX_RUNTIME_IDENTITY_LENGTH - 64 : MAX_ROOT_FRAME_LENGTH,
+  );
+  if (options.executionNonce !== undefined)
+    validateRuntimeIdentity(options.executionNonce, "executionNonce", MAX_EXECUTION_NONCE_LENGTH);
   const baseCwd = options.cwd ?? process.cwd();
   // The host's catalogue, known before the first call. A script cannot name a
   // tier, so this is not a typo check: it is what the strength table is resolved
@@ -1260,7 +1345,7 @@ export async function runWorkflow<T = unknown>(
     currentPhase: meta.phases?.[0]?.title,
     phaseBudgets: new Map(),
     callSeq: 0,
-    workflowGenerations: new Map(),
+    workflowGenerations: copyWorkflowGenerations(options.resumeWorkflowGenerations),
     firstMiss: Number.POSITIVE_INFINITY,
   };
 
@@ -1294,7 +1379,7 @@ export async function runWorkflow<T = unknown>(
   const log = (message: unknown) => {
     const text = String(message);
     state.logs.push(text);
-    options.onLog?.(text);
+    options.onLog?.(text, { frameId: runId });
   };
   if (concurrencyClampNotice !== undefined) log(concurrencyClampNotice);
 
@@ -1384,13 +1469,38 @@ export async function runWorkflow<T = unknown>(
     );
   };
 
+  let graphSequence = 0;
+  let helperSequence = 0;
   const emitRuntimeEvent = (event: WorkflowRuntimeEvent): void => {
     try {
-      options.onRuntimeEvent?.(event);
+      const scope = orchestrationScope.getStore();
+      options.onRuntimeEvent?.(
+        structuredClone({
+          // Origin task scope can belong to the parent; emission frame cannot.
+          ...(scope ? { graphId: scope.graphId, taskKey: scope.taskKey, taskId: scope.taskId } : {}),
+          ...event,
+          // A child's forwarded events must never look like its parent's phase.
+          frameId: runId,
+          runId,
+        }),
+      );
     } catch {
       // Runtime observers are diagnostic surfaces and must not change execution.
     }
   };
+
+  // Observation identity is independent of bounded display text and call hashing.
+  const phaseObservation = (title: string | undefined) => ({
+    phase: title,
+    phaseKey:
+      title === undefined
+        ? undefined
+        : createHash("sha256")
+            .update(JSON.stringify([runId, title]))
+            .digest("hex"),
+  });
+  const taskObservation = (scope: ReturnType<typeof orchestrationScope.getStore>) =>
+    scope ? { graphId: scope.graphId, taskKey: scope.taskKey, taskId: scope.taskId } : {};
 
   const phase = (title: string, phaseOptions?: { budget?: number }) => {
     state.currentPhase = title;
@@ -1404,6 +1514,7 @@ export async function runWorkflow<T = unknown>(
     emitRuntimeEvent({
       type: "phase",
       title,
+      phaseKey: phaseObservation(title).phaseKey,
       budget: typeof phaseOptions?.budget === "number" && phaseOptions.budget > 0 ? phaseOptions.budget : null,
     });
   };
@@ -1489,6 +1600,8 @@ export async function runWorkflow<T = unknown>(
     // synchronously, before suspending on the limiter below.
     const batch = fanoutScope.getStore();
 
+    // Preserve inherited phase attribution (and therefore existing call hashes)
+    // across nested frames; a task key names its origin graph, not the call's frame.
     const taskScope = orchestrationScope.getStore();
     const assignedPhase = agentOptions.phase ?? taskScope?.phase ?? state.currentPhase;
 
@@ -1538,6 +1651,13 @@ export async function runWorkflow<T = unknown>(
     const deltaKey = `${runId}:${callIndex}`;
 
     const label = requestedLabel || defaultAgentLabel(assignedPhase, shared.agentCount + 1);
+    const observation = {
+      frameId: runId,
+      callIndex,
+      agentType: agentOptions.agentType ?? "general-purpose",
+      ...phaseObservation(assignedPhase),
+      ...taskObservation(taskScope),
+    };
 
     // Longest-unchanged-prefix resume: replay a cached result only while the
     // prefix is still intact. Once any call misses, it AND everything after it
@@ -1556,6 +1676,8 @@ export async function runWorkflow<T = unknown>(
       const replayTier = cached.tier ?? effectiveTier;
       options.onAgentStart?.({
         id: deltaKey,
+        ...observation,
+        replayed: true,
         label,
         phase: assignedPhase,
         prompt: promptText,
@@ -1564,7 +1686,7 @@ export async function runWorkflow<T = unknown>(
       options.onAgentEnd?.({
         id: deltaKey,
         label,
-        phase: assignedPhase,
+        ...phaseObservation(assignedPhase),
         tier: replayTier,
         result: cached.result,
         tokens: 0,
@@ -1616,12 +1738,15 @@ export async function runWorkflow<T = unknown>(
       throwIfAborted();
       if (batch?.cancelled) throw agentLimitError();
 
-      const timeout = agentOptions.timeoutMs !== undefined ? agentOptions.timeoutMs : agentTimeoutMs;
+      const timeout =
+        agentOptions.timeoutMs !== undefined ? normalizeAgentTimeout(agentOptions.timeoutMs) : agentTimeoutMs;
       const retryAttempts = normalizeAgentRetries(agentOptions.retries ?? options.agentRetries ?? 0);
       const maxAttempts = retryAttempts + 1;
 
       options.onAgentStart?.({
         id: deltaKey,
+        ...observation,
+        replayed: false,
         label,
         phase: assignedPhase,
         prompt: promptText,
@@ -1637,7 +1762,7 @@ export async function runWorkflow<T = unknown>(
       // failed attempt does not double-count the next one.
       let usage: AgentUsage | undefined;
       const recordTokens = (result: unknown): number => {
-        const tokens = usage && usage.total > 0 ? usage.total : estimateTokens(result) + estimateTokens(promptText);
+        const tokens = usage === undefined ? estimateTokens(result) + estimateTokens(promptText) : usage.total;
         if (usage) {
           shared.tokenUsage.input += usage.input;
           shared.tokenUsage.output += usage.output;
@@ -1699,6 +1824,10 @@ export async function runWorkflow<T = unknown>(
             let restartTimeout: (() => void) | undefined;
             const runPromise = agentRunner.run(promptText + schemaInstruction + repairFeedback, {
               label,
+              phase: assignedPhase,
+              ...(taskScope
+                ? { graphId: taskScope.graphId, taskKey: taskScope.taskKey, taskId: taskScope.taskId }
+                : {}),
               sessionName: agentOptions.thread
                 ? `workflow:${runId} thread:${agentOptions.thread}`
                 : `workflow:${runId} ${label}`,
@@ -1709,7 +1838,10 @@ export async function runWorkflow<T = unknown>(
               agentType: agentOptions.agentType,
               isolation: resolvedIsolation,
               toolset: options.toolset ?? agentOptions.toolset,
-              excludeTools: options.excludeTools ?? agentOptions.excludeTools,
+              excludeTools:
+                options.excludeTools === undefined && agentOptions.excludeTools === undefined
+                  ? undefined
+                  : [...new Set([...(options.excludeTools ?? []), ...(agentOptions.excludeTools ?? [])])],
               runId,
               callIndex,
               callHash,
@@ -1800,7 +1932,7 @@ export async function runWorkflow<T = unknown>(
             options.onAgentEnd?.({
               id: deltaKey,
               label,
-              phase: assignedPhase,
+              ...phaseObservation(assignedPhase),
               result,
               tier: resolvedTier,
               tokens,
@@ -1842,7 +1974,7 @@ export async function runWorkflow<T = unknown>(
             options.onAgentEnd?.({
               id: deltaKey,
               label,
-              phase: assignedPhase,
+              ...phaseObservation(assignedPhase),
               result: null,
               tier: resolvedTier,
               tokens,
@@ -1973,11 +2105,20 @@ export async function runWorkflow<T = unknown>(
   const orchestrate = async (rawTasks: unknown, rawOptions?: unknown): Promise<OrchestrationResult> => {
     throwIfAborted();
     const normalized = normalizeOrchestration(rawTasks, rawOptions);
+    const graphId = `${runId}:graph-${++graphSequence}`;
+    const taskKeys = new Map(normalized.tasks.map((task, index) => [task.id, `${graphId}:task-${index}`]));
     const tasks = normalized.tasks.map((task) => ({
       ...task,
       run: (context: OrchestrationTaskContext) =>
-        orchestrationScope.run({ taskId: task.id, ...(task.phase === undefined ? {} : { phase: task.phase }) }, () =>
-          task.run(context),
+        orchestrationScope.run(
+          {
+            frameId: runId,
+            graphId,
+            taskKey: taskKeys.get(task.id) ?? "",
+            taskId: task.id,
+            ...(task.phase === undefined ? {} : { phase: task.phase }),
+          },
+          () => task.run(context),
         ),
     }));
     return executeOrchestration(tasks, normalized.options, {
@@ -1988,7 +2129,15 @@ export async function runWorkflow<T = unknown>(
         return !workflowError.recoverable || workflowError.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT;
       },
       formatError: (error: unknown) => wrapError(error).message,
-      onEvent: emitRuntimeEvent,
+      onEvent: (event) => {
+        const task = normalized.tasks.find((candidate) => candidate.id === event.taskId);
+        emitRuntimeEvent({
+          ...event,
+          graphId,
+          taskKey: taskKeys.get(event.taskId),
+          ...(task?.description === undefined ? {} : { description: task.description }),
+        });
+      },
     });
   };
 
@@ -2005,8 +2154,18 @@ export async function runWorkflow<T = unknown>(
       });
     }
     const callIndex = nextCallIndex();
-    const childScript = options.loadSavedWorkflow?.(String(nameOrScript)) ?? String(nameOrScript);
+    const taskScope = orchestrationScope.getStore();
+    const workflowPhase = taskScope?.phase ?? state.currentPhase;
     const workflowName = String(nameOrScript);
+    const savedScript = options.loadSavedWorkflow?.(workflowName);
+    const childScript = savedScript ?? workflowName;
+    const observation = {
+      ...phaseObservation(workflowPhase),
+      ...taskObservation(taskScope),
+      // Classify the resolver result, never source syntax or display text.
+      sourceKind: savedScript === undefined ? ("inline" as const) : ("saved" as const),
+      name: savedScript === undefined ? "nested workflow" : workflowName,
+    };
     const argsPresent = childArgs !== undefined;
     const callHash = hashIdentity({
       kind: "workflow",
@@ -2026,17 +2185,41 @@ export async function runWorkflow<T = unknown>(
     });
     const cached = options.resumeJournal?.get(`${runId}:${callIndex}`);
     if (cached != null && cached.hash === callHash && callIndex < state.firstMiss) {
-      state.workflowGenerations.set(callIndex, cached.generation ?? 1);
+      state.workflowGenerations.set(
+        callIndex,
+        Math.max(state.workflowGenerations.get(callIndex) ?? 0, cached.generation ?? 1),
+      );
       if (cached.storeDelta) store.applyDelta(cached.storeDelta);
       const replayedAgentCount = cached.agentCount ?? 0;
       shared.agentCount += replayedAgentCount;
       frameAgentCount += replayedAgentCount;
+      emitRuntimeEvent({
+        type: "workflow",
+        stage: "replay",
+        ...observation,
+        callIndex,
+        replayedAgentCount,
+      });
       return cached.result;
     }
     if (cached == null || cached.hash !== callHash) state.firstMiss = Math.min(state.firstMiss, callIndex);
-    const generation = (state.workflowGenerations.get(callIndex) ?? cached?.generation ?? 0) + 1;
+    const generation = Math.max(state.workflowGenerations.get(callIndex) ?? 0, cached?.generation ?? 0) + 1;
+    if (generation > MAX_WORKFLOW_GENERATION) {
+      throw new WorkflowError("Nested workflow generation limit exceeded", WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, {
+        recoverable: false,
+      });
+    }
     state.workflowGenerations.set(callIndex, generation);
-    emitRuntimeEvent({ type: "workflow", stage: "start", name: workflowName, args: childArgs });
+    const childFrameId = `${runId}-nested-call-${callIndex}-g${generation}${options.executionNonce ? `-${options.executionNonce}` : ""}`;
+    emitRuntimeEvent({
+      type: "workflow",
+      stage: "start",
+      ...observation,
+      args: childArgs,
+      callIndex,
+      childFrameId,
+    });
+    let outcome: "completed" | "failed" | "cancelled" = "failed";
     try {
       const childDeltas = new Map<number, Record<string, unknown>>();
       const child = await runWorkflow(childScript, {
@@ -2049,6 +2232,8 @@ export async function runWorkflow<T = unknown>(
         // call results here would duplicate nested calls and make the synthetic
         // parent journal entry ambiguous.
         resumeJournal: undefined,
+        // These watermarks belong to the parent lexical namespace only.
+        resumeWorkflowGenerations: undefined,
         resumeFromRunId: undefined,
         onWorkflowJournal: undefined,
         onAgentJournal: (entry) => {
@@ -2060,7 +2245,7 @@ export async function runWorkflow<T = unknown>(
         // The call index + generation keeps changed nested calls distinct across
         // resume. The engine nonce additionally fences an interrupted child whose
         // result was never durable before a process/branch restart.
-        runId: `${runId}-nested-call-${callIndex}-g${generation}${options.executionNonce ? `-${options.executionNonce}` : ""}`,
+        runId: childFrameId,
       });
       const normalizedChildResult = child.result === undefined ? null : child.result;
       const storeDelta: Record<string, unknown> = {};
@@ -2079,13 +2264,50 @@ export async function runWorkflow<T = unknown>(
         agentCount: child.agentCount,
         ...(Object.keys(storeDelta).length > 0 ? { storeDelta } : {}),
       });
+      outcome = "completed";
       return normalizedChildResult;
     } finally {
-      emitRuntimeEvent({ type: "workflow", stage: "end", name: workflowName, args: childArgs });
+      if (isAborted()) outcome = "cancelled";
+      emitRuntimeEvent({
+        type: "workflow",
+        stage: "end",
+        ...observation,
+        args: childArgs,
+        callIndex,
+        childFrameId,
+        outcome,
+      });
     }
   };
 
   // ── Quality-pattern stdlib ──────────────────────────────────────────────────
+
+  const observeQuality = async <T>(helper: string, run: () => Promise<T>): Promise<T> => {
+    const helperId = `${runId}:helper-${++helperSequence}`;
+    emitRuntimeEvent({ type: "quality", stage: "start", helper, helperId });
+    let outcome: "completed" | "failed" | "cancelled" = "failed";
+    let accepted: boolean | undefined;
+    try {
+      const value = await run();
+      outcome = "completed";
+      if (value && typeof value === "object") {
+        const verdict = value as Record<string, unknown>;
+        if (typeof verdict.real === "boolean") accepted = verdict.real;
+        if (typeof verdict.complete === "boolean") accepted = verdict.complete;
+      }
+      return value;
+    } finally {
+      if (isAborted()) outcome = "cancelled";
+      emitRuntimeEvent({
+        type: "quality",
+        stage: "end",
+        helper,
+        helperId,
+        outcome,
+        ...(accepted === undefined ? {} : { accepted }),
+      });
+    }
+  };
 
   const VERIFY_SCHEMA = {
     type: "object",
@@ -2101,33 +2323,34 @@ export async function runWorkflow<T = unknown>(
     total: number;
     votes: Array<{ real: boolean; reason?: string }>;
   }> => {
-    emitRuntimeEvent({ type: "quality", stage: "start", helper: "verify" });
-    const reviewers = Math.max(1, opts.reviewers ?? 2);
-    const threshold = opts.threshold ?? 0.5;
-    const lenses = opts.lens ? (Array.isArray(opts.lens) ? opts.lens : [opts.lens]) : [];
-    const claim = typeof item === "string" ? item : JSON.stringify(item);
-    const votes = (
-      await parallel(
-        Array.from(
-          { length: reviewers },
-          (_v, i) => () =>
-            agent(
-              `Adversarially review whether the following is REAL/correct. Try to refute it; default to real=false if unsure.${lenses.length ? ` Focus lens: ${lenses[i % lenses.length]}.` : ""}\n\n${claim}`,
-              // Defaults low: numerous, narrow, and aggregated by the vote
-              // below, which is what carries the gate rather than any single
-              // reviewer's depth. A caller who wants a deeper gate says so.
-              { label: `verify ${i + 1}`, strength: opts.strength ?? "low", schema: VERIFY_SCHEMA },
-            ),
-        ),
-      )
-    ).filter(Boolean) as Array<{ real?: boolean; reason?: string }>;
-    const realCount = votes.filter((v) => v?.real).length;
-    return {
-      real: votes.length > 0 && realCount / votes.length >= threshold,
-      realCount,
-      total: votes.length,
-      votes: votes.map((v) => ({ real: Boolean(v?.real), reason: v?.reason })),
-    };
+    return observeQuality("verify", async () => {
+      const reviewers = Math.max(1, opts.reviewers ?? 2);
+      const threshold = opts.threshold ?? 0.5;
+      const lenses = opts.lens ? (Array.isArray(opts.lens) ? opts.lens : [opts.lens]) : [];
+      const claim = typeof item === "string" ? item : JSON.stringify(item);
+      const votes = (
+        await parallel(
+          Array.from(
+            { length: reviewers },
+            (_v, i) => () =>
+              agent(
+                `Adversarially review whether the following is REAL/correct. Try to refute it; default to real=false if unsure.${lenses.length ? ` Focus lens: ${lenses[i % lenses.length]}.` : ""}\n\n${claim}`,
+                // Defaults low: numerous, narrow, and aggregated by the vote
+                // below, which is what carries the gate rather than any single
+                // reviewer's depth. A caller who wants a deeper gate says so.
+                { label: `verify ${i + 1}`, strength: opts.strength ?? "low", schema: VERIFY_SCHEMA },
+              ),
+          ),
+        )
+      ).filter(Boolean) as Array<{ real?: boolean; reason?: string }>;
+      const realCount = votes.filter((v) => v?.real).length;
+      return {
+        real: votes.length > 0 && realCount / votes.length >= threshold,
+        realCount,
+        total: votes.length,
+        votes: votes.map((v) => ({ real: Boolean(v?.real), reason: v?.reason })),
+      };
+    });
   };
 
   const JUDGE_SCHEMA = {
@@ -2141,58 +2364,53 @@ export async function runWorkflow<T = unknown>(
   ): Promise<
     { index: number; attempt: unknown; score: number; judgments: Array<{ score: number; reason?: string }> } | undefined
   > => {
-    emitRuntimeEvent({ type: "quality", stage: "start", helper: "judgePanel" });
-    if (!Array.isArray(attempts) || attempts.length === 0) {
-      emitRuntimeEvent({ type: "quality", stage: "end", helper: "judgePanel" });
-      return undefined;
-    }
-    const judges = Math.min(16, Math.max(1, Math.floor(opts.judges ?? 3)));
-    const rubric = opts.rubric ?? "overall quality and correctness";
-    const scored = (
-      await parallel(
-        (Array.isArray(attempts) ? attempts : []).map((att, idx) => async () => {
-          const text = typeof att === "string" ? att : JSON.stringify(att);
-          const js = (
-            await parallel(
-              Array.from(
-                { length: judges },
-                (_v, j) => () =>
-                  agent(
-                    `Score this candidate from 0 to 1 on: ${rubric}. Reply with the score.\n\nCandidate:\n${text}`,
-                    {
-                      label: `judge ${idx + 1}.${j + 1}`,
-                      // Same shape as verify: many narrow scores, aggregated.
-                      strength: opts.strength ?? "low",
-                      schema: JUDGE_SCHEMA,
-                    },
-                  ),
-              ),
-            )
-          ).filter(Boolean) as Array<{ score?: number }>;
-          const score = js.length ? js.reduce((s, v) => s + (Number(v?.score) || 0), 0) / js.length : 0;
-          return { index: idx, attempt: att, score, judgments: js };
-        }),
-      )
-    ).filter(Boolean) as Array<{
-      index: number;
-      attempt: unknown;
-      score: number;
-      judgments: Array<{ score?: number; reason?: string }>;
-    }>;
-    const normalized = scored.map((s) => ({
-      index: s.index,
-      attempt: s.attempt,
-      score: s.score,
-      judgments: s.judgments.map((j) => ({ score: Number(j?.score) || 0, reason: j?.reason })),
-    }));
-    if (normalized.length === 0) {
-      emitRuntimeEvent({ type: "quality", stage: "end", helper: "judgePanel" });
-      return undefined;
-    }
-    let best = normalized[0];
-    for (const s of normalized) if (s.score > best.score || (s.score === best.score && s.index < best.index)) best = s;
-    emitRuntimeEvent({ type: "quality", stage: "end", helper: "judgePanel" });
-    return best;
+    return observeQuality("judgePanel", async () => {
+      if (!Array.isArray(attempts) || attempts.length === 0) return undefined;
+      const judges = Math.min(16, Math.max(1, Math.floor(opts.judges ?? 3)));
+      const rubric = opts.rubric ?? "overall quality and correctness";
+      const scored = (
+        await parallel(
+          (Array.isArray(attempts) ? attempts : []).map((att, idx) => async () => {
+            const text = typeof att === "string" ? att : JSON.stringify(att);
+            const js = (
+              await parallel(
+                Array.from(
+                  { length: judges },
+                  (_v, j) => () =>
+                    agent(
+                      `Score this candidate from 0 to 1 on: ${rubric}. Reply with the score.\n\nCandidate:\n${text}`,
+                      {
+                        label: `judge ${idx + 1}.${j + 1}`,
+                        // Same shape as verify: many narrow scores, aggregated.
+                        strength: opts.strength ?? "low",
+                        schema: JUDGE_SCHEMA,
+                      },
+                    ),
+                ),
+              )
+            ).filter(Boolean) as Array<{ score?: number }>;
+            const score = js.length ? js.reduce((s, v) => s + (Number(v?.score) || 0), 0) / js.length : 0;
+            return { index: idx, attempt: att, score, judgments: js };
+          }),
+        )
+      ).filter(Boolean) as Array<{
+        index: number;
+        attempt: unknown;
+        score: number;
+        judgments: Array<{ score?: number; reason?: string }>;
+      }>;
+      const normalized = scored.map((s) => ({
+        index: s.index,
+        attempt: s.attempt,
+        score: s.score,
+        judgments: s.judgments.map((j) => ({ score: Number(j?.score) || 0, reason: j?.reason })),
+      }));
+      if (normalized.length === 0) return undefined;
+      let best = normalized[0];
+      for (const s of normalized)
+        if (s.score > best.score || (s.score === best.score && s.index < best.index)) best = s;
+      return best;
+    });
   };
 
   const loopUntilDry = async (opts: {
@@ -2220,15 +2438,20 @@ export async function runWorkflow<T = unknown>(
         if (code === WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED || code === WorkflowErrorCode.AGENT_LIMIT_EXCEEDED) break;
         throw error;
       }
-      const fresh = (Array.isArray(items) ? items : []).filter((x) => x != null && !seen.has(key(x)));
+      const fresh: Array<{ item: unknown; key: string }> = [];
+      for (const item of Array.isArray(items) ? items : []) {
+        if (item == null) continue;
+        const identity = await key(item);
+        if (!seen.has(identity)) fresh.push({ item, key: identity });
+      }
       if (!fresh.length) {
         dry++;
         continue;
       }
       dry = 0;
-      for (const x of fresh) {
-        seen.add(key(x));
-        all.push(x);
+      for (const entry of fresh) {
+        seen.add(entry.key);
+        all.push(entry.item);
       }
     }
     return all;
@@ -2244,16 +2467,16 @@ export async function runWorkflow<T = unknown>(
     results: unknown,
     opts: { strength?: WorkflowStrength } = {},
   ): Promise<{ complete: boolean; missing?: string[] } | null> => {
-    emitRuntimeEvent({ type: "quality", stage: "start", helper: "completenessCheck" });
-    const verdict = await agent(
-      `Given the task and the results gathered so far, list what is still MISSING (modalities not covered, claims unverified, gaps). Be specific and concise.\n\nTask:\n${JSON.stringify(taskArgs)}\n\nResults so far:\n${JSON.stringify(results).slice(0, 4000)}`,
-      // Defaults medium, not low like the other two gates: one call, no vote to
-      // average over, and an open-ended read of the whole task rather than one
-      // claim, so there is no redundancy here to carry a shallow verdict.
-      { label: "completeness critic", strength: opts.strength ?? "medium", schema: COMPLETENESS_SCHEMA },
-    );
-    emitRuntimeEvent({ type: "quality", stage: "end", helper: "completenessCheck" });
-    return verdict as { complete: boolean; missing?: string[] } | null;
+    return observeQuality("completenessCheck", async () => {
+      const verdict = await agent(
+        `Given the task and the results gathered so far, list what is still MISSING (modalities not covered, claims unverified, gaps). Be specific and concise.\n\nTask:\n${JSON.stringify(taskArgs)}\n\nResults so far:\n${JSON.stringify(results).slice(0, 4000)}`,
+        // Defaults medium, not low like the other two gates: one call, no vote to
+        // average over, and an open-ended read of the whole task rather than one
+        // claim, so there is no redundancy here to carry a shallow verdict.
+        { label: "completeness critic", strength: opts.strength ?? "medium", schema: COMPLETENESS_SCHEMA },
+      );
+      return verdict as { complete: boolean; missing?: string[] } | null;
+    });
   };
 
   const retry = async (
@@ -2265,7 +2488,7 @@ export async function runWorkflow<T = unknown>(
     for (let i = 0; i < attempts; i++) {
       throwIfAborted();
       last = await thunk(i);
-      const accepted = !opts.until || opts.until(last);
+      const accepted = !opts.until || (await opts.until(last));
       emitRuntimeEvent({ type: "control-attempt", helper: "retry", attempt: i + 1, accepted });
       if (accepted) return last;
     }
@@ -2302,10 +2525,22 @@ export async function runWorkflow<T = unknown>(
     const callIndex = nextCallIndex();
     const callHash = hashCheckpoint(promptText, checkpointOptions);
     const journalKey = `${runId}:${callIndex}`;
+    const taskScope = orchestrationScope.getStore();
+    const observation = {
+      ...phaseObservation(taskScope?.phase ?? state.currentPhase),
+      ...taskObservation(taskScope),
+    };
     const cached = options.resumeJournal?.get(journalKey);
     if (cached != null && cached.hash === callHash && callIndex < state.firstMiss) {
       shared.agentCount++;
       frameAgentCount++;
+      emitRuntimeEvent({
+        type: "control-attempt",
+        helper: "checkpoint",
+        stage: "replay",
+        callIndex,
+        ...observation,
+      });
       return cached.result; // replay the journaled human reply without spending a slot
     }
     if (cached == null || cached.hash !== callHash) state.firstMiss = Math.min(state.firstMiss, callIndex);
@@ -2314,48 +2549,69 @@ export async function runWorkflow<T = unknown>(
     frameAgentCount++;
     shared.physicalAgentCount++;
 
-    let reply: unknown;
-    if (options.confirm) {
-      // Host-only cancellation must not affect author options or replay hashes.
-      const signal = options.signal
-        ? AbortSignal.any([options.signal, shared.runFatalController.signal])
-        : shared.runFatalController.signal;
-      const confirm = options.confirm;
-      let onAbort: (() => void) | undefined;
-      try {
-        const cancelled = new Promise<never>((_resolve, reject) => {
-          onAbort = () => {
-            try {
-              throwIfAborted();
-            } catch (error) {
-              reject(error);
-            }
-          };
-          signal.addEventListener("abort", onAbort, { once: true });
-          if (signal.aborted) onAbort();
-        });
-        // Older host callbacks may ignore the optional signal. Still release
-        // the runtime wait, and observe any eventual callback rejection.
-        const answer = Promise.resolve().then(() => {
-          throwIfAborted();
-          return confirm(promptText, checkpointOptions, signal);
-        });
-        reply = await Promise.race([answer, cancelled]);
-      } finally {
-        if (onAbort) signal.removeEventListener("abort", onAbort);
+    emitRuntimeEvent({
+      type: "control-attempt",
+      helper: "checkpoint",
+      stage: "start",
+      callIndex,
+      ...observation,
+    });
+    let outcome: "completed" | "failed" | "cancelled" = "failed";
+    try {
+      let reply: unknown;
+      if (options.confirm) {
+        // Host-only cancellation must not affect author options or replay hashes.
+        const signal = options.signal
+          ? AbortSignal.any([options.signal, shared.runFatalController.signal])
+          : shared.runFatalController.signal;
+        const confirm = options.confirm;
+        let onAbort: (() => void) | undefined;
+        try {
+          const cancelled = new Promise<never>((_resolve, reject) => {
+            onAbort = () => {
+              try {
+                throwIfAborted();
+              } catch (error) {
+                reject(error);
+              }
+            };
+            signal.addEventListener("abort", onAbort, { once: true });
+            if (signal.aborted) onAbort();
+          });
+          // Older host callbacks may ignore the optional signal. Still release
+          // the runtime wait, and observe any eventual callback rejection.
+          const answer = Promise.resolve().then(() => {
+            throwIfAborted();
+            return confirm(promptText, checkpointOptions, signal);
+          });
+          reply = await Promise.race([answer, cancelled]);
+        } finally {
+          if (onAbort) signal.removeEventListener("abort", onAbort);
+        }
+      } else if (checkpointOptions.headless === "abort") {
+        throw new WorkflowError(
+          `checkpoint "${promptText}" needs human input but none is available (headless run)`,
+          WorkflowErrorCode.WORKFLOW_ABORTED,
+          { recoverable: false },
+        );
+      } else {
+        reply = checkpointOptions.default ?? true;
       }
-    } else if (checkpointOptions.headless === "abort") {
-      throw new WorkflowError(
-        `checkpoint "${promptText}" needs human input but none is available (headless run)`,
-        WorkflowErrorCode.WORKFLOW_ABORTED,
-        { recoverable: false },
-      );
-    } else {
-      reply = checkpointOptions.default ?? true;
+      throwIfAborted();
+      options.onAgentJournal?.({ index: callIndex, runId, hash: callHash, result: reply });
+      outcome = "completed";
+      return reply;
+    } finally {
+      if (isAborted()) outcome = "cancelled";
+      emitRuntimeEvent({
+        type: "control-attempt",
+        helper: "checkpoint",
+        stage: "end",
+        callIndex,
+        ...observation,
+        outcome,
+      });
     }
-    throwIfAborted();
-    options.onAgentJournal?.({ index: callIndex, runId, hash: callHash, result: reply });
-    return reply;
   };
 
   const runtimeBindings: WorkflowRuntimeBindings & { console: Record<string, (m: unknown) => void> } = {
@@ -2397,18 +2653,20 @@ export async function runWorkflow<T = unknown>(
     );
   }
 
-  const context = vm.createContext({
-    ...runtimeBindings,
-    // Object/Array/JSON/Math/Date/Promise/Set/Map/etc. come from the vm realm
-    // itself — we deliberately do NOT inject host built-ins, whose
-    // .constructor would be the host Function (a determinism-guard bypass).
-    // Math/Date are neutered in-realm by DETERMINISM_PRELUDE below.
-  });
-
   const wrapped = `${DETERMINISM_PRELUDE}\n(async () => {\n${body}\n})()`;
   try {
-    const result = await new vm.Script(wrapped, { filename: `${meta.name || "workflow"}.js` }).runInContext(context, {
-      timeout: MAX_SCRIPT_SYNC_MS,
+    const result = await executeOwnedVm({
+      script: wrapped,
+      filename: `${meta.name || "workflow"}.js`,
+      args: options.args,
+      cwd: baseCwd,
+      bindings: { ...runtimeBindings },
+      total: budget.total,
+      spent: budget.spent,
+      cancel: () => frameController.abort(),
+      signal: options.signal
+        ? AbortSignal.any([options.signal, shared.runFatalController.signal])
+        : shared.runFatalController.signal,
     });
     try {
       const serialized = JSON.stringify(result);
@@ -2439,6 +2697,7 @@ export async function runWorkflow<T = unknown>(
     // reaching here does NOT seal anything (the parent may still catch
     // workflow()'s rejection). Idempotent: aborting an already-aborted
     // controller is a no-op.
+    frameController.abort();
     if (isTopLevelRun) shared.runFatalController.abort();
     throw error;
   } finally {

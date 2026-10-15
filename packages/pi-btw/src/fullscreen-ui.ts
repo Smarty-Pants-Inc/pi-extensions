@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import type { ExtensionCommandContext, KeybindingsManager, Theme } from "@earendil-works/pi-coding-agent";
 import { type Component, type OverlayHandle, type TUI, TuiAltScreen, truncateToWidth } from "@earendil-works/pi-tui";
+import { withPreservedCustomEditor } from "@signalridge/pi-ui";
 import { sanitizeSingleLine } from "./text.js";
 
 type BtwCustomOptions = Parameters<ExtensionCommandContext["ui"]["custom"]>[1];
@@ -48,67 +49,50 @@ export async function runBtwFullscreen<T>(
     ((parent: TUI) => createBtwFullscreenTui(parent, dependencies.openUrl ?? openUrlInBrowser));
   const sessionManager = ctx.sessionManager;
   const sessionId = sessionManager?.getSessionId?.();
-  const ownsSession = () => {
+  const ownsEditorIdentity = () => {
     try {
-      return (
-        (!dependencies.isSessionCurrent || dependencies.isSessionCurrent()) &&
-        ctx.sessionManager === sessionManager &&
-        sessionManager?.getSessionId?.() === sessionId
-      );
+      return ctx.sessionManager === sessionManager && sessionManager?.getSessionId?.() === sessionId;
     } catch {
-      // Pi invalidates captured command contexts after a session replacement.
       return false;
     }
   };
-  let liveEditorText = ctx.ui.getEditorText();
-  let restoreEditor = false;
+  // Host restoration is independent of side-thread branch ownership. A provider
+  // can finish after live retirement but before our committed tree handler runs.
+  // The shared adapter repairs only an observed host reset to the opening text;
+  // invalid public contexts and later editor writers still take precedence.
+  const ui = new Proxy(ctx.ui, {
+    get(target, property, receiver) {
+      if (property === "setEditorText")
+        return (text: string) => {
+          if (ownsEditorIdentity()) target.setEditorText(text);
+        };
+      if (property === "getEditorText")
+        return () => {
+          if (!ownsEditorIdentity()) throw new Error("The BTW editor context is retired");
+          return target.getEditorText();
+        };
+      const value = Reflect.get(target, property, receiver) as unknown;
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  const preservationContext = new Proxy(ctx, {
+    get(target, property, receiver) {
+      return property === "ui" ? ui : Reflect.get(target, property, receiver);
+    },
+  });
   let closeAtBoundary: (() => void) | undefined;
   const unregisterClose = dependencies.registerClose?.(() => closeAtBoundary?.());
   let outcome: FullscreenOutcome<T>;
   try {
-    outcome = await ctx.ui.custom<FullscreenOutcome<T>>((parent, theme, keybindings, done) => {
-      const host = new BtwFullscreenHost(
-        parent,
-        theme,
-        keybindings,
-        ctx,
-        run,
-        (value) => {
-          try {
-            if (ownsSession()) {
-              liveEditorText = ctx.ui.getEditorText();
-              restoreEditor = true;
-            }
-          } catch {
-            // A replaced session owns a different editor and must not receive stale text.
-          }
-          // Pi restores the editor snapshot from when custom UI opened inside
-          // done(). Restore the current text in the same call stack: a committed
-          // session_tree handler may run before this one and populate its editor,
-          // while the generation guard expires before our await resumes.
-          done(value);
-          if (restoreEditor && ownsSession()) {
-            try {
-              if (ctx.ui.getEditorText() !== liveEditorText && ownsSession()) ctx.ui.setEditorText(liveEditorText);
-            } catch {
-              // A replaced context must not receive the outgoing editor text.
-            }
-          }
-        },
-        createTui,
-      );
-      closeAtBoundary = () => host.closeAtBoundary();
-      return host;
-    });
+    outcome = await withPreservedCustomEditor(preservationContext).ui.custom<FullscreenOutcome<T>>(
+      (parent, theme, keybindings, done) => {
+        const host = new BtwFullscreenHost(parent, theme, keybindings, ctx, run, done, createTui);
+        closeAtBoundary = () => host.closeAtBoundary();
+        return host;
+      },
+    );
   } finally {
     unregisterClose?.();
-  }
-  if (restoreEditor && ownsSession()) {
-    try {
-      if (ctx.ui.getEditorText() !== liveEditorText && ownsSession()) ctx.ui.setEditorText(liveEditorText);
-    } catch {
-      // A replaced session owns a different editor and must not receive stale restoration.
-    }
   }
   if (outcome.kind === "failed") throw outcome.error;
   return outcome.value;

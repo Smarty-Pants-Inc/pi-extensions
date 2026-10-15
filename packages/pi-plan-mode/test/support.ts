@@ -1,6 +1,7 @@
 import os from "node:os";
 import path from "node:path";
 import { Key, type KeyId, matchesKey } from "@earendil-works/pi-tui";
+import { nativeInput } from "./native-input.js";
 
 type MockHandler = (...args: unknown[]) => unknown;
 
@@ -97,6 +98,7 @@ export function createMockPi(
   let activeTools = [...(options.activeTools ?? [])];
   const allTools = options.allTools ?? activeTools.map((name) => builtinTool(name));
 
+  let activeManager: { appendCustomEntry?(type: string, data: unknown): void } | undefined;
   const rawPi: MockPiApi = {
     registerCommand(name: string, command: unknown) {
       commands.set(name, command as MockCommand);
@@ -105,7 +107,24 @@ export function createMockPi(
       flags.set(name, flag as MockFlag);
     },
     registerTool(tool: unknown) {
-      tools.push(tool as MockTool);
+      const definition = tool as MockTool;
+      if (definition.name === "plan_mode_complete") {
+        const execute = definition.execute as MockHandler;
+        // Menu/state unit fixtures simulate a model-issued completion, including
+        // native acceptance and tool_call. Security tests use the real SDK.
+        tools.push({
+          ...definition,
+          execute: async (...args: unknown[]) => {
+            const ctx = args[4] as ReturnType<typeof createMockContext>["ctx"];
+            await nativeInput({ events }, ctx);
+            for (const handler of events.get("tool_call") ?? []) {
+              const result = await handler({ toolName: definition.name, toolCallId: args[0], input: args[1] }, ctx);
+              if (isRecord(result) && result.block) throw new Error(String(result.reason));
+            }
+            return execute(...args);
+          },
+        });
+      } else tools.push(definition);
     },
     registerEntryRenderer(customType: string, renderer: MockHandler) {
       entryRenderers.set(customType, renderer);
@@ -129,7 +148,13 @@ export function createMockPi(
       providerUnregistrations.push(name);
     },
     on(name: string, handler: MockHandler) {
-      events.set(name, [...(events.get(name) ?? []), handler]);
+      events.set(name, [
+        ...(events.get(name) ?? []),
+        (...args) => {
+          activeManager = (args[1] as { sessionManager?: typeof activeManager } | undefined)?.sessionManager;
+          return handler(...args);
+        },
+      ]);
     },
     getFlag(name: string) {
       return flags.get(name)?.value;
@@ -152,6 +177,7 @@ export function createMockPi(
     },
     appendEntry(customType: string, data: unknown) {
       entries.push({ customType, data });
+      activeManager?.appendCustomEntry?.(customType, data);
     },
     sendUserMessage(text: string, messageOptions?: unknown) {
       sentUserMessages.push({ text, options: messageOptions });
@@ -269,6 +295,7 @@ export function createMockContext(overrides: Record<string, unknown> = {}) {
         }
       : (customOverride ?? defaultCustom);
 
+  const branch: unknown[] = [];
   const ctx = {
     cwd: overrides.cwd ?? process.cwd(),
     mode: overrides.mode ?? (overrides.hasUI ? "tui" : undefined),
@@ -309,8 +336,11 @@ export function createMockContext(overrides: Record<string, unknown> = {}) {
     sessionManager: overrides.sessionManager ?? {
       getSessionId: () => "test-session",
       getSessionName: () => undefined,
-      getBranch: () => [],
-      getEntries: () => [],
+      getBranch: () => [...branch],
+      getEntries: () => [...branch],
+      appendCustomEntry(customType: string, data: unknown) {
+        branch.push({ type: "custom", id: `custom-${branch.length}`, customType, data });
+      },
     },
     modelRegistry: overrides.modelRegistry ?? {
       getApiKeyAndHeaders: async () => ({ ok: false, error: "missing" }),

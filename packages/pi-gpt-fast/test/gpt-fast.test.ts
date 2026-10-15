@@ -9,7 +9,19 @@
  */
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import * as fs from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SettingsManager } from "@earendil-works/pi-coding-agent";
@@ -65,7 +77,7 @@ function boot(flag = false): Harness {
 const notices: { message: string; level: string }[] = [];
 const statuses: (string | undefined)[] = [];
 
-function ctx(model?: { provider: string; id: string }) {
+function ctx(model?: { provider: string; id: string; api?: string }) {
   return {
     hasUI: true,
     model,
@@ -76,7 +88,7 @@ function ctx(model?: { provider: string; id: string }) {
   };
 }
 
-const onAllowlist = { provider: "openai", id: "gpt-5.6" };
+const onAllowlist = { provider: "openai", api: "openai-responses", id: "gpt-5.6" };
 const offAllowlist = { provider: "anthropic", id: "claude-opus-5" };
 
 beforeEach(() => {
@@ -386,7 +398,7 @@ test("a host update at lock acquisition is read before merging the toggle", asyn
 
 test("a deterministic concurrent host settings update preserves both owners' keys", async () => {
   const path = join(agentDir, "settings.json");
-  writeFileSync(path, '{"theme":"old","unrelated":1}');
+  writeFileSync(path, '{"theme":"old","unrelated":1}', { mode: 0o600 });
   const host = SettingsManager.create(agentDir, agentDir);
   const pi = boot();
   pi.sessionStart(ctx(onAllowlist));
@@ -411,5 +423,153 @@ test("a deterministic concurrent host settings update preserves both owners' key
     unrelated: 1,
     "pi-gpt-fast": { enabled: false },
   });
+  expect(lstatSync(path).mode & 0o777).toBe(0o600);
+  expect(readdirSync(agentDir)).toEqual(["settings.json"]);
   expect(existsSync(`${path}.lock`)).toBe(false);
+});
+
+for (const [provider, api] of [
+  ["openai", "openai-responses"],
+  ["openai-codex", "openai-codex-responses"],
+]) {
+  for (const id of ["gpt-5.4", "gpt-5.5", "gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]) {
+    test(`eligible tuple ${provider}/${api}/${id} receives priority without mutating the original`, () => {
+      const pi = boot(true);
+      const context = ctx({ provider, api, id });
+      pi.sessionStart(context);
+      const payload = { service_tier: "flex", unknown: { retained: true } };
+      expect(pi.request(payload, context)).toEqual({ ...payload, service_tier: "priority" });
+      expect(payload.service_tier).toBe("flex");
+    });
+  }
+  for (const unsupportedApi of [
+    undefined,
+    "openai-completions",
+    "anthropic-messages",
+    "openai-responses-other",
+    api === "openai-responses" ? "openai-codex-responses" : "openai-responses",
+  ]) {
+    test(`leaves unsupported API untouched: ${provider}/${unsupportedApi}`, async () => {
+      const context = ctx({ provider, api: unsupportedApi, id: "gpt-5.6" });
+      const pi = boot(true);
+      pi.sessionStart(context);
+      const payload = { service_tier: "flex", unknown: { retained: true } };
+      expect(pi.request(payload, context)).toBeUndefined();
+      expect(payload).toEqual({ service_tier: "flex", unknown: { retained: true } });
+      expect(statuses.at(-1)).toBe("fast (armed)");
+    });
+  }
+  for (const id of ["gpt-5", "gpt-5.7", "gpt-5.6-sol-extra", "GPT-5.6"]) {
+    test(`does not broaden the exact model allowlist: ${provider}/${id}`, () => {
+      const context = ctx({ provider, api, id });
+      const pi = boot(true);
+      pi.sessionStart(context);
+      expect(pi.request({ input: [] }, context)).toBeUndefined();
+    });
+  }
+}
+
+for (const initialMode of [undefined, 0o600, 0o400, 0o200, 0o644]) {
+  test(`settings and temporary bytes stay private under umask 022: initial mode ${initialMode?.toString(8) ?? "absent"}`, () => {
+    const path = join(agentDir, "settings.json");
+    if (initialMode !== undefined) {
+      writeFileSync(path, '{"unknown":{"retained":true}}');
+      chmodSync(path, initialMode);
+    }
+    // Subprocess isolates umask and permits deterministic mode checks in the
+    // same process that writes. Read-only targets may be unreadable to an
+    // unprivileged owner when their initial mode is write-only.
+    const result = spawnSync(
+      process.execPath,
+      [
+        "-e",
+        `
+      import assert from "node:assert/strict";
+      import * as fs from "node:fs";
+      import { writeEnabled } from ${JSON.stringify(new URL("../src/settings.ts", import.meta.url).href)};
+      process.umask(0o022);
+      const path = ${JSON.stringify(path)};
+      const mode = ${initialMode === undefined ? "undefined" : initialMode};
+      if (mode === 0o200 && process.getuid() !== 0) {
+        assert.throws(() => writeEnabled(true));
+      } else {
+        for (const enabled of [true, false]) {
+          writeEnabled(enabled);
+          assert.equal(fs.lstatSync(path).mode & 0o777, (mode ?? 0o600) & 0o600);
+          if (mode === 0o200) fs.chmodSync(path, 0o600);
+          const settings = JSON.parse(fs.readFileSync(path, "utf8"));
+          assert.equal(settings["pi-gpt-fast"].enabled, enabled);
+          if (mode !== undefined) assert.deepEqual(settings.unknown, { retained: true });
+          if (mode === 0o200) fs.chmodSync(path, mode);
+        }
+      }
+      assert.deepEqual(fs.readdirSync(${JSON.stringify(agentDir)}), ["settings.json"]);
+    `,
+      ],
+      { env: process.env, encoding: "utf8" },
+    );
+    expect(result.stderr).toBe("");
+    expect(result.status).toBe(0);
+  });
+}
+
+test("a symlink settings target is never read, replaced, or followed", async () => {
+  const target = join(agentDir, "actual.json");
+  const path = join(agentDir, "settings.json");
+  const bytes = '{"secret":"retained","pi-gpt-fast":{"enabled":true}}';
+  writeFileSync(target, bytes);
+  symlinkSync(target, path);
+  const pi = boot();
+  pi.sessionStart(ctx(onAllowlist));
+  expect(pi.request({}, ctx(onAllowlist))).toBeUndefined();
+  for (const state of ["on", "off"]) {
+    await pi.command(state);
+    expect(readFileSync(target, "utf8")).toBe(bytes);
+    expect(lstatSync(path).isSymbolicLink()).toBe(true);
+    expect(notices.some(({ message }) => message.includes("regular file"))).toBe(true);
+    expect(readdirSync(agentDir).sort()).toEqual(["actual.json", "settings.json"]);
+  }
+});
+
+test("failed atomic rename leaves settings intact and removes its private temp under the lock", async () => {
+  const path = join(agentDir, "settings.json");
+  const bytes = '{"secret":"retained"}';
+  writeFileSync(path, bytes, { mode: 0o600 });
+  const rename = spyOn(fs, "renameSync").mockImplementation((source, target) => {
+    expect(target).toBe(path);
+    expect(existsSync(`${path}.lock`)).toBe(true);
+    expect(lstatSync(source).mode & 0o777).toBe(0o600);
+    throw new Error("rename denied");
+  });
+  try {
+    await boot().command("on");
+    expect(rename).toHaveBeenCalledTimes(1);
+    expect(readFileSync(path, "utf8")).toBe(bytes);
+    expect(notices.some(({ message }) => message.includes("rename denied"))).toBe(true);
+    expect(readdirSync(agentDir)).toEqual(["settings.json"]);
+  } finally {
+    rename.mockRestore();
+  }
+});
+
+test("a target replaced with a symlink before rename is rejected with no temp or lock leak", async () => {
+  const path = join(agentDir, "settings.json");
+  const target = join(agentDir, "actual.json");
+  writeFileSync(path, '{"theme":"old"}', { mode: 0o600 });
+  writeFileSync(target, '{"secret":"retained"}');
+  const chmod = fs.fchmodSync;
+  const change = spyOn(fs, "fchmodSync").mockImplementation((fd, mode) => {
+    chmod(fd, mode);
+    rmSync(path);
+    symlinkSync(target, path);
+  });
+  try {
+    await boot().command("on");
+    expect(lstatSync(path).isSymbolicLink()).toBe(true);
+    expect(readFileSync(target, "utf8")).toBe('{"secret":"retained"}');
+    expect(readdirSync(agentDir).sort()).toEqual(["actual.json", "settings.json"]);
+    expect(notices.some(({ message }) => message.includes("could not persist state"))).toBe(true);
+  } finally {
+    change.mockRestore();
+  }
 });

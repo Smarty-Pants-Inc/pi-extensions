@@ -73,7 +73,7 @@ test.each(
     await pending; // No dialog response is needed to settle.
     const notifications = context.notifications.length;
     const afterBoundary = render();
-    assert.deepEqual(afterBoundary, before);
+    assert.deepEqual(afterBoundary, boundary === "shutdown" ? [] : before);
     if (dialog === "editor") {
       assert.ok(harness?.component instanceof ExtensionEditorComponent);
       const editor = harness.component.children.find((child) => child instanceof Editor);

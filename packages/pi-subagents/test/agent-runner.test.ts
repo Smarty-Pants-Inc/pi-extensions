@@ -1,8 +1,9 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import type * as NodeFs from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, isRecoverableLength } from "@earendil-works/pi-ai";
-import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
+import { type AgentSessionEvent, DefaultPackageManager } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const {
@@ -31,17 +32,44 @@ const {
   sessionManagerInMemory: vi.fn(() => ({ kind: "memory-session-manager" })),
   sessionManagerCreate: vi.fn(() => ({ kind: "persistent-session-manager" })),
   settingsManagerGetSessionDir: vi.fn(() => undefined as string | undefined),
-  settingsManagerCreate: vi.fn(() => ({ kind: "settings-manager", getSessionDir: settingsManagerGetSessionDir })),
+  settingsManagerCreate: vi.fn(() => ({
+    kind: "settings-manager", getSessionDir: settingsManagerGetSessionDir, reload: async () => {},
+    getGlobalSettings: () => ({}), getProjectSettings: () => ({}),
+  })),
   toolCallHandlers: [] as Array<(event: { toolName: string; input: unknown }) => Promise<unknown>>,
 }));
+
+vi.mock("node:fs", async (importOriginal) => {
+  const original = await importOriginal<typeof NodeFs>();
+  return {
+    ...original,
+    existsSync: (path: Parameters<typeof original.existsSync>[0]) =>
+      loaderExtensionsRef.current.extensions.some((extension) => extension.path === path) || original.existsSync(path),
+  };
+});
 
 vi.mock("@earendil-works/pi-coding-agent", () => ({
   createAgentSession,
   get ModelRuntime() { return hostCapabilities.modernRuntime ? { create: vi.fn() } : undefined; },
   get createPowerShellTool() { return hostCapabilities.powershell ? () => ({ name: "powershell" }) : undefined; },
-  // Mock loader simulates pi-mono: reload() applies additionalExtensionPaths
-  // (an unknown path becomes an error row, mirroring a failed load) and then
-  // runs extensionsOverride over the result.
+  // Resolve fake resources BEFORE loading, mirroring the public SDK boundary.
+  // The real package resolver/factories are covered in the SDK tests.
+  DefaultPackageManager: class {
+    async resolve() {
+      return { extensions: loaderExtensionsRef.current.extensions.map(({ path }) => ({
+        path, enabled: true, metadata: { source: path, scope: "user", origin: "local" },
+      })) };
+    }
+    async resolveExtensionSources(sources: string[]) {
+      return { extensions: sources.map((path) => {
+        if (!loaderExtensionsRef.current.extensions.some((extension) => extension.path === path)) {
+          throw new Error(`Extension path "${path}" could not be resolved`);
+        }
+        return { path, enabled: true, metadata: { source: path, scope: "temporary", origin: "local" } };
+      }) };
+    }
+  },
+  // Mock loader applies preselected additionalExtensionPaths, then the override.
   DefaultResourceLoader: class {
     opts: any;
     constructor(options: any) {
@@ -50,10 +78,12 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
     }
 
     async reload() {
-      // Mirror Pi's real loader: noExtensions drops discovered paths but still
-      // loads SDK inline factories, including the hidden policy hook.
+      // noExtensions suppresses rediscovery, not explicitly selected paths or
+      // inline factories (including the hidden policy hook).
       if (this.opts.noExtensions) {
-        loaderExtensionsRef.current = { extensions: [], errors: [], runtime: {} };
+        loaderExtensionsRef.current.extensions = loaderExtensionsRef.current.extensions.filter(
+          ({ path }) => this.opts.additionalExtensionPaths?.includes(path),
+        );
       }
       for (const factory of this.opts.extensionFactories ?? []) {
         if (factory.builtin) continue; // older hosts do not export these factories
@@ -2038,7 +2068,7 @@ describe("agent-runner extension allowlist", () => {
 
     const opts = lastLoaderOpts();
     expect(opts.extensionsOverride).toEqual(expect.any(Function));
-    expect(opts.additionalExtensionPaths).toBeUndefined();
+    expect(opts.additionalExtensionPaths).toEqual(["/ext/a.ts"]);
     expect(loaderExtensionsRef.current.extensions.map((e) => e.path)).toEqual([
       "<inline:pi-subagents-tool-policy>", "/ext/a.ts",
     ]);
@@ -2066,6 +2096,8 @@ describe("agent-runner extension allowlist", () => {
     // A package whose entry is `src/index.ts` canonicalizes to "src"; a child
     // agent must still be able to allowlist it by the package name.
     const dir = mkdtempSync(join(tmpdir(), "subagents-match-"));
+    const resolver = vi.spyOn(DefaultPackageManager.prototype, "resolve");
+    const sourceResolver = vi.spyOn(DefaultPackageManager.prototype, "resolveExtensionSources");
     try {
       writeFileSync(
         join(dir, "package.json"),
@@ -2077,6 +2109,24 @@ describe("agent-runner extension allowlist", () => {
 
       setupArrayAgent(["pi-subagents"]);
       withExtensions({ [entry]: ["pkg_tool"] });
+      // A configured package carries ownership metadata in the real SDK.
+      resolver.mockResolvedValueOnce({
+        extensions: [{ path: entry, enabled: true, metadata: {
+          source: dir, scope: "user", origin: "package", packageRoot: dir,
+        } }],
+        skills: [], prompts: [], themes: [],
+      });
+      // Canonical-target probes resolve package directories, not just files.
+      sourceResolver.mockImplementation(async (sources) => {
+        if (sources.length === 0) return { extensions: [], skills: [], prompts: [], themes: [] };
+        expect(sources).toEqual([realpathSync(dir)]);
+        return {
+          extensions: [{ path: entry, enabled: true, metadata: {
+            source: dir, scope: "temporary", origin: "package", packageRoot: dir,
+          } }],
+          skills: [], prompts: [], themes: [],
+        };
+      });
       const { session } = createSession("OK");
       createAgentSession.mockResolvedValue({ session });
 
@@ -2086,6 +2136,8 @@ describe("agent-runner extension allowlist", () => {
       // to "src", so it was filtered out and pkg_tool never reached the allowlist.
       expect(lastToolsPassed()).toContain("pkg_tool");
     } finally {
+      resolver.mockRestore();
+      sourceResolver.mockRestore();
       rmSync(dir, { recursive: true, force: true });
     }
   });
@@ -2134,8 +2186,8 @@ describe("agent-runner extension allowlist", () => {
     await runAgent(ctx, "Explore", "go", { pi });
 
     const opts = lastLoaderOpts();
-    expect(opts.additionalExtensionPaths).toEqual(["/abs/foo.ts"]);
-    // No "*" → the loader override is in force (narrowing, not load-all).
+    expect(opts.additionalExtensionPaths).toEqual(["/abs/foo.ts", "/ext/mcp.ts"]);
+    // No "*" → preselection narrows the discovered resources.
     expect(opts.extensionsOverride).toBeDefined();
     const tools = lastToolsPassed();
     expect(tools).toContain("mcp_tool");
@@ -2177,22 +2229,13 @@ describe("agent-runner extension allowlist", () => {
     );
   });
 
-  it("warns but proceeds when a path entry fails to load", async () => {
+  it("fails closed before loading when an explicit path cannot resolve", async () => {
     setupArrayAgent(["/abs/missing.ts"]);
-    // Not pre-registered → the mock loader records a load error; the path's
-    // canonical name ("missing") is what the unmatched-name check reports.
-    const { session } = createSession("OK");
-    createAgentSession.mockResolvedValue({ session });
-    const onToolActivity = vi.fn();
-
-    const result = await runAgent(ctx, "Explore", "go", { pi, onToolActivity });
-
-    expect(result.responseText).toBe("OK");
-    expect(onToolActivity).toHaveBeenCalledWith(
-      expect.objectContaining({
-        toolName: expect.stringContaining('extension-error:extension "missing"'),
-      }),
+    await expect(runAgent(ctx, "Explore", "go", { pi })).rejects.toThrow(
+      'Extension path "/abs/missing.ts" could not be resolved',
     );
+    expect(defaultResourceLoaderCtor).not.toHaveBeenCalled();
+    expect(createAgentSession).not.toHaveBeenCalled();
   });
 
   it("matches `extensions: [Mcp]` against `mcp.ts` (case-insensitive)", async () => {

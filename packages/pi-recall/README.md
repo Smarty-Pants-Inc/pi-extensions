@@ -75,6 +75,8 @@ Print and JSON modes reject `/recall` before opening an interactive flow. TUI an
 - **All** — every valid record in the current Pi agent directory.
 - **Current session** — records whose source session ID exactly matches the current session.
 
+Each interaction owns its opening session and branch path. Ordinary appends (including metadata entries) keep that path active and do not cancel pending selections or quote confirmations: the live check accepts the opening path as a prefix of the active branch. A committed tree event retires the interaction even when that prefix survives; moving backward, to a sibling, or to an empty branch is detected from the live public session manager even before Recall's tree handler runs. Cancelled navigation with an unchanged branch leaves it usable. Reopen `/recall` after navigation for fresh candidates.
+
 Scope applies only when recalling already saved messages. The save picker intentionally reads only `ctx.sessionManager.getBranch()` from the current session and never scans other session files. TUI scope switching keeps the selected saved record when it remains visible in the new scope; otherwise it selects the first fuzzy-ranked result or the newest result when the query is empty.
 
 ## TUI fuzzy search
@@ -99,9 +101,9 @@ Pi's configured agent directory replaces `~/.pi/agent` when applicable. Each lin
 
 Pi Recall does not create settings, session custom entries, tools, background processes, watchers, or automatic model context. It reads storage only when `/recall` needs it.
 
-Save and delete operations acquire one cross-process lock, reread canonical storage under that lock, and publish a complete JSONL replacement through a unique same-directory `0600` temporary file. Lock waiting is abort-aware. The canonical file is required to be a regular non-symlink file and is kept at `0600`.
+Save and delete operations acquire one cross-process lock, reread canonical storage under that lock, and publish a complete JSONL replacement through a unique same-directory `0600` temporary file. Lock waiting is abort-aware. The canonical file is required to be a regular non-symlink file and is kept at `0600`. Live interaction ownership is checked immediately before dispatching canonical replacement; a filesystem operation already dispatched while current cannot be retracted.
 
-Malformed JSON, duplicate IDs, unknown record types or versions, invalid records, symlinks, and limit violations make storage read-only. Fix or move the reported file, then reopen `/recall`; Pi Recall never overwrites invalid storage. Unknown fields on otherwise valid version-1 records survive later rewrites.
+Invalid UTF-8, malformed JSON, duplicate IDs, unknown record types or versions, invalid records, symlinks, and limit violations make storage read-only, including its existing permission bits. Bytes are decoded strictly and the complete JSONL is validated before canonical permission repair. Fix or move the reported file, then reopen `/recall`; Pi Recall never overwrites invalid storage. Unknown fields on otherwise valid version-1 records survive later rewrites.
 
 Deleting a message removes it from canonical `pi-recall.jsonl`. It is not secure erasure of filesystem blocks, backups, snapshots, temporary copies left by an operating-system failure, or content already quoted into a session.
 
@@ -125,6 +127,7 @@ Terminal controls are removed from labels, previews, metadata, and errors before
 - No cross-session transcript browser: only previously saved records can be recalled across sessions.
 - Text only; images and tool payloads are deliberately omitted.
 - The custom TUI picker is keyboard-operated. RPC uses sequential dialogs.
+- Custom UI completion uses the shared public-API editor-preservation adapter: observable writes before completion survive the host's saved-draft restoration, and later destination writes remain authoritative. This is not a universal ownership guarantee; invalid contexts and indistinguishable writes of the opening draft cannot be recovered.
 - Scope and search preferences are not persisted; every new `/recall` interaction starts at **Current cwd** with an empty query.
 
 ## Package layout

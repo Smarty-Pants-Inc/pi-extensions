@@ -15,6 +15,12 @@ export interface FreshImplementationRequest {
   retention: ImplementationPlanRetention;
   stateEntryType: string;
   isCurrent(): boolean;
+  registerHandoff?(
+    message: string,
+    implementationId: string,
+    plan: string,
+    ctx: ReplacementContext,
+  ): string | undefined;
 }
 
 interface FreshImplementationFromStateOptions {
@@ -22,6 +28,7 @@ interface FreshImplementationFromStateOptions {
   menuIsCurrent(): boolean;
   retention: ImplementationPlanRetention;
   stateEntryType: string;
+  registerHandoff?: FreshImplementationRequest["registerHandoff"];
 }
 
 export type FreshImplementationResult =
@@ -71,6 +78,7 @@ export async function startFreshImplementationFromState(
     retention: options.retention,
     stateEntryType: options.stateEntryType,
     isCurrent,
+    registerHandoff: options.registerHandoff,
   });
 }
 
@@ -174,7 +182,8 @@ export async function startFreshImplementationSession(
           return;
         }
         try {
-          await replacementCtx.sendUserMessage(handoff);
+          const transport = request.registerHandoff?.(handoff, activeImplementation.id, request.plan, replacementCtx);
+          await replacementCtx.sendUserMessage(transport ?? handoff);
           replacementCtx.ui.notify(
             "Fresh implementation session started. Only the approved plan was transferred.",
             "info",

@@ -2,6 +2,7 @@ import { readFileSync, statSync } from "node:fs";
 import { relative } from "node:path";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { sanitizeDisplayText } from "@signalridge/pi-ui";
 
 import { DEFAULT_VIEWER_HEIGHT, MAX_VIEWER_HEIGHT, MIN_PANEL_HEIGHT, SEARCH_SCROLL_OFFSET } from "./constants.js";
 import { loadFileContent } from "./file-viewer.js";
@@ -277,7 +278,7 @@ export function createViewer(
     if (!state.file) return "";
     const isUntracked = isUntrackedStatus(state.file.gitStatus);
 
-    let header = theme.bold(state.file.name);
+    let header = theme.bold(sanitizeDisplayText(state.file.name));
     if (isUntracked) {
       header += theme.fg("dim", " [UNTRACKED]");
     } else if (state.diffMode) {

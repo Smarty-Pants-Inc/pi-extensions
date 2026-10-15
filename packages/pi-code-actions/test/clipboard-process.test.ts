@@ -54,6 +54,35 @@ async function waitFor(check: () => boolean, message: string) {
   }
 }
 
+interface UtilityRecord {
+  pid: number;
+  utility: string;
+  input?: string;
+}
+
+function committedRecords(text: string): UtilityRecord[] {
+  // The child can still be appending a JSONL record when the parent polls.
+  // A newline commits a record; an incomplete tail is not yet parseable.
+  const end = text.lastIndexOf("\n");
+  if (end < 0) return [];
+  return text
+    .slice(0, end)
+    .split("\n")
+    .map((line) => JSON.parse(line) as UtilityRecord);
+}
+
+test("clipboard fixture reads only committed JSONL records without hiding malformed records", () => {
+  const first = JSON.stringify({ pid: 1, utility: "wl-copy" });
+  const second = JSON.stringify({ pid: 1, utility: "wl-copy", input: "quoted input" });
+  const source = `${first}\n${second}\n`;
+  for (let length = 0; length <= source.length; length++) {
+    const prefix = source.slice(0, length);
+    assert.equal(committedRecords(prefix).length, [...prefix].filter((char) => char === "\n").length);
+  }
+  assert.deepEqual(committedRecords(source), [JSON.parse(first), JSON.parse(second)]);
+  assert.throws(() => committedRecords("{INVALID}\n"), SyntaxError);
+});
+
 function alive(pid: number) {
   try {
     process.kill(pid, 0);
@@ -129,17 +158,7 @@ for (const platform of ["darwin", "linux"]) {
       let calls = 0;
       let host: Awaited<ReturnType<typeof installedExec>> | undefined;
       let result: Awaited<ReturnType<ExtensionAPI["exec"]>> | undefined;
-      const records = () =>
-        existsSync(log)
-          ? (readFileSync(log, "utf8")
-              .trim()
-              .split("\n")
-              .map((line) => JSON.parse(line)) as Array<{
-              pid: number;
-              utility: string;
-              input?: string;
-            }>)
-          : [];
+      const records = () => (existsSync(log) ? committedRecords(readFileSync(log, "utf8")) : []);
       try {
         host = await installedExec(directory);
         const exec = host.exec;

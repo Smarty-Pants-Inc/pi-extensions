@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.8
+### Patch Changes
+
+- c2fd867: Keep atomic settings writes private and preserve restrictive permissions under the shared lock, reject non-regular targets, and require supported provider/API pairs alongside the existing exact model allowlist.
+
 ## 1.2.7
 ### Patch Changes
 

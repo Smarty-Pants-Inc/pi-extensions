@@ -173,7 +173,9 @@ function renderViewer(messages: unknown[], record: AgentRecord = mockRecord()): 
   const viewer = new ConversationViewer(
     mockTui(), mockSession(messages), record, undefined, markerTheme, () => {},
   );
-  return viewer.render(120).join("\n");
+  const output = viewer.render(120).join("\n");
+  viewer.dispose();
+  return output;
 }
 
 function renderFleet(records: AgentRecord[]): string {
@@ -187,8 +189,9 @@ function renderFleet(records: AgentRecord[]): string {
     custom: async () => undefined,
   } as unknown as FleetUICtx);
   fleet.update();
-  if (!factory) return "";
-  return factory(mockTui(), markerTheme).render(120).join("\n");
+  const output = factory ? factory(mockTui(), markerTheme).render(120).join("\n") : "";
+  fleet.dispose();
+  return output;
 }
 
 /**
@@ -252,7 +255,7 @@ describe("rendered surfaces neutralize child-derived text", () => {
     const output = renderViewer([], mockRecord({ description: `head${CSI_CLEAR}line` }));
 
     expectInert(output);
-    expect(output).toContain("<muted>head line");
+    expect(output).toContain("<muted>head\\u001b");
   });
 
   it("neutralizes the activity preview drawn from a child's own response text", () => {
@@ -277,6 +280,6 @@ describe("rendered surfaces neutralize child-derived text", () => {
     ]);
 
     expectInert(output);
-    expect(output).toContain("fleet row");
+    expect(output).toContain("fleet\\u001b[2J\\u001b[Hrow");
   });
 });

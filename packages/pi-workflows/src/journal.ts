@@ -154,7 +154,7 @@ export interface ScriptRun {
   callResults: Record<string, CallResult>;
   /** Call index → resolved tier identity for live and stopped calls. */
   callTiers: Record<string, CallTierIdentity>;
-  /** Call index → latest accepted nested workflow result generation. */
+  /** Monotonic nested-result watermarks; retained even when a managed call invalidates replay. */
   workflowResultGenerations: Record<string, number>;
   compactions: Record<string, number>;
   startedAt: number;
@@ -537,6 +537,8 @@ function parseTerminalResult(raw: unknown, runId: string): RecoveryTerminalResul
 }
 
 function parseRunRecovery(raw: Record<string, unknown>, run: ScriptRun, timestamp: number): RunRecoveryEvent {
+  if (run.status === "completed" || run.nonResumable || run.terminalIntent === "stop")
+    throw new Error("cannot recover a completed or non-resumable workflow run");
   if (raw.status !== "interrupted") throw new Error("run recovery status is invalid");
   if (typeof raw.branchGeneration !== "number" || !Number.isInteger(raw.branchGeneration) || raw.branchGeneration < 0) {
     throw new Error("run recovery branchGeneration is invalid");
@@ -1140,6 +1142,8 @@ export function applyRecoveryEvent(run: ScriptRun, event: RunRecoveryEvent | Att
   if (event.kind === "run_recovery") {
     run.status = "interrupted";
     run.terminalIntent = undefined;
+    run.error = undefined;
+    run.finalResult = undefined;
     for (const rotation of event.rotations) applyRecoveryRotation(run, rotation);
     applyRecoveryTerminalResults(run, event.terminalResults ?? []);
   } else {
@@ -1218,6 +1222,7 @@ function applyJournalEvent(runs: Map<string, ScriptRun>, event: JournalEvent): v
       break;
     case "workflow_transition":
       run.status = event.status;
+      if (event.status === "running") run.error = undefined;
       if (event.error !== undefined) run.error = event.error;
       if (event.finalResult !== undefined) run.finalResult = structuredClone(event.finalResult);
       if (event.terminalIntent !== undefined) run.terminalIntent = event.terminalIntent;
@@ -1353,9 +1358,10 @@ export function snapshotRun(run: ScriptRun): ScriptRun {
  * The runtime keys its cache by `${runId}:${callIndex}` (the same namespacing
  * the store deltas use), so a nested workflow() call with its own runId can
  * never replay the parent's entry. Every `call_result` or `workflow_result`
- * event that carries a `callHash` is a replayable fact. Entries from another
- * schema or without a hash are not replayable; they are ignored here even when
- * `replayJournal` retains them as non-replayable lifecycle history.
+ * event that carries a `callHash` is a replayable candidate only while it is
+ * the aggregate's final completed result. Entries from another schema or
+ * without a hash are not replayable, but accepted lifecycle history can still
+ * supersede an older candidate.
  */
 export function buildResumeJournal(entries: readonly SessionEntryLike[]): Map<
   string,
@@ -1381,7 +1387,7 @@ export function buildResumeJournal(entries: readonly SessionEntryLike[]): Map<
     agentCount?: number;
   };
   const journal = new Map<string, ResumeEntry>();
-  const journalRunIds = new Map<string, string>();
+  const journalSources = new Map<string, { runId: string; nodeId: string; result: CallResult }>();
 
   // Reuse the authoritative replay validator so stale call results from an
   // older attempt, terminal-after-lifecycle facts, and quarantined runs never
@@ -1404,6 +1410,10 @@ export function buildResumeJournal(entries: readonly SessionEntryLike[]): Map<
           : {}),
       };
       const key = `${event.runId}:${event.nodeId}`;
+      // Parsing resolves the result's tier before application, so the
+      // aggregate retains this exact accepted result object. Record even an
+      // identical nested retry: it becomes the aggregate's latest identity.
+      journalSources.set(key, { runId: event.runId, nodeId: event.nodeId, result: event.result });
       const existing = journal.get(key);
       if (candidate.generation !== undefined && existing?.generation !== undefined) {
         if (candidate.generation < existing.generation) return;
@@ -1419,17 +1429,34 @@ export function buildResumeJournal(entries: readonly SessionEntryLike[]): Map<
         }
       }
       journal.set(key, candidate);
-      journalRunIds.set(key, event.runId);
     },
   });
 
-  // replayJournal may quarantine a run after an accepted fact (for example,
-  // when a later contradictory event invalidates the aggregate). Do not retain
-  // cache entries belonging to that run.
-  for (const [key, runId] of journalRunIds) {
-    if (!replayedRuns.has(runId)) journal.delete(key);
+  // Reconcile with authoritative final state, not a second event acceptance
+  // parser. Generation rotations clear results; non-replayable replacements
+  // (including recovery terminal results) replace their identity; removal and
+  // quarantine discard the run. Rejected stale events change none of these.
+  for (const [key, source] of journalSources) {
+    const run = replayedRuns.get(source.runId);
+    if (run?.callStatus[source.nodeId] !== "completed" || run.callResults[source.nodeId] !== source.result) {
+      journal.delete(key);
+    }
   }
   return journal;
+}
+
+/**
+ * Copy accepted aggregate watermarks for WorkflowRunOptions.resumeWorkflowGenerations.
+ * Not a result cache: kind changes, rotations and failed results must not erase
+ * an earlier nested generation or make its old value eligible for replay.
+ * Supply a run returned by replayJournal (or the engine's accepted live aggregate).
+ */
+export function buildWorkflowGenerations(
+  run: Pick<ScriptRun, "workflowResultGenerations">,
+): ReadonlyMap<number, number> {
+  return new Map(
+    Object.entries(run.workflowResultGenerations).map(([index, generation]) => [Number(index), generation]),
+  );
 }
 
 /** Derive a stable recovery id from a recovery event's content. */

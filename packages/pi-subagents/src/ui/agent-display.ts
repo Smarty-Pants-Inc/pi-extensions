@@ -7,10 +7,11 @@
  * sanitizer on the way out.
  */
 
+import { sanitizeDisplayText } from "@signalridge/pi-ui";
 import { getConfig } from "../agent-types.js";
 import type { AgentInvocation, SubagentType } from "../types.js";
 import type { LifetimeUsage, SessionLike } from "../usage.js";
-import { sanitizeDisplayText, truncateCodePoints } from "./safe-text.js";
+import { truncateCodePoints } from "./safe-text.js";
 
 // ---- Constants ----
 

@@ -252,6 +252,12 @@ function emit(hooks: OrchestrationHooks, event: OrchestrationTaskEvent): void {
   }
 }
 
+function detachmentError(task: OrchestrationTask, error: unknown): TypeError {
+  return new TypeError(
+    `orchestrate() task "${task.id}" results cannot be detached: ${error instanceof Error ? error.message : String(error)}`,
+  );
+}
+
 function snapshotContext(
   task: OrchestrationTask,
   attempt: number,
@@ -262,9 +268,7 @@ function snapshotContext(
   try {
     detachedResults = structuredClone(values);
   } catch (error: unknown) {
-    throw new TypeError(
-      `orchestrate() task "${task.id}" results cannot be detached: ${error instanceof Error ? error.message : String(error)}`,
-    );
+    throw detachmentError(task, error);
   }
   return Object.freeze({
     id: task.id,
@@ -361,6 +365,19 @@ export async function executeOrchestration(
       });
     }
 
+    // Every attempt in this layer sees the same barrier state, even after a
+    // sibling settles. Detach once here, then again for each callback so nested
+    // mutations cannot alter the baseline or another attempt's input.
+    const layerStatuses = { ...statuses };
+    let layerValues: Record<string, unknown> = {};
+    let layerCloneError: { error: unknown } | undefined;
+    try {
+      layerValues = structuredClone(values);
+    } catch (error: unknown) {
+      // Keep detachment failures inside the existing per-task retry/error path.
+      layerCloneError = { error };
+    }
+
     const outcomes = await Promise.all(
       ready.map(async (task): Promise<{ task: OrchestrationTask; fatal?: { error: unknown } }> => {
         const record = records.get(task.id);
@@ -369,7 +386,8 @@ export async function executeOrchestration(
           record.attempts = attempt;
           try {
             hooks.throwIfAborted?.();
-            const value = await task.run(snapshotContext(task, attempt, values, statuses));
+            if (layerCloneError) throw detachmentError(task, layerCloneError.error);
+            const value = await task.run(snapshotContext(task, attempt, layerValues, layerStatuses));
             hooks.throwIfAborted?.();
             pending.delete(task.id);
             record.status = "completed";

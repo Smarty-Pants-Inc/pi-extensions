@@ -18,8 +18,8 @@
  *     interpolated from the file, so nothing else can ride along inside it.
  */
 
+import { sanitizeDisplayText } from "@signalridge/pi-ui";
 import { getConfig } from "./agent-types.js";
-import { sanitizeDisplayText } from "./ui/safe-text.js";
 
 const NAMED_AGENT_COLORS: Readonly<Record<string, string>> = {
   // Claude Code's eight subagent colors, as its default theme renders them.

@@ -1096,7 +1096,7 @@ test("statusline settings read legacy files and prefer the canonical package fil
     assert.equal(existsSync(legacyPath), true);
     const mock = createMockPi();
     statusline(mock.pi);
-    const context = createMockContext();
+    const context = createMockContext({ mode: "tui" });
     await emit(mock.events, "session_start", {}, context.ctx);
     assert.match(context.notifications[0]?.message ?? "", /takes precedence/i);
     assert.match(context.notifications[1]?.message ?? "", /read settings/i);

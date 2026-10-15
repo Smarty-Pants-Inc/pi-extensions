@@ -93,23 +93,27 @@ function collectSnippets(
 
 export default function codeActionsExtension(pi: ExtensionAPI) {
   let owner: { sessionId: string; leafId: string | null; controller: AbortController } | undefined;
+  const runs = new Set<Promise<void>>();
   let stopped = false;
   const retire = () => {
     const previous = owner;
     owner = undefined;
     previous?.controller.abort();
+    // Navigation/shutdown must wait for bounded process cleanup, not only abort the shell.
+    return Promise.allSettled(runs).then(() => {});
   };
   pi.on("session_before_switch", retire);
   pi.on("session_before_fork", retire);
   pi.on("session_before_tree", retire);
   pi.on("session_start", () => {
-    retire();
+    const cleanup = retire();
     stopped = false;
+    return cleanup;
   });
   pi.on("session_tree", retire);
   pi.on("session_shutdown", () => {
     stopped = true;
-    retire();
+    return retire();
   });
 
   pi.registerCommand("code", {
@@ -187,11 +191,18 @@ export default function codeActionsExtension(pi: ExtensionAPI) {
 
       if (action === "run") {
         if (!ctx.hasUI) return;
+        const cwd = ctx.cwd;
         const ok = await ctx.ui.confirm("Run snippet?", "This will execute the selected snippet in your shell.", {
           signal: operation.signal,
         });
         if (!operation.isCurrent() || !ok) return;
-        await runSnippet(pi, ctx, snippet.content, operation);
+        const running = runSnippet(pi, ctx, snippet.content, operation, cwd);
+        runs.add(running);
+        try {
+          await running;
+        } finally {
+          runs.delete(running);
+        }
       }
     },
   });

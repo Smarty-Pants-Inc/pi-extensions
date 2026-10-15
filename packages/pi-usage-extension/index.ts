@@ -9,7 +9,7 @@
  * Data collection and caching live in ./data.ts.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
@@ -43,6 +43,8 @@ import {
   renderChart,
   TOTAL_SERIES_KEY,
 } from "./graph.js";
+
+import { writePrivateExport } from "./private-export.js";
 
 type ViewMode = "table" | "insights" | "graph";
 
@@ -554,8 +556,7 @@ class UsageComponent {
       const home = homedir();
       const dir = resolveExportDir(configured, home, existsSync("/tmp"), tmpdir());
       mkdirSync(dir, { recursive: true });
-      const path = join(dir, name);
-      writeFileSync(path, content);
+      const path = writePrivateExport(dir, name, content);
       const shown = path.startsWith(`${home}/`) ? `~${path.slice(home.length)}` : path;
       this.exportNote = { text: `Saved ${shown}`, ok: true };
     } catch (err) {
@@ -711,12 +712,12 @@ class UsageComponent {
     }
     lines.push("");
 
-    if (!hasUsage) {
+    if (!hasUsage && insights.length === 0) {
       lines.push(th.fg("dim", "  No usage recorded for this period."));
       lines.push("");
       return lines;
     }
-    if (!hasCost) {
+    if (!hasCost && insights.length === 0) {
       lines.push(th.fg("dim", "  No cost data recorded for this period."));
       lines.push("");
       return lines;

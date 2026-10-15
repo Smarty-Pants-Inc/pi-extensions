@@ -32,7 +32,7 @@ for state it owns; renderers consume keys and never overwrite the producer's sta
 
 | Owner | Owns | Must not own |
 | --- | --- | --- |
-| `pi-subagents` | Managed child sessions, model/thinking/tool/skill policy, queue, concurrency, retry, cwd/isolation, transcripts, stop, quiescence, and managed lifecycle records. | Workflow DAG state or workflow journal interpretation. |
+| `pi-subagents` | Managed child sessions, model/thinking/tool/skill policy, queue, concurrency, retry, cwd/isolation, transcripts, stop, quiescence, managed lifecycle records, and opt-in ordinary parent clarification for background children. | Workflow DAG state, workflow journal interpretation, or automatic permission/credential/destructive-action approval. |
 | `pi-workflows` | DAG validation/scheduling, `pi-workflows:journal`, run/task transitions, recovery identities, synthesis, bounded control output, and workflow-owned event filtering. | Subagent settings, execution policy, raw child-session lifecycle, or unowned stop fallback. |
 | `pi-goal` | Goal state, goal persistence, goal-owned continuation/settled lifecycle, and bounded-flow tool policy. | Workflow journal or subagent queue policy. |
 | `pi-ralph-wiggum` | Ralph loop state and session-boundary behavior. | Goal state and managed subagent policy. |
@@ -41,7 +41,28 @@ The managed RPC is versioned and capability-gated. Every managed request and
 lifecycle event is scoped by `{ extension, runId, nodeId, attemptId }`. Workflow
 execution is disabled when the required peer is absent, duplicated, or advertises
 an incompatible protocol. Owned cleanup requires `ownedStop` and `ownedQuiescence`;
-there is no unowned stop fallback.
+there is no unowned stop fallback. The optional main-agent clarification channel
+belongs to the subagent owner, does not widen parent-history sharing, and leaves
+human approval gates unchanged. It is not a second managed RPC or an arbitrator
+agent.
+
+Workflow author JavaScript and callbacks execute in owned Node helpers. Native
+bindings, managed child dispatch, execution policy, budgets and durable journal
+facts stay parent-owned. A helper returning a value is not proof that accepted
+native operations or descendant execution frames are quiescent.
+
+## Background processes
+
+`pi-background` owns its local shell process groups, bounded in-memory logs,
+literal-match watches, and session-local notification outbox. It does not replace
+builtin `bash`, own remote workspace execution, spawn agents, or mutate Goal state.
+Session shutdown and successful session-tree navigation terminate owned jobs and
+discard logs/outbox state. There is no persistence or cross-extension control
+protocol. Permission policies must cover its launch tools separately from `bash`.
+Asynchronous events are recorded without a turn, then a bounded extension-sourced
+user message takes the normal prompt-hook path. This does not resume Goal state.
+Managed subagent sessions exclude `pi-background`: process-driven child turns
+cannot outlive their manager's completion or isolated-workspace cleanup.
 
 ## Persistence boundaries
 
@@ -69,8 +90,8 @@ lifecycle callbacks, synthesis, cleanup, and the terminal journal append settle.
 
 `pi-plan-mode` owns read-only command policy and plan persistence. `pi-worktree`
 owns repository-scoped locking, identity verification, quarantine, and safe Git
-mutation. It remains opt-in because the user's repository constitution forbids
-worktrees.
+mutation. It remains opt-in because worktree creation changes repository state
+and requires an explicit ownership and cleanup policy.
 
 `pi-lsp`, `pi-github-pr`, `pi-files-widget`, `pi-code-actions`, `pi-btw`, and
 `pi-recall` each own their tools, schemas, bounded output, and TUI guards. They do

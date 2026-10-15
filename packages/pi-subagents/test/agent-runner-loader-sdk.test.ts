@@ -208,7 +208,7 @@ export default function(pi) {
     expect(existsSync(sentinel)).toBe(false);
   });
 
-  it("does not prefilter an unrestricted discovery run", async () => {
+  it("keeps ordinary extensions under default inheritance despite ownership preselection", async () => {
     const { rogue } = fixtures();
     const { paths } = await loadedFor({ extensions: true });
     expect(paths).toContain(rogue);

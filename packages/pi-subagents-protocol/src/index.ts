@@ -50,3 +50,18 @@ export {
   requiredCapabilitiesMatch,
   routingPolicyFingerprint,
 } from "./validation.js";
+export type {
+  OwnedConversationOpenRequest,
+  WorkflowUiOpenRequest,
+  WorkflowUiQueryRequest,
+  WorkflowUiRunSummary,
+  WorkflowUiSnapshot,
+} from "./workflow-ui.js";
+export {
+  parseOwnedConversationOpenRequest,
+  parseWorkflowUiOpenRequest,
+  parseWorkflowUiQueryRequest,
+  parseWorkflowUiSnapshot,
+  WORKFLOW_UI_CHANNELS,
+  WORKFLOW_UI_VERSION,
+} from "./workflow-ui.js";

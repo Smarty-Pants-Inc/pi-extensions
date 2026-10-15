@@ -3,8 +3,9 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import * as piHost from "@earendil-works/pi-coding-agent";
+import { acquireClient } from "./client-leases.js";
 import { collectSupportedFiles, resolveRoot, resolveSupportedFile } from "./files.js";
-import { LspClient } from "./lsp-client.js";
+import type { LspClient } from "./lsp-client.js";
 import { beginStatus } from "./status.js";
 import { applyTextEdits, collectWorkspaceEdits, hasOverlappingTextEdits } from "./text-edits.js";
 import type { CodeAction, DiagnosticEntry, LspServerAdapter, LspTextEdit, StatusContext } from "./types.js";
@@ -32,16 +33,18 @@ export async function runDiagnostics(
     });
   }
 
-  const client = new LspClient(adapter, command, root, timeoutMs);
-  const abort = () => client.close();
   throwIfAborted(signal, adapter);
+  const { client, releaseWhenClosed } = await acquireClient(adapter, root, timeoutMs);
+  const abort = () => client.close();
   signal?.addEventListener("abort", abort, { once: true });
 
   let finishStatus: (() => void) | undefined;
+  let operationFailed = false;
   try {
     finishStatus = beginStatus(ctx, statusKey, `${adapter.name} diagnostics`);
     throwIfAborted(signal, adapter);
     await client.start();
+    throwIfAborted(signal, adapter);
     await client.initialize(root);
 
     const openedFiles: Array<{ file: string; uri: string }> = [];
@@ -69,11 +72,15 @@ export async function runDiagnostics(
     } finally {
       for (const { uri } of openedFiles) client.didClose(uri);
     }
+  } catch (error) {
+    operationFailed = true;
+    throw error;
   } finally {
     signal?.removeEventListener("abort", abort);
     try {
-      await client.shutdown();
+      await shutdownClient(client, operationFailed);
     } finally {
+      releaseWhenClosed();
       finishStatus?.();
     }
   }
@@ -108,17 +115,18 @@ async function runFixWindow(
   const file = params.path;
   const actionKind = params.kind?.trim() || "source.fixAll";
 
-  const command = adapter.defaultCommand;
-  const client = new LspClient(adapter, command, root, timeoutMs);
-  const abort = () => client.close();
   throwIfAborted(signal, adapter);
+  const { client, releaseWhenClosed } = await acquireClient(adapter, root, timeoutMs);
+  const abort = () => client.close();
   signal?.addEventListener("abort", abort, { once: true });
 
   let finishStatus: (() => void) | undefined;
+  let operationFailed = false;
   try {
     finishStatus = beginStatus(ctx, statusKey, `${adapter.name} fix`);
     throwIfAborted(signal, adapter);
     await client.start();
+    throwIfAborted(signal, adapter);
     await client.initialize(root);
     throwIfAborted(signal, adapter);
     const uri = pathToFileURL(file).href;
@@ -162,13 +170,26 @@ async function runFixWindow(
       edits,
       text: !params.write && changed ? newText : undefined,
     });
+  } catch (error) {
+    operationFailed = true;
+    throw error;
   } finally {
     signal?.removeEventListener("abort", abort);
     try {
-      await client.shutdown();
+      await shutdownClient(client, operationFailed);
     } finally {
+      releaseWhenClosed();
       finishStatus?.();
     }
+  }
+}
+
+async function shutdownClient(client: LspClient, operationFailed: boolean) {
+  try {
+    await client.shutdown();
+  } catch (error) {
+    // Cleanup failure must not replace the original protocol/request error.
+    if (!operationFailed) throw error;
   }
 }
 

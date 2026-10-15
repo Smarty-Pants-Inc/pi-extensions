@@ -1,7 +1,6 @@
-import type { ExtensionCommandContext, KeybindingsManager, Theme } from "@earendil-works/pi-coding-agent";
-import type { Component, TUI } from "@earendil-works/pi-tui";
+import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { MenuContext, RunMenuResult } from "@narumitw/pi-tui-kit";
-import { wrapCustomUi } from "@signalridge/pi-ui";
+import { withBorderedCustomUi, withPreservedCustomEditor } from "@signalridge/pi-ui";
 import {
   type BtwSettings,
   btwSettingsPath,
@@ -44,14 +43,6 @@ export type BtwCommandMenuResult = "start" | "closed" | { kind: "resume"; thread
 
 type BtwMenuScreen = "main" | "resume" | "settings" | "invalid";
 type BtwMenuAction = "start" | "resume" | "set-thinking" | "set-remember";
-type BtwCustomOptions = Parameters<ExtensionCommandContext["ui"]["custom"]>[1];
-
-type BtwCustomFactory<T> = (
-  tui: TUI,
-  theme: Theme,
-  keybindings: KeybindingsManager,
-  done: (result: T) => void,
-) => Component;
 
 export async function showBtwCommandMenu(
   ctx: ExtensionCommandContext,
@@ -250,44 +241,28 @@ export async function runBtwMenuPreservingEditor(
     }
   };
   if (!ownsSession()) return { kind: "stale" };
-  let liveEditorText = ctx.ui.getEditorText();
-  let completed = false;
-  const restoreLiveEditor = () => {
-    if (completed && ownsSession()) {
-      try {
-        if (ctx.ui.getEditorText() !== liveEditorText && ownsSession()) ctx.ui.setEditorText(liveEditorText);
-      } catch {
-        // A replaced context owns a different editor and must not receive stale restoration.
-      }
-    }
-  };
-  const ui = new Proxy(wrapCustomUi(ctx.ui), {
+  // Each screen's draft is repaired synchronously when it completes (before the
+  // menu mounts the next screen), but only while this session still owns the
+  // editor: a replaced context must not receive stale restoration.
+  const ownedUi = new Proxy(ctx.ui, {
     get(target, property) {
-      if (property === "custom") {
-        return <Value>(factory: BtwCustomFactory<Value>, customOptions?: BtwCustomOptions) =>
-          target.custom<Value>(
-            (tui, theme, keybindings, done) =>
-              factory(tui, theme, keybindings, (value) => {
-                try {
-                  if (ownsSession()) liveEditorText = target.getEditorText();
-                } catch {
-                  // Keep completion finite if session replacement invalidates the editor context.
-                }
-                completed = true;
-                done(value);
-                // Pi restores its opening snapshot synchronously. Restore the live
-                // draft before the menu mounts another screen and captures it.
-                restoreLiveEditor();
-              }),
-            customOptions,
-          );
+      if (property === "setEditorText") {
+        return (text: string) => {
+          if (ownsSession()) target.setEditorText(text);
+        };
       }
       const value = Reflect.get(target, property, target) as unknown;
       return typeof value === "function" ? value.bind(target) : value;
     },
   });
-  const result = await run({ mode: ctx.mode, hasUI: ctx.hasUI, ui });
-  restoreLiveEditor();
+  const ownedContext = new Proxy(ctx, {
+    get(target, property) {
+      if (property === "ui") return ownedUi;
+      return Reflect.get(target, property, target);
+    },
+  });
+  const menuContext = withBorderedCustomUi(withPreservedCustomEditor(ownedContext));
+  const result = await run(menuContext);
   return ownsSession() ? result : { kind: "stale" };
 }
 

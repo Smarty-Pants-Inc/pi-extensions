@@ -1,10 +1,10 @@
-import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { lstat, readdir, rename, rmdir, unlink } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import type { ExecResult, ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import lockfile from "proper-lockfile";
+import { GitInputError, runGitInput } from "./git-input.ts";
 
 const GIT_TIMEOUT_MS = 15_000;
 const GIT_MUTATION_TIMEOUT_MS = 60_000;
@@ -63,9 +63,15 @@ interface GitExecOptions {
 
 export class GitWorktreeError extends Error {
   readonly args?: readonly string[];
+  readonly stdout?: string;
+  readonly stderr?: string;
 
-  constructor(message: string, args?: readonly string[]) {
-    super(message);
+  constructor(message: string, args?: readonly string[], cause?: unknown) {
+    super(message, { cause });
+    if (cause instanceof GitInputError) {
+      this.stdout = cause.stdout;
+      this.stderr = cause.stderr;
+    }
     this.name = "GitWorktreeError";
     this.args = args;
   }
@@ -1254,65 +1260,13 @@ function runGitWithInputAllowFailure(
   if (signal?.aborted) {
     return Promise.resolve({ stdout: "", stderr: "", code: 1, killed: true });
   }
-  return new Promise((resolveResult, reject) => {
-    // ExtensionAPI.exec has no stdin channel, so this read-only check uses an argv-only child.
-    const child = spawn("git", args, {
-      cwd,
-      stdio: ["pipe", "pipe", "pipe"],
-      windowsHide: true,
-    });
-    let stdout = "";
-    let stderr = "";
-    let killed = false;
-    let settled = false;
-    const finish = (result: ExecResult) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeoutHandle);
-      signal?.removeEventListener("abort", stop);
-      resolveResult(result);
-    };
-    const fail = (error: unknown) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeoutHandle);
-      signal?.removeEventListener("abort", stop);
-      child.kill();
-      const message = formatError(error);
-      reject(
-        /\bENOENT\b|not found/i.test(message)
-          ? new GitWorktreeError("Git executable was not found. Install Git and retry.", args)
-          : new GitWorktreeError(`Could not start git ${args.slice(0, 2).join(" ")}: ${message}`, args),
-      );
-    };
-    const stop = () => {
-      killed = true;
-      child.kill();
-    };
-    const timeoutHandle = setTimeout(stop, timeout);
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => {
-      stdout += chunk;
-    });
-    child.stderr.on("data", (chunk: string) => {
-      stderr += chunk;
-    });
-    child.stdin.on("error", (error) => {
-      if (!isNodeError(error) || error.code !== "EPIPE") fail(error);
-    });
-    child.once("error", fail);
-    child.once("close", (code, closeSignal) => {
-      finish({
-        stdout,
-        stderr,
-        code: code ?? 1,
-        killed: killed || closeSignal !== null,
-      });
-    });
-    signal?.addEventListener("abort", stop, { once: true });
-    if (signal?.aborted) stop();
-    child.stdin.end(input);
+  // ExtensionAPI.exec has no stdin channel. This local argv-only owner bounds
+  // both cancellation and timeout cleanup without changing native Git settings.
+  return runGitInput(args, cwd, input, signal, timeout).catch((error: unknown) => {
+    const message = formatError(error);
+    throw /\bENOENT\b|not found/i.test(message)
+      ? new GitWorktreeError("Git executable was not found. Install Git and retry.", args, error)
+      : new GitWorktreeError(`git ${args.slice(0, 2).join(" ")}: ${message}`, args, error);
   });
 }
 

@@ -20,8 +20,10 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { ManagedSpawnResponse } from "@signalridge/pi-subagents-protocol";
 import { isManagedAgentTier } from "@signalridge/pi-subagents-protocol";
-import { WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
+import { describeWorkflowError, WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
+import { type WorkflowInspection, type WorkflowInspectionHeader, WorkflowPresentation } from "./inspection.js";
 import {
+  applyRecoveryEvent,
   buildResumeJournal,
   type CallResult,
   type CallTierIdentity,
@@ -31,6 +33,7 @@ import {
   type JournalEvent,
   type JournalWriter,
   type RecoveryTerminalResult,
+  type RunRecoveryEvent,
   replayJournal,
   type ScriptRun,
   type SessionEntryLike,
@@ -172,6 +175,25 @@ interface AgentTerminalDelivery {
   history?: unknown[];
 }
 
+interface ManagedCallFacts {
+  executionGeneration: number;
+  attemptId: string;
+  agentId: string;
+  tokenCount?: number;
+  outputFile?: string;
+  compactionCount: number;
+}
+
+interface OwnedCleanup {
+  agentId: string;
+  spawnKey?: string;
+  owner: WorkflowOwner;
+  epoch: number;
+  confirmed: Promise<void>;
+  resolve: () => void;
+  operation?: Promise<void>;
+}
+
 interface BufferedAgentTerminal extends AgentTerminalDelivery {
   owner: WorkflowOwner;
   executionGeneration: number;
@@ -179,6 +201,15 @@ interface BufferedAgentTerminal extends AgentTerminalDelivery {
 
 export interface ScriptRunState {
   run: ScriptRun;
+  /** Volatile, execution-fenced presentation; never journaled. */
+  presentation: WorkflowPresentation;
+  /** Exact-attempt metadata merged into the runtime's single schema-transformed result fact. */
+  managedCallFacts: Map<string, ManagedCallFacts>;
+  /** Ownership remains busy even after a cleanup deadline fences execution. */
+  pendingCleanup: Set<Promise<void>>;
+  activeExecutionGenerations: Set<number>;
+  stopOperation?: Promise<void>;
+  removeOperation?: Promise<void>;
   /** Frozen run parameters — resume reuses the original values, ignoring new budget/toolset overrides. */
   frozenOptions: Pick<
     ScriptStartOptions,
@@ -200,8 +231,18 @@ export interface ScriptRunState {
   agentWaiters: Map<string, AgentLifecycleWaiter>;
   /** Owner-validated terminal events emitted before their spawn reply/waiter. */
   bufferedTerminals: Map<string, BufferedAgentTerminal>;
-  /** Allocations whose managed-spawn reply has not arrived yet. */
-  pendingSpawns: Map<string, { spawnKey: string; owner: WorkflowOwner; executionGeneration: number }>;
+  /** Local reservations and submitted allocations retained through terminal admission. */
+  pendingSpawns: Map<
+    string,
+    {
+      spawnKey: string;
+      owner: WorkflowOwner;
+      executionGeneration: number;
+      phase: "reserved" | "submitted";
+      startedAgentId?: string;
+      agentId?: string;
+    }
+  >;
   /** Journal retry bookkeeping. */
   pendingJournal: Set<string>;
   /** Whether a lifecycle suspension is in effect (branch change). */
@@ -307,12 +348,41 @@ function sameWorkflowOwner(left: WorkflowOwner, right: WorkflowOwner): boolean {
   );
 }
 
+/** Optional owned lifecycle usage is per-attempt; legacy `tokens` remains lifetime-scoped. */
+function managedLifecycleUsage(raw: unknown): AgentUsage | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const { input, output, total } = raw as Record<string, unknown>;
+  if (
+    typeof input !== "number" ||
+    typeof output !== "number" ||
+    typeof total !== "number" ||
+    !Number.isSafeInteger(input) ||
+    !Number.isSafeInteger(output) ||
+    !Number.isSafeInteger(total) ||
+    input < 0 ||
+    output < 0 ||
+    total < 0 ||
+    !Number.isSafeInteger(input + output) ||
+    total < input + output
+  )
+    return undefined;
+  // The managed total includes cache writes, but excludes cache reads. The
+  // additive lifecycle field has no cost/cache-read detail; do not invent it.
+  return { input, output, total, cost: 0, cacheRead: 0, cacheWrite: total - input - output };
+}
+
 export class WorkflowEngine {
   private readonly runs = new Map<string, ScriptRunState>();
   /** Fired when a run settles terminal; wired by the UI surface for widget refresh. */
   onRunSettled: (() => void) | undefined;
+  /** Every accepted background execution, including automatic and UI resumes. */
+  onBackgroundExecution: ((runId: string) => void) | undefined;
   /** Optional in-process observer for phase/task/quality runtime events. */
   onRuntimeEvent: ((runId: string, event: WorkflowRuntimeEvent) => void) | undefined;
+  /** Additive notification after accepted presentation mutations; consumers re-read getInspection(). */
+  onInspectionChanged: ((runId: string) => void) | undefined;
+  /** Fresh saved-workflow resolver for control and automatic resumes. */
+  loadSavedWorkflow: ((name: string) => string | undefined) | undefined;
   /**
    * The user's current strength → Agent tier table, read fresh per execution.
    *
@@ -339,11 +409,19 @@ export class WorkflowEngine {
   private admissionsClosed = false;
   private pendingAdmissions = 0;
   private recoveryBranchGeneration = 0;
-  private readonly journalRetries = new Map<string, { timer?: ReturnType<typeof setTimeout>; attempt: number }>();
+  private readonly journalRetries = new Map<
+    string,
+    { timer?: ReturnType<typeof setTimeout>; attempt: number; done: Promise<void>; resolve: () => void }
+  >();
   private readonly journalBlockedRuns = new Set<string>();
   private readonly providerResumeTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private journalMutationKey: string | undefined;
+  private journalMutationSequence = 0;
   private readonly quarantinedRunIds = new Set<string>();
+  private readonly cleanupObligations = new WeakMap<ScriptRunState, Map<string, OwnedCleanup>>();
+  /** Retired states keep their exact leases; replacement states never inherit them. */
+  private readonly retainedCleanupStates = new Set<ScriptRunState>();
+  private readonly terminalNotified = new WeakSet<ScriptRunState>();
 
   constructor(
     readonly events: WorkflowEventBus,
@@ -357,6 +435,15 @@ export class WorkflowEngine {
       protocolGate ??
       (() => this.client.checkProtocol?.() ?? Promise.reject(new Error("managed protocol check is unavailable")));
     this.unsubscribeLifecycle = this.attachLifecycle();
+  }
+
+  private notifyInspection(state: ScriptRunState): void {
+    state.presentation.changed();
+    try {
+      this.onInspectionChanged?.(state.run.runId);
+    } catch {
+      // Presentation observers must never change execution or durable control.
+    }
   }
 
   private async awaitProtocol(): Promise<ManagedProtocolCheck> {
@@ -382,6 +469,40 @@ export class WorkflowEngine {
     return this.disposed;
   }
 
+  /** Pure exact-state cleanup uncertainty query for owner control surfaces. */
+  hasPendingCleanup(runId: string): boolean {
+    return (this.runs.get(runId)?.pendingCleanup.size ?? 0) > 0;
+  }
+
+  private isCurrentState(state: ScriptRunState, generation: number, epoch: number): boolean {
+    return (
+      this.runs.get(state.run.runId) === state &&
+      state.executionGeneration === generation &&
+      this.branchEpoch === epoch &&
+      !state.lifecycleSuspended &&
+      !this.lifecyclePaused &&
+      !this.disposed
+    );
+  }
+
+  private notifyTerminal(state: ScriptRunState): void {
+    const generation = state.executionGeneration;
+    const epoch = this.branchEpoch;
+    if (
+      !this.isCurrentState(state, generation, epoch) ||
+      state.pendingCleanup.size > 0 ||
+      this.terminalNotified.has(state)
+    )
+      return;
+    this.terminalNotified.add(state);
+    this.settleWaiters(state.run.runId, state.run);
+    try {
+      this.onRunSettled?.();
+    } catch {
+      /* terminal observers are presentation-only */
+    }
+  }
+
   /** A synchronous snapshot for cancellable navigation, not an admission lock. */
   hasUnsettledWork(): boolean {
     return (
@@ -389,6 +510,7 @@ export class WorkflowEngine {
       this.branchQuiescePromise !== undefined ||
       this.journalRetries.size > 0 ||
       this.providerResumeTimers.size > 0 ||
+      this.retainedCleanupStates.size > 0 ||
       [...this.runs.values()].some(
         (state) =>
           state.run.status === "running" ||
@@ -396,7 +518,11 @@ export class WorkflowEngine {
           state.run.status === "stopping" ||
           state.pendingSpawns.size > 0 ||
           state.agentWaiters.size > 0 ||
-          state.pendingJournal.size > 0,
+          state.pendingJournal.size > 0 ||
+          state.pendingCleanup.size > 0 ||
+          state.activeExecutionGenerations.size > 0 ||
+          state.stopOperation !== undefined ||
+          state.removeOperation !== undefined,
       )
     );
   }
@@ -410,6 +536,8 @@ export class WorkflowEngine {
     this.clearJournalRetries();
     for (const state of this.runs.values()) {
       state.lifecycleSuspended = true;
+      state.presentation.reset(false);
+      this.notifyInspection(state);
       state.controller.abort(new DOMException("Workflow branch replaced", "AbortError"));
     }
   }
@@ -436,7 +564,8 @@ export class WorkflowEngine {
       eventName !== "subagents:created" &&
       eventName !== "subagents:started" &&
       eventName !== "subagents:completed" &&
-      eventName !== "subagents:failed"
+      eventName !== "subagents:failed" &&
+      eventName !== "subagents:compacted"
     )
       return;
     if (!raw || typeof raw !== "object") return;
@@ -489,13 +618,55 @@ export class WorkflowEngine {
     if (currentAttemptId !== undefined && currentAttemptId !== `${owner.runId}/${callNodeId}/${owner.attemptId}`)
       return;
 
+    const acceptedGeneration = state.executionGeneration;
+    const acceptedEpoch = this.branchEpoch;
+    const current = () =>
+      this.isCurrentState(state, acceptedGeneration, acceptedEpoch) && !state.controller.signal.aborted;
+    const terminalEvent = eventName === "subagents:completed" || eventName === "subagents:failed";
+    const hasManagedUsage = terminalEvent && "managedTokens" in data;
+    const managedUsage = hasManagedUsage ? managedLifecycleUsage(data.managedTokens) : undefined;
+    // A malformed present field cannot fall back to cumulative lifetime usage.
+    // Reject before identity, presentation, buffering, or waiter mutations.
+    if (hasManagedUsage && !managedUsage) return;
+
+    if (eventName === "subagents:compacted") {
+      this.recordManagedAdmission(state, callNodeId, agentId, state.executionGeneration);
+      if (!current()) return;
+      if (
+        typeof data.compactionCount === "number" &&
+        Number.isSafeInteger(data.compactionCount) &&
+        data.compactionCount >= 0
+      ) {
+        const facts = state.managedCallFacts.get(callNodeId);
+        if (facts) facts.compactionCount = Math.max(facts.compactionCount, data.compactionCount);
+        if (state.run.attemptIds[callNodeId])
+          state.run.compactions[callNodeId] = facts?.compactionCount ?? data.compactionCount;
+        state.presentation.managed(callNodeId, { compactionCount: facts?.compactionCount ?? data.compactionCount });
+        this.notifyInspection(state);
+      }
+      return;
+    }
     if (updateCallTierIdentity(state, callNodeId, data.tier)) {
       this.persistCallTierIdentity(state, callNodeId);
     }
+    if (!current()) return;
+    this.recordManagedAdmission(state, callNodeId, agentId, state.executionGeneration);
+    if (!current()) return;
     // A start is the moment the host admitted this agent from its queue. It is
     // the only signal that separates waiting for a slot from doing the work, so
     // the call's wall clock is restarted here rather than at dispatch.
-    if (eventName === "subagents:started" && waiterMatches && waiter) notifyAgentRunning(waiter);
+    if (eventName === "subagents:started") {
+      if (pendingMatches && pending) pending.startedAgentId = agentId;
+      if (waiterMatches && waiter) notifyAgentRunning(waiter);
+      if (!current()) return;
+    }
+    state.presentation.managed(callNodeId, {
+      agentId,
+      status: eventName === "subagents:started" ? "running" : undefined,
+      ...(isManagedAgentTier(data.tier) ? { tier: data.tier } : {}),
+    });
+    this.notifyInspection(state);
+    if (!current()) return;
     // Created/started lifecycle facts carry managed identity before the RPC
     // reply is necessarily available. They are observation-only here; terminal
     // ownership is handled below once a completion/failure fact arrives.
@@ -508,13 +679,27 @@ export class WorkflowEngine {
           ? "stopped"
           : "failed";
     const tokenCount =
-      typeof data.tokenCount === "number"
-        ? data.tokenCount
-        : data.tokens &&
-            typeof data.tokens === "object" &&
-            typeof (data.tokens as Record<string, unknown>).total === "number"
-          ? ((data.tokens as Record<string, unknown>).total as number)
-          : undefined;
+      managedUsage !== undefined
+        ? managedUsage.total
+        : typeof data.tokenCount === "number"
+          ? data.tokenCount
+          : data.tokens &&
+              typeof data.tokens === "object" &&
+              typeof (data.tokens as Record<string, unknown>).total === "number"
+            ? ((data.tokens as Record<string, unknown>).total as number)
+            : undefined;
+    state.presentation.managed(callNodeId, {
+      agentId,
+      status: lifecycleStatus,
+      tokenCount,
+      ...(typeof data.outputFile === "string" ? { outputFile: data.outputFile } : {}),
+      compactionCount: Math.max(
+        typeof data.compactionCount === "number" ? data.compactionCount : 0,
+        state.managedCallFacts.get(callNodeId)?.compactionCount ?? 0,
+      ),
+    });
+    this.notifyInspection(state);
+    if (!current()) return;
     const delivery: AgentTerminalDelivery = {
       response: {
         id: agentId,
@@ -528,9 +713,11 @@ export class WorkflowEngine {
           completedAt: typeof data.completedAt === "number" ? data.completedAt : Date.now(),
         },
       },
-      ...(tokenCount === undefined
-        ? {}
-        : { usage: { input: 0, output: tokenCount, total: tokenCount, cost: 0, cacheRead: 0, cacheWrite: 0 } }),
+      ...(managedUsage !== undefined
+        ? { usage: managedUsage }
+        : tokenCount === undefined
+          ? {}
+          : { usage: { input: 0, output: tokenCount, total: tokenCount, cost: 0, cacheRead: 0, cacheWrite: 0 } }),
       ...(Array.isArray(data.history) ? { history: [...data.history] } : {}),
     };
 
@@ -547,6 +734,60 @@ export class WorkflowEngine {
     state.bufferedTerminals.set(spawnKey, { ...delivery, owner, executionGeneration: state.executionGeneration });
   }
 
+  private recordManagedAdmission(
+    state: ScriptRunState,
+    nodeId: string,
+    agentId: string,
+    executionGeneration: number,
+  ): void {
+    const attemptId = state.run.attemptIds[nodeId];
+    if (!attemptId) return; // Nested facts remain volatile, owned by the parent boundary.
+    const existing = state.managedCallFacts.get(nodeId);
+    if (
+      existing?.executionGeneration === executionGeneration &&
+      existing.attemptId === attemptId &&
+      existing.agentId === agentId
+    )
+      return;
+    state.managedCallFacts.set(nodeId, { executionGeneration, attemptId, agentId, compactionCount: 0 });
+    state.run.agentIds[nodeId] = agentId;
+    state.run.compactions[nodeId] = 0;
+    const event: JournalEvent = {
+      kind: "call_transition",
+      schemaVersion: JOURNAL_SCHEMA_VERSION,
+      runId: state.run.runId,
+      nodeId,
+      status: "running",
+      agentId,
+      ...(state.callTiers.get(nodeId)?.tier === undefined ? {} : { tier: state.callTiers.get(nodeId)?.tier }),
+      attemptId,
+      owner: { extension: "pi-workflows", runId: state.run.runId, nodeId, attemptId },
+      timestamp: Date.now(),
+    };
+    this.persist(state.run.runId, `call-identity:${nodeId}`, () => this.write(event));
+  }
+
+  private recordManagedTerminal(
+    state: ScriptRunState,
+    nodeId: string,
+    agentId: string,
+    terminal: NonNullable<ManagedSpawnResponse["terminal"]>,
+    executionGeneration: number,
+  ): void {
+    this.recordManagedAdmission(state, nodeId, agentId, executionGeneration);
+    const facts = state.managedCallFacts.get(nodeId);
+    if (
+      !facts ||
+      facts.executionGeneration !== executionGeneration ||
+      facts.attemptId !== state.run.attemptIds[nodeId] ||
+      facts.agentId !== agentId
+    )
+      return;
+    facts.tokenCount = terminal.tokenCount;
+    facts.outputFile = terminal.outputFile;
+    facts.compactionCount = Math.max(facts.compactionCount, terminal.compactionCount);
+  }
+
   /** Persist a host-normalized tier learned before the managed reply arrives. */
   private persistCallTierIdentity(state: ScriptRunState, nodeId: string): void {
     const attemptId = state.run.attemptIds[nodeId];
@@ -554,19 +795,18 @@ export class WorkflowEngine {
     // Nested workflow frames are in-memory only; only a top-level call has a
     // durable attempt owner and can safely receive a journal transition.
     if (!attemptId || identity?.tier === undefined) return;
-    this.persist(state.run.runId, `call-tier:${nodeId}`, () =>
-      this.write({
-        kind: "call_transition",
-        schemaVersion: JOURNAL_SCHEMA_VERSION,
-        runId: state.run.runId,
-        nodeId,
-        status: "running",
-        tier: identity.tier,
-        attemptId,
-        owner: { extension: "pi-workflows", runId: state.run.runId, nodeId, attemptId },
-        timestamp: Date.now(),
-      }),
-    );
+    const event: JournalEvent = {
+      kind: "call_transition",
+      schemaVersion: JOURNAL_SCHEMA_VERSION,
+      runId: state.run.runId,
+      nodeId,
+      status: "running",
+      tier: identity.tier,
+      attemptId,
+      owner: { extension: "pi-workflows", runId: state.run.runId, nodeId, attemptId },
+      timestamp: Date.now(),
+    };
+    this.persist(state.run.runId, `call-tier:${nodeId}`, () => this.write(event));
   }
 
   private resolveAgentWaiter(
@@ -578,9 +818,23 @@ export class WorkflowEngine {
     if (waiter.settled) return;
     waiter.settled = true;
     state.agentWaiters.delete(agentId);
-    if (delivery.usage) waiter.onUsage?.(delivery.usage);
-    if (delivery.history) waiter.onHistory?.(delivery.history);
-    waiter.resolve(delivery.response);
+    const epoch = this.branchEpoch;
+    try {
+      if (delivery.usage) waiter.onUsage?.(delivery.usage);
+      if (!this.isCurrentState(state, waiter.executionGeneration, epoch) || state.controller.signal.aborted) {
+        waiter.reject(new WorkflowWaitAbortedError());
+        return;
+      }
+      if (delivery.history) waiter.onHistory?.(delivery.history);
+      if (!this.isCurrentState(state, waiter.executionGeneration, epoch) || state.controller.signal.aborted) {
+        waiter.reject(new WorkflowWaitAbortedError());
+        return;
+      }
+      waiter.resolve(delivery.response);
+    } catch (error) {
+      // A throwing observer cannot strand a removed waiter and its child lease.
+      waiter.reject(error);
+    }
   }
 
   dispose(): void {
@@ -589,12 +843,14 @@ export class WorkflowEngine {
     this.disposeController.abort();
     this.unsubscribeLifecycle();
     this.quarantinedRunIds.clear();
-    for (const state of this.runs.values()) {
+    const retiredStates = [...this.runs.values()];
+    for (const state of retiredStates) {
       this.cleanupAgents(state.run.runId);
       state.controller.abort(new DOMException("Workflow engine disposed", "AbortError"));
     }
     this.rejectWaiters(new WorkflowWaitAbortedError());
     this.runs.clear();
+    for (const state of retiredStates) this.notifyInspection(state);
     this.clearJournalRetries();
     this.branchQuiescePromise = undefined;
   }
@@ -613,68 +869,58 @@ export class WorkflowEngine {
 
   /** Stop owned agents while Pi replaces the active session-tree branch. */
   async quiesceForBranchChange(): Promise<WorkflowQuiesceResult> {
-    if (this.disposed) return { settled: true, pending: [] };
     if (this.branchQuiescePromise) return this.branchQuiescePromise;
     this.admissionsClosed = true;
     this.clearJournalRetries();
 
-    // Suspend and abort synchronously, before any await can let a stale runtime
-    // dispatch another call or let a provider-limit continuation recreate an old
-    // branch agent. `restore()` creates fresh states with suspension cleared.
-    const targets = new Map<string, { agentIds: string[]; owners: WorkflowOwner[] }>();
-    for (const state of this.runs.values()) {
-      if (isTerminalWorkflow(state.run.status)) continue;
-      const agentIds = [...state.agentWaiters.keys()];
-      const owners = agentIds.map((agentId) => {
-        const waiter = state.agentWaiters.get(agentId);
-        return {
-          extension: "pi-workflows" as const,
-          runId: state.run.runId,
-          nodeId: waiter ? `call-${waiter.callIndex}` : "",
-          attemptId: `attempt-${waiter?.generation ?? 1}`,
-        };
-      });
-      targets.set(state.run.runId, { agentIds, owners });
-      state.lifecycleSuspended = true;
-      state.bufferedTerminals.clear();
-      state.controller.abort(new DOMException("Workflow branch change", "AbortError"));
-    }
-
-    const operation = (async () => {
-      const operations: Array<Promise<WorkflowQuiesceResult>> = [];
-      for (const state of this.runs.values()) {
-        const run = state.run;
-        const target = targets.get(run.runId);
-        if (isTerminalWorkflow(run.status)) {
-          this.reconcilePendingSpawns(state);
-          continue;
-        }
-        if (state.pendingSpawns.size > 0) operations.push(this.quiescePendingSpawns(state));
-        const activeAgentIds = target?.agentIds ?? [];
-        if (activeAgentIds.length === 0) continue;
-        operations.push(
-          this.client
-            .quiesceOwned?.(run.runId, activeAgentIds, BRANCH_QUIESCE_TIMEOUT_MS, target?.owners)
-            .then((result) => ({
-              settled: result.settled && result.pending.length === 0,
-              pending: [...new Set(result.pending)].slice(0, 256),
-            }))
-            .catch((error: unknown) => ({
-              settled: false,
-              pending: activeAgentIds.slice(0, 256),
-              diagnostic: error instanceof Error ? error.message : String(error),
-            })) ?? Promise.resolve({ settled: false, pending: activeAgentIds.slice(0, 256) }),
-        );
+    // Snapshot exact states/owners, not run ids or status. Terminal and retired
+    // states may still own cleanup, and observation must not donate those
+    // leases to a same-id replacement on a newly committed branch.
+    const states = [...new Set([...this.runs.values(), ...this.retainedCleanupStates])];
+    const targets = states.flatMap((state) => {
+      const owners = new Map<string, { agentId: string; owner: WorkflowOwner; generation: number }>();
+      for (const pending of state.pendingSpawns.values()) {
+        if (pending.phase !== "submitted") continue;
+        owners.set(JSON.stringify(pending.owner), {
+          agentId: pending.agentId ?? pending.startedAgentId ?? pending.spawnKey,
+          owner: { ...pending.owner },
+          generation: pending.executionGeneration,
+        });
       }
-      const results = await Promise.all(operations);
-      const pending = [...new Set(results.flatMap((r) => r.pending))].slice(0, 256);
-      const diagnostics = results.map((r) => r.diagnostic).filter((d): d is string => Boolean(d));
-      return {
-        settled: results.every((r) => r.settled) && pending.length === 0,
-        pending,
-        ...(diagnostics.length > 0 ? { diagnostic: diagnostics.join("; ") } : {}),
-      };
-    })();
+      for (const [agentId, waiter] of state.agentWaiters) {
+        const owner: WorkflowOwner = {
+          extension: "pi-workflows",
+          runId: state.run.runId,
+          nodeId: `call-${waiter.callIndex}`,
+          attemptId: `attempt-${waiter.generation}`,
+        };
+        owners.set(JSON.stringify(owner), { agentId, owner, generation: waiter.executionGeneration });
+      }
+      for (const cleanup of this.cleanupObligations.get(state)?.values() ?? []) {
+        owners.set(JSON.stringify(cleanup.owner), {
+          agentId: cleanup.agentId,
+          owner: { ...cleanup.owner },
+          generation: state.executionGeneration,
+        });
+      }
+      return [...owners.values()].map((target) => ({ state, ...target }));
+    });
+    // Publish the handshake before RPC, abort or inspection can re-enter.
+    let acceptOperations!: (operations: Promise<void>[]) => void;
+    const operations = new Promise<Promise<void>[]>((resolve) => {
+      acceptOperations = resolve;
+    });
+    const operation = operations.then(async (cleanup) => {
+      await Promise.all(cleanup);
+      const pending = [
+        ...new Set(
+          states.flatMap((state) =>
+            [...(this.cleanupObligations.get(state)?.values() ?? [])].map((cleanup) => cleanup.agentId),
+          ),
+        ),
+      ].slice(0, 256);
+      return { settled: pending.length === 0, pending };
+    });
     const tracked = operation.then(
       (result) => {
         if (this.branchQuiescePromise === tracked) this.branchQuiescePromise = undefined;
@@ -686,6 +932,34 @@ export class WorkflowEngine {
       },
     );
     this.branchQuiescePromise = tracked;
+    // Fence every captured state before the first notifying observer. Start
+    // known-id owner checks synchronously for the bus-first shutdown handshake;
+    // their positive result is consumed by the same stable cleanup obligation,
+    // never treated as a status-only shortcut or a separate donated lease.
+    for (const state of states) state.lifecycleSuspended = true;
+    acceptOperations(
+      targets.map(({ state, agentId, owner, generation }) => {
+        const existing = [...(this.cleanupObligations.get(state)?.values() ?? [])].find((cleanup) =>
+          sameWorkflowOwner(cleanup.owner, owner),
+        );
+        let quiescence: Promise<{ settled: boolean; pending: string[] }> | undefined;
+        if (!existing?.operation && agentId !== `${owner.runId}/${owner.nodeId}/${owner.attemptId}`) {
+          try {
+            quiescence = this.client.quiesceOwned?.(owner.runId, [agentId], BRANCH_QUIESCE_TIMEOUT_MS, [owner]);
+          } catch (error) {
+            quiescence = Promise.reject(error);
+          }
+          void quiescence?.catch(() => {});
+        }
+        return this.stopAndQuiesce(state, agentId, owner, generation, undefined, quiescence);
+      }),
+    );
+    for (const state of states) {
+      state.bufferedTerminals.clear();
+      state.controller.abort(new DOMException("Workflow branch change", "AbortError"));
+      state.presentation.reset(false);
+      this.notifyInspection(state);
+    }
     return tracked;
   }
 
@@ -780,8 +1054,14 @@ export class WorkflowEngine {
       ...(options.excludeTools ? { frozenExcludeTools: [...options.excludeTools] } : {}),
       timestamp: now,
     });
+    if (epoch !== this.branchEpoch || this.disposed || this.lifecyclePaused || this.admissionsClosed)
+      throw new Error("Workflow branch changed before admission");
     const state: ScriptRunState = {
       run,
+      presentation: new WorkflowPresentation(runId),
+      managedCallFacts: new Map(),
+      pendingCleanup: new Set(),
+      activeExecutionGenerations: new Set(),
       frozenOptions: {
         ...(frozenTokenBudget !== undefined ? { tokenBudget: frozenTokenBudget } : {}),
         ...(frozenMaxAgents !== undefined ? { maxAgents: frozenMaxAgents } : {}),
@@ -802,13 +1082,19 @@ export class WorkflowEngine {
       executionGeneration: 0,
     };
     this.runs.set(runId, state);
-    this.setWorkflowStatus(run, "running");
-    state.executionGeneration += 1;
-    state.execution = this.execute(runId, script, startOptions, undefined, state.executionGeneration, protocol);
+    // Accept identity before any synchronous running/root observer can stop or
+    // replace this state. Dispatch is deferred until its promise is published.
+    const generation = ++state.executionGeneration;
+    state.presentation.reset();
+    state.execution = Promise.resolve().then(() =>
+      this.execute(state, script, startOptions, undefined, generation, epoch, protocol),
+    );
     const execution = state.execution;
     // A run-fatal abort/stop already journals its terminal state; never let a
     // leftover rejection become an unhandled promise rejection.
-    void state.execution.catch(() => {});
+    void execution.catch(() => {});
+    this.setWorkflowStatus(run, "running");
+    if (this.isCurrentState(state, generation, epoch)) this.notifyInspection(state);
     if (options.background) return { runId, status: run.status, background: true };
     try {
       const settled = await this.waitFor(runId, options.signal);
@@ -859,7 +1145,7 @@ export class WorkflowEngine {
       throw new Error("Workflow branch changed before admission");
     const state = this.runs.get(runId);
     if (!state) return undefined;
-    if (state.lifecycleSuspended) return undefined;
+    if (state.lifecycleSuspended || state.removeOperation) return undefined;
     const run = state.run;
     if (run.status === "running" || run.status === "pausing" || run.status === "stopping") return undefined;
     const providerTimer = this.providerResumeTimers.get(runId);
@@ -867,8 +1153,53 @@ export class WorkflowEngine {
       clearTimeout(providerTimer);
       this.providerResumeTimers.delete(runId);
     }
-    if (run.nonResumable || (isTerminalWorkflow(run.status) && run.status !== "failed" && run.status !== "stopped"))
+    if (
+      run.nonResumable ||
+      run.terminalIntent === "stop" ||
+      (isTerminalWorkflow(run.status) && run.status !== "failed" && run.status !== "stopped")
+    )
       return undefined;
+    if (isTerminalWorkflow(run.status)) {
+      await this.drainExecution(state, state.execution);
+      for (const [nodeId, agentId] of Object.entries(run.agentIds)) {
+        if (run.callStatus[nodeId] !== "running") continue; // Completed/local calls own no live child.
+        const attemptId = run.attemptIds[nodeId];
+        if (!attemptId) continue;
+        await this.stopAndQuiesce(
+          state,
+          agentId,
+          {
+            extension: "pi-workflows",
+            runId,
+            nodeId: `call-${nodeId}`,
+            attemptId: `attempt-${generationFromAttemptId(attemptId)}`,
+          },
+          state.executionGeneration,
+        );
+      }
+      if (run.nonResumable || this.runs.get(runId) !== state || epoch !== this.branchEpoch || this.lifecyclePaused)
+        return undefined;
+      if (
+        this.journalBlockedRuns.has(runId) ||
+        [...this.journalRetries.keys()].some((key) => key.startsWith(`${runId}\u0000`))
+      )
+        throw new Error("Workflow journal has not settled; retry resume after persistence recovers");
+      const timestamp = Date.now();
+      const recovery: RunRecoveryEvent = {
+        kind: "run_recovery",
+        schemaVersion: JOURNAL_SCHEMA_VERSION,
+        runId,
+        status: "interrupted",
+        branchGeneration: this.recoveryBranchGeneration,
+        rotations: [],
+        recoveryId: deriveRecoveryId({ runId, rotations: [], timestamp }),
+        timestamp,
+      };
+      this.appendRequired(recovery);
+      if (!this.isCurrentState(state, state.executionGeneration, epoch)) return undefined;
+      applyRecoveryEvent(run, recovery);
+      state.result = undefined;
+    }
     if (replacementScript !== undefined) {
       const parsed = parseWorkflowScript(replacementScript);
       const revision = (run.revision ?? 0) + 1;
@@ -889,6 +1220,7 @@ export class WorkflowEngine {
         }),
       );
     }
+    if (!this.isCurrentState(state, state.executionGeneration, epoch)) return undefined;
     // Arguments are frozen in every schema-v4 run_created fact. Resume never accepts
     // replacement args and never backfills the pre-schema-v4 run_args contract.
     const resumeArgs = cloneWorkflowArgs(run.args);
@@ -898,8 +1230,6 @@ export class WorkflowEngine {
     for (const [callIndex, attemptId] of Object.entries(run.attemptIds)) {
       state.generations.set(callIndex, generationFromAttemptId(attemptId));
     }
-    this.setWorkflowStatus(run, "running");
-    state.controller = new AbortController();
     // Freeze semantics: original run parameters and args win over new options.
     // Only signal/confirm/background/loadSavedWorkflow/mainModel/strengths are
     // per-resume context; input/budget/scale/toolset are frozen from the
@@ -911,6 +1241,7 @@ export class WorkflowEngine {
       // a caller that passed none is asking the engine to read the current one.
       strengths: options.strengths ?? this.strengths?.(),
       args: resumeArgs,
+      loadSavedWorkflow: options.loadSavedWorkflow ?? this.loadSavedWorkflow,
       tokenBudget: frozen.tokenBudget,
       maxAgents: frozen.maxAgents,
       concurrency: frozen.concurrency,
@@ -919,19 +1250,25 @@ export class WorkflowEngine {
       toolset: frozen.toolset,
       excludeTools: frozen.excludeTools ? [...frozen.excludeTools] : undefined,
     };
+    if (!this.isCurrentState(state, state.executionGeneration, epoch) || run.nonResumable || state.stopOperation)
+      return undefined;
     state.bufferedTerminals.clear();
-    state.executionGeneration += 1;
-    state.execution = this.execute(
-      runId,
-      run.script,
-      resumeOptions,
-      resumeJournal,
-      state.executionGeneration,
-      protocol,
+    this.terminalNotified.delete(state);
+    state.controller = new AbortController();
+    const generation = ++state.executionGeneration;
+    const acceptedScript = run.script;
+    state.presentation.reset();
+    state.execution = Promise.resolve().then(() =>
+      this.execute(state, acceptedScript, resumeOptions, resumeJournal, generation, epoch, protocol),
     );
     const execution = state.execution;
     void execution.catch(() => {});
-    if (options.background) return { runId, status: run.status, background: true };
+    this.setWorkflowStatus(run, "running");
+    if (this.isCurrentState(state, generation, epoch)) this.notifyInspection(state);
+    if (options.background) {
+      this.onBackgroundExecution?.(runId);
+      return { runId, status: run.status, background: true };
+    }
     try {
       const settled = await this.waitFor(runId, options.signal);
       return { runId, status: settled.status, background: false };
@@ -986,11 +1323,7 @@ export class WorkflowEngine {
       await this.stop(state);
     } else if (action === "rm") {
       if (!isTerminalWorkflow(run.status)) throw new Error("cannot remove a running workflow");
-      this.persist(runId, "run-removed", () =>
-        this.write({ kind: "run_removed", schemaVersion: JOURNAL_SCHEMA_VERSION, runId, timestamp: Date.now() }),
-      );
-      this.runs.delete(runId);
-      this.waiters.delete(runId);
+      await this.remove(state);
       return { action, run: this.summary(run) };
     }
     return { action, run: this.summary(run) };
@@ -999,6 +1332,7 @@ export class WorkflowEngine {
   async waitFor(runId: string, signal?: AbortSignal): Promise<ScriptRun> {
     const state = this.runs.get(runId);
     if (!state) throw new Error(`workflow run not found: ${runId}`);
+    if (isTerminalWorkflow(state.run.status) && state.pendingCleanup.size > 0) throw new WorkflowWaitAbortedError();
     if (isTerminalWorkflow(state.run.status) || state.run.status === "paused" || state.run.status === "interrupted")
       return state.run;
     if (signal?.aborted) throw new WorkflowWaitAbortedError();
@@ -1047,6 +1381,7 @@ export class WorkflowEngine {
   }
 
   private settleWaiters(runId: string, run: ScriptRun): void {
+    if (this.runs.get(runId)?.run !== run || this.hasPendingCleanup(runId)) return;
     const all = this.waiters.get(runId);
     if (!all) return;
     for (const waiter of [...all]) {
@@ -1062,24 +1397,24 @@ export class WorkflowEngine {
   // ── execution ──────────────────────────────────────────────────────────────
 
   private async execute(
-    runId: string,
+    state: ScriptRunState,
     script: string,
     options: ScriptStartOptions,
-    resumeJournal?: Map<string, JournalEntry>,
-    executionGeneration?: number,
+    resumeJournal: Map<string, JournalEntry> | undefined,
+    generation: number,
+    epoch: number,
     protocol?: ManagedProtocolCheck,
   ): Promise<WorkflowRunResult<unknown>> {
-    if (this.disposed) throw new WorkflowEngineDisposedError();
-    const state = this.runs.get(runId);
-    if (!state) throw new Error(`workflow run not found: ${runId}`);
-    const generation = executionGeneration ?? state.executionGeneration;
-    const epoch = this.branchEpoch;
+    const runId = state.run.runId;
+    state.activeExecutionGenerations.add(generation);
     const isSameBranch = () =>
       this.runs.get(runId) === state &&
       state.executionGeneration === generation &&
       this.branchEpoch === epoch &&
       !this.disposed;
     const isCurrent = () => isSameBranch() && !state.lifecycleSuspended && !this.lifecyclePaused;
+    const isPresentationCurrent = () => isCurrent() && state.activeExecutionGenerations.has(generation);
+    const explicitlyStopped = () => state.stopOperation !== undefined || state.run.terminalIntent === "stop";
     const executionSignal =
       !options.background && options.signal
         ? AbortSignal.any([state.controller.signal, options.signal])
@@ -1088,7 +1423,8 @@ export class WorkflowEngine {
     const cleanupTasks = new Set<Promise<void>>();
     const runner: WorkflowAgentRunner = {
       run: async (prompt: string, runOptions: AgentRunOptions = {}) => {
-        if (!isCurrent()) throw new WorkflowError("stale workflow execution", WorkflowErrorCode.WORKFLOW_ABORTED);
+        if (!isCurrent() || executionSignal.aborted || explicitlyStopped())
+          throw new WorkflowError("stale workflow execution", WorkflowErrorCode.WORKFLOW_ABORTED);
         const dispatch = this.dispatchAgent(runId, prompt, runOptions);
         const settled = dispatch.then(
           () => {},
@@ -1102,6 +1438,15 @@ export class WorkflowEngine {
         if (runOptions.signal?.aborted) trackCleanup();
         try {
           return await dispatch;
+        } catch (error: unknown) {
+          if (isCurrent()) {
+            const frameId = runOptions.runId ?? runId;
+            const nodeId =
+              frameId === runId ? String(runOptions.callIndex ?? 0) : `${frameId}:${runOptions.callIndex ?? 0}`;
+            state.presentation.managed(nodeId, { status: runOptions.signal?.aborted ? "stopped" : "failed" });
+            this.notifyInspection(state);
+          }
+          throw error;
         } finally {
           runOptions.signal?.removeEventListener("abort", trackCleanup);
         }
@@ -1110,6 +1455,8 @@ export class WorkflowEngine {
     };
 
     try {
+      if (!isCurrent() || executionSignal.aborted || explicitlyStopped())
+        throw new WorkflowError("workflow execution aborted before dispatch", WorkflowErrorCode.WORKFLOW_ABORTED);
       const result = await runWorkflow(script, {
         cwd: this.cwd,
         args: options.args,
@@ -1134,29 +1481,74 @@ export class WorkflowEngine {
         runId,
         executionNonce: `${generation}-${randomUUID()}`,
         resumeJournal,
+        resumeWorkflowGenerations: new Map(
+          Object.entries(state.run.workflowResultGenerations).map(([index, generation]) => [Number(index), generation]),
+        ),
         toolset: options.toolset,
         strengths: options.strengths,
         excludeTools: options.excludeTools,
-        confirm: options.confirm,
+        confirm:
+          options.confirm &&
+          (async (prompt, checkpointOptions, signal) => {
+            if (!isCurrent() || executionSignal.aborted || signal?.aborted || state.stopOperation)
+              throw new WorkflowError("stale workflow checkpoint", WorkflowErrorCode.WORKFLOW_ABORTED);
+            const value = await options.confirm?.(prompt, checkpointOptions, signal);
+            if (!isCurrent() || executionSignal.aborted || signal?.aborted)
+              throw new WorkflowError("stale workflow checkpoint", WorkflowErrorCode.WORKFLOW_ABORTED);
+            return value;
+          }),
         loadSavedWorkflow: options.loadSavedWorkflow,
+        onAgentStart: (event) => {
+          if (!isPresentationCurrent()) return;
+          state.presentation.agentStart(event);
+          this.notifyInspection(state);
+        },
+        onAgentEnd: (event) => {
+          if (!isPresentationCurrent()) return;
+          const nodeId = event.id.startsWith(`${runId}:`) ? event.id.slice(runId.length + 1) : undefined;
+          const persisted = nodeId === undefined ? undefined : state.run.callResults[nodeId];
+          const persistedTokens =
+            nodeId !== undefined && persisted?.attemptId === state.run.attemptIds[nodeId]
+              ? persisted?.tokenCount
+              : undefined;
+          // Runtime replay reports zero new spend, not the historical call's
+          // usage. Explicit managed zero is also authoritative over estimates.
+          const tokenCount = event.tokenUsage?.total ?? persistedTokens ?? event.tokens;
+          state.presentation.agentEnd({ ...event, tokens: tokenCount });
+          this.notifyInspection(state);
+        },
+        onLog: (message, scope) => {
+          if (!isPresentationCurrent()) return;
+          state.presentation.log(message, scope?.frameId);
+          this.notifyInspection(state);
+        },
         onAgentJournal: (entry) => {
           if (!isCurrent()) return;
-          // Nested workflow frames keep their own lifecycle visibility, but their
-          // individual call facts are not top-level replay keys. The parent
-          // workflow_result fact below owns the nested replay boundary.
+          // Persist the accepted owner before presentation observers can replace it.
+          // Nested frames are owned by their parent's workflow_result boundary.
           if (entry.runId === undefined || entry.runId === runId) this.journalCallResult(runId, entry);
+          if (!isCurrent()) return;
+          state.presentation.journalResult(entry.runId ?? runId, entry.index, entry.result);
+          this.notifyInspection(state);
         },
         onWorkflowJournal: (entry) => {
           if (!isCurrent()) return;
           this.journalWorkflowResult(runId, entry);
+          if (!isCurrent()) return;
+          state.presentation.journalResult(entry.runId ?? runId, entry.index, entry.result);
+          this.notifyInspection(state);
         },
         onRuntimeEvent: (event) => {
-          if (!isCurrent()) return;
+          if (!isPresentationCurrent()) return;
+          state.presentation.runtime(event);
+          this.notifyInspection(state);
+          if (!isPresentationCurrent()) return;
           try {
             this.events.emit("pi-workflows:runtime", { runId, event: cloneRuntimeEvent(event) });
           } catch {
             // Cross-extension observers cannot change workflow execution.
           }
+          if (!isPresentationCurrent()) return;
           try {
             this.onRuntimeEvent?.(runId, cloneRuntimeEvent(event));
           } catch {
@@ -1170,6 +1562,19 @@ export class WorkflowEngine {
           recoverable: true,
         });
       }
+      // A terminal frame cannot overtake accepted journal facts. In particular,
+      // a delayed call_attempt must precede its result, not reset it on replay.
+      await this.drainJournal(runId);
+      if (
+        executionSignal.aborted ||
+        !isCurrent() ||
+        state.run.status === "stopping" ||
+        state.stopOperation !== undefined ||
+        state.run.terminalIntent === "stop"
+      )
+        throw new WorkflowError("workflow execution aborted", WorkflowErrorCode.WORKFLOW_ABORTED, {
+          recoverable: true,
+        });
       const live = this.runs.get(runId);
       const run = live?.run;
       if (run && isSameBranch() && !isTerminalWorkflow(run.status)) {
@@ -1180,8 +1585,8 @@ export class WorkflowEngine {
     } catch (error: unknown) {
       await runner.waitForCleanup?.();
       const run = this.runs.get(runId)?.run;
-      if (run && isSameBranch() && !isTerminalWorkflow(run.status)) {
-        const message = error instanceof Error ? error.message : String(error);
+      if (run && isSameBranch() && !isTerminalWorkflow(run.status) && run.status !== "stopping") {
+        const message = describeWorkflowError(error);
         const workflowError = error instanceof WorkflowError ? error : wrapError(error);
         if (workflowError.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT) {
           this.setWorkflowStatus(run, "paused", message);
@@ -1203,15 +1608,22 @@ export class WorkflowEngine {
           run.status = "interrupted";
           run.updatedAt = Date.now();
         } else {
-          this.setWorkflowStatus(run, "failed", message);
           this.cleanupAgents(runId);
+          this.setWorkflowStatus(run, "failed", message);
         }
       }
       throw error;
     } finally {
+      state.activeExecutionGenerations.delete(generation);
       // Reject any waiters that never settled (agents left in flight).
       const run = this.runs.get(runId)?.run;
-      if (run && isSameBranch()) this.settleWaiters(runId, run);
+      if (run && isSameBranch()) {
+        if (isCurrent()) {
+          state.presentation.settle(run.status);
+          this.notifyInspection(state);
+        }
+        if (isSameBranch() && run.status !== "stopping") this.settleWaiters(runId, run);
+      }
     }
   }
 
@@ -1268,6 +1680,7 @@ export class WorkflowEngine {
     const tierIdentity: CallTierIdentity = tier === undefined ? {} : { tier };
     state.callTiers.set(nodeId, tierIdentity);
     run.callTiers[nodeId] = tierIdentity;
+    state.managedCallFacts.delete(nodeId);
     const task: DispatchTask = {
       subagent_type: type,
       prompt,
@@ -1283,6 +1696,15 @@ export class WorkflowEngine {
     // represented by its parent workflow_result replay boundary instead of
     // leaking child call facts into the parent's numeric call namespace.
     if (!nested) {
+      // Match journal replay's call_attempt semantics: historical results stay
+      // durable, but are not current facts for this accepted live rotation.
+      run.callStatus[nodeId] = "running";
+      run.attempts[nodeId] = generation;
+      run.attemptIds[nodeId] = attemptId;
+      delete run.agentIds[nodeId];
+      delete run.callResults[nodeId];
+      run.compactions[nodeId] = 0;
+      run.updatedAt = Date.now();
       this.persist(runId, `call-attempt:${nodeId}`, () =>
         this.write({
           kind: "call_attempt",
@@ -1296,10 +1718,12 @@ export class WorkflowEngine {
           timestamp: Date.now(),
         }),
       );
-      run.callStatus[nodeId] = "running";
-      run.attempts[nodeId] = generation;
-      run.attemptIds[nodeId] = attemptId;
-      run.updatedAt = Date.now();
+      if (
+        !this.isCurrentState(state, executionGeneration, dispatchEpoch) ||
+        runOptions.signal?.aborted ||
+        state.controller.signal.aborted
+      )
+        throw new WorkflowError("stale workflow attempt", WorkflowErrorCode.WORKFLOW_ABORTED);
     }
 
     // Abort linkage: an external signal (pause/stop/Esc) cancels the wait and
@@ -1313,214 +1737,386 @@ export class WorkflowEngine {
       nodeId: spawnNodeId,
       attemptId: spawnAttemptId,
     };
-    state.pendingSpawns.set(spawnKey, { spawnKey, owner, executionGeneration });
-    const reconcilePending = () => {
-      state.bufferedTerminals.delete(spawnKey);
-      const reconciliation = this.client.reconcileManaged?.(spawnKey, owner);
-      void reconciliation?.catch(() => {});
+    const pending = {
+      spawnKey,
+      owner,
+      executionGeneration,
+      phase: "reserved" as "reserved" | "submitted",
+      startedAgentId: undefined as string | undefined,
+      agentId: undefined as string | undefined,
     };
-    const onPendingAbort = () => reconcilePending();
-    externalSignal.addEventListener("abort", onPendingAbort, { once: true });
-    if (externalSignal.aborted) onPendingAbort();
-
-    let pendingId = "";
-    let response: ManagedSpawnResponse | string;
+    // Keep this exact allocation lease through every publication callback and
+    // terminal delivery. A waiter alone is insufficient: it is removed before
+    // onUsage/onHistory, which may synchronously pause or replace the branch.
+    state.pendingSpawns.set(spawnKey, pending);
+    let responseId: string | undefined;
+    let terminalAccepted = false;
+    let ownedCleanup: Promise<void> | undefined;
+    const cleanupResponse = () =>
+      (ownedCleanup ??= this.stopAndQuiesce(
+        state,
+        responseId ?? pending.startedAgentId ?? spawnKey,
+        owner,
+        executionGeneration,
+      ));
     try {
-      response = await this.client.spawn(task, runId, spawnNodeId, spawnAttemptId, externalSignal);
-    } catch (error: unknown) {
-      if (externalSignal.aborted) {
-        const reconciled = await this.client.reconcileManaged?.(spawnKey, owner).catch(() => undefined);
-        const id = typeof reconciled === "string" ? reconciled : reconciled?.id;
-        await this.stopAndQuiesce(
-          state,
-          id ?? spawnKey,
-          owner,
-          executionGeneration,
-          id ? undefined : "cancelled spawn allocation could not be confirmed",
+      state.presentation.dispatch(runOptions, attemptId);
+      this.notifyInspection(state);
+      if (!this.isCurrentState(state, executionGeneration, dispatchEpoch) || externalSignal.aborted)
+        throw new WorkflowError("stale workflow dispatch", WorkflowErrorCode.WORKFLOW_ABORTED);
+      const reconcilePending = () => {
+        state.bufferedTerminals.delete(spawnKey);
+        const reconciliation = this.client.reconcileManaged?.(spawnKey, owner);
+        void reconciliation?.catch(() => {});
+      };
+      const onPendingAbort = () => reconcilePending();
+      externalSignal.addEventListener("abort", onPendingAbort, { once: true });
+      if (externalSignal.aborted) onPendingAbort();
+
+      let pendingId = "";
+      let response: ManagedSpawnResponse | string;
+      try {
+        // Reservation is local until this exact boundary. Observers above can
+        // cancel without creating uncertainty for an RPC that was never sent.
+        pending.phase = "submitted";
+        response = await this.client.spawn(task, runId, spawnNodeId, spawnAttemptId, externalSignal);
+      } catch (error: unknown) {
+        // Transport failure is not evidence that the host never allocated. Keep
+        // the exact spawn owner even without a reply or an aborted signal.
+        await cleanupResponse();
+        throw error;
+      } finally {
+        externalSignal.removeEventListener("abort", onPendingAbort);
+      }
+      responseId = typeof response === "string" ? response : response.id;
+      pending.agentId = responseId;
+      if (
+        state.executionGeneration !== executionGeneration ||
+        this.runs.get(runId) !== state ||
+        this.branchEpoch !== dispatchEpoch ||
+        state.lifecycleSuspended ||
+        this.lifecyclePaused ||
+        state.controller.signal.aborted ||
+        externalSignal.aborted
+      ) {
+        state.bufferedTerminals.delete(spawnKey);
+        await cleanupResponse();
+        throw new WorkflowError(
+          "workflow dispatch became stale during pause/resume",
+          WorkflowErrorCode.WORKFLOW_ABORTED,
+          { recoverable: true },
         );
       }
-      throw error;
-    } finally {
-      externalSignal.removeEventListener("abort", onPendingAbort);
-      state.pendingSpawns.delete(spawnKey);
-    }
-    const responseId = typeof response === "string" ? response : response.id;
-    if (
-      state.executionGeneration !== executionGeneration ||
-      this.runs.get(runId) !== state ||
-      this.branchEpoch !== dispatchEpoch ||
-      state.lifecycleSuspended ||
-      this.lifecyclePaused ||
-      state.controller.signal.aborted ||
-      externalSignal.aborted
-    ) {
-      state.bufferedTerminals.delete(spawnKey);
-      await this.stopAndQuiesce(state, responseId, owner, executionGeneration);
-      throw new WorkflowError(
-        "workflow dispatch became stale during pause/resume",
-        WorkflowErrorCode.WORKFLOW_ABORTED,
-        { recoverable: true },
-      );
-    }
-    if (typeof response !== "string" && updateCallTierIdentity(state, nodeId, response.tier)) {
-      this.persistCallTierIdentity(state, nodeId);
-    }
-    // Report the tier the host actually selected back to the runtime, which
-    // journals it: a call that named none still resolved to something, and the
-    // run's own record of what ran should say what.
-    const resolvedTierIdentity = state.callTiers.get(nodeId);
-    if (resolvedTierIdentity?.tier !== undefined) runOptions.onTierResolved?.(resolvedTierIdentity.tier);
-    if (typeof response === "string") {
-      pendingId = response;
-    } else if (response.terminal) {
-      state.bufferedTerminals.delete(spawnKey);
-      // The spawn response already carries a terminal snapshot (fast completion
-      // or interrupted replay). The runtime journals successful calls itself
-      // (onAgentJournal); a terminal snapshot that is NOT a success is
-      // journaled here so the resume journal reflects the failure.
-      const terminal = response.terminal;
-      if (typeof terminal.tokenCount === "number")
-        runOptions.onUsage?.({
-          input: 0,
-          output: terminal.tokenCount,
-          total: terminal.tokenCount,
-          cost: 0,
-          cacheRead: 0,
-          cacheWrite: 0,
-        });
-      const status = managedTerminalStatus(terminal);
+      if (typeof response !== "string" && updateCallTierIdentity(state, nodeId, response.tier)) {
+        this.persistCallTierIdentity(state, nodeId);
+      }
+      if (!this.isCurrentState(state, executionGeneration, dispatchEpoch) || externalSignal.aborted)
+        throw new WorkflowError("stale workflow identity", WorkflowErrorCode.WORKFLOW_ABORTED);
+      this.recordManagedAdmission(state, nodeId, responseId, executionGeneration);
+      if (!this.isCurrentState(state, executionGeneration, dispatchEpoch) || externalSignal.aborted)
+        throw new WorkflowError("stale workflow admission", WorkflowErrorCode.WORKFLOW_ABORTED);
+      if (typeof response !== "string" && response.terminal)
+        this.recordManagedTerminal(state, nodeId, responseId, response.terminal, executionGeneration);
+      const bufferedTerminal = state.bufferedTerminals.get(spawnKey);
+      const observedTerminal =
+        bufferedTerminal?.response.id === responseId &&
+        bufferedTerminal.executionGeneration === executionGeneration &&
+        sameWorkflowOwner(bufferedTerminal.owner, owner)
+          ? bufferedTerminal.response.terminal
+          : undefined;
+      const observedRunning = pending.startedAgentId === responseId;
+      state.presentation.managed(nodeId, {
+        agentId: responseId,
+        status: observedTerminal
+          ? managedTerminalStatus(observedTerminal)
+          : observedRunning
+            ? "running"
+            : typeof response === "string"
+              ? "pending"
+              : response.state === "queued"
+                ? "queued"
+                : "running",
+        tier: state.callTiers.get(nodeId)?.tier,
+        ...(typeof response !== "string" && response.terminal
+          ? {
+              status: managedTerminalStatus(response.terminal),
+              tokenCount: response.terminal.tokenCount,
+              outputFile: response.terminal.outputFile,
+              compactionCount: Math.max(
+                response.terminal.compactionCount,
+                state.managedCallFacts.get(nodeId)?.compactionCount ?? 0,
+              ),
+            }
+          : {}),
+      });
+      this.notifyInspection(state);
+      if (!this.isCurrentState(state, executionGeneration, dispatchEpoch) || externalSignal.aborted)
+        throw new WorkflowError("stale workflow dispatch", WorkflowErrorCode.WORKFLOW_ABORTED);
+      // Report the tier the host actually selected back to the runtime, which
+      // journals it: a call that named none still resolved to something, and the
+      // run's own record of what ran should say what.
+      const resolvedTierIdentity = state.callTiers.get(nodeId);
+      if (resolvedTierIdentity?.tier !== undefined) runOptions.onTierResolved?.(resolvedTierIdentity.tier);
+      if (!this.isCurrentState(state, executionGeneration, dispatchEpoch) || externalSignal.aborted)
+        throw new WorkflowError("stale workflow dispatch", WorkflowErrorCode.WORKFLOW_ABORTED);
+      if (typeof response === "string") {
+        pendingId = response;
+      } else if (response.terminal) {
+        state.bufferedTerminals.delete(spawnKey);
+        // The spawn response already carries a terminal snapshot (fast completion
+        // or interrupted replay). The runtime journals successful calls itself
+        // (onAgentJournal); a terminal snapshot that is NOT a success is
+        // journaled here so the resume journal reflects the failure.
+        const terminal = response.terminal;
+        if (typeof terminal.tokenCount === "number")
+          runOptions.onUsage?.({
+            input: 0,
+            output: terminal.tokenCount,
+            total: terminal.tokenCount,
+            cost: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+          });
+        if (!this.isCurrentState(state, executionGeneration, dispatchEpoch) || externalSignal.aborted)
+          throw new WorkflowError("stale workflow terminal", WorkflowErrorCode.WORKFLOW_ABORTED);
+        terminalAccepted = true;
+        const status = managedTerminalStatus(terminal);
+        if (status !== "completed") {
+          const result = resultFromLifecycle(
+            status,
+            response.id,
+            terminal.result,
+            terminal.error,
+            terminal.compactionCount,
+            terminal.tokenCount,
+            resolvedTierIdentity?.tier ?? tier,
+          );
+          result.attemptId = attemptId;
+          if (!nested) this.commitCallTerminal(runId, nodeId, result);
+          if (status === "failed" && terminal.error) {
+            throw wrapError(new Error(terminal.error), { agentLabel: runOptions.label });
+          }
+        }
+        if (!this.isCurrentState(state, executionGeneration, dispatchEpoch) || externalSignal.aborted)
+          throw new WorkflowError("stale workflow terminal", WorkflowErrorCode.WORKFLOW_ABORTED);
+        return terminal.result ?? "";
+      } else {
+        pendingId = response.id;
+      }
+
+      const waitAbort = () => {
+        const waiter = state.agentWaiters.get(pendingId);
+        if (waiter && !waiter.settled) {
+          waiter.settled = true;
+          state.agentWaiters.delete(pendingId);
+          state.bufferedTerminals.delete(spawnKey);
+          // Stop acknowledges cancellation, not provider/tool finally completion.
+          void cleanupResponse().then(async () => {
+            if (
+              !nested &&
+              this.runs.get(runId) === state &&
+              state.executionGeneration === executionGeneration &&
+              !run.nonResumable
+            ) {
+              const result = resultFromLifecycle(
+                "stopped",
+                pendingId,
+                undefined,
+                "workflow call cancelled",
+                run.compactions[nodeId] ?? 0,
+                undefined,
+                resolvedTierIdentity?.tier ?? tier,
+              );
+              result.attemptId = attemptId;
+              try {
+                await this.drainJournal(runId);
+                if (!this.isCurrentState(state, executionGeneration, dispatchEpoch)) {
+                  waiter.reject(new WorkflowWaitAbortedError());
+                  return;
+                }
+                this.commitCallTerminal(runId, nodeId, result, true);
+              } catch (error) {
+                this.fenceExecution(
+                  state,
+                  executionGeneration,
+                  "Could not persist cancelled call terminal fact; run is non-resumable",
+                );
+                waiter.reject(error);
+                return;
+              }
+            }
+            waiter.reject(
+              new WorkflowError("workflow aborted", WorkflowErrorCode.WORKFLOW_ABORTED, { recoverable: true }),
+            );
+          });
+        }
+      };
+
+      // Wait for the terminal lifecycle event, consuming a matching terminal that
+      // arrived while the managed-spawn reply was still pending.
+      const terminal = await new Promise<ManagedSpawnResponse>((resolve, reject) => {
+        const waiter: AgentLifecycleWaiter = {
+          callIndex: nodeId,
+          generation,
+          executionGeneration,
+          onUsage: runOptions.onUsage,
+          onHistory: runOptions.onHistory,
+          onRunning: runOptions.onRunning,
+          startedNotified: false,
+          settled: false,
+          resolve,
+          reject,
+        };
+        state.agentWaiters.set(pendingId, waiter);
+        // A spawn that was admitted straight away is already running, and its
+        // `subagents:started` event fired before this waiter existed. Only a
+        // reply that says "queued" still has a start to wait for.
+        if (observedRunning || (typeof response !== "string" && response.state !== "queued"))
+          notifyAgentRunning(waiter);
+        externalSignal.addEventListener("abort", waitAbort, { once: true });
+        if (externalSignal.aborted) {
+          waitAbort();
+          return;
+        }
+
+        const buffered = state.bufferedTerminals.get(spawnKey);
+        if (!buffered) return;
+        state.bufferedTerminals.delete(spawnKey);
+        if (
+          buffered.executionGeneration !== executionGeneration ||
+          state.executionGeneration !== executionGeneration ||
+          state.lifecycleSuspended ||
+          state.controller.signal.aborted ||
+          buffered.response.id !== pendingId ||
+          !sameWorkflowOwner(buffered.owner, owner)
+        )
+          return;
+        this.resolveAgentWaiter(state, pendingId, waiter, buffered);
+      }).finally(() => {
+        externalSignal.removeEventListener("abort", waitAbort);
+      });
+
+      if (
+        this.runs.get(runId) !== state ||
+        this.branchEpoch !== dispatchEpoch ||
+        state.lifecycleSuspended ||
+        this.lifecyclePaused
+      ) {
+        throw new WorkflowError("stale workflow terminal", WorkflowErrorCode.WORKFLOW_ABORTED, { recoverable: true });
+      }
+      const snapshot = terminal.terminal;
+      if (!snapshot)
+        throw new WorkflowError(
+          "subagent settled without a terminal snapshot",
+          WorkflowErrorCode.AGENT_EXECUTION_ERROR,
+          {
+            recoverable: true,
+          },
+        );
+      this.recordManagedTerminal(state, nodeId, terminal.id, snapshot, executionGeneration);
+      state.presentation.managed(nodeId, {
+        agentId: terminal.id,
+        status: managedTerminalStatus(snapshot),
+        tokenCount: snapshot.tokenCount,
+        outputFile: snapshot.outputFile,
+        compactionCount: Math.max(snapshot.compactionCount, state.managedCallFacts.get(nodeId)?.compactionCount ?? 0),
+      });
+      this.notifyInspection(state);
+      if (!this.isCurrentState(state, executionGeneration, dispatchEpoch))
+        throw new WorkflowError("stale workflow terminal", WorkflowErrorCode.WORKFLOW_ABORTED);
+      if (externalSignal.aborted) throw new WorkflowError("workflow aborted", WorkflowErrorCode.WORKFLOW_ABORTED);
+      terminalAccepted = true;
+      const status = managedTerminalStatus(snapshot);
+      // Successful calls are journaled by the runtime's onAgentJournal (the
+      // single writer for completed results); only failures settle here so the
+      // resume journal reflects them.
       if (status !== "completed") {
         const result = resultFromLifecycle(
           status,
-          response.id,
-          terminal.result,
-          terminal.error,
-          terminal.compactionCount,
-          terminal.tokenCount,
-          resolvedTierIdentity?.tier ?? tier,
+          terminal.id,
+          snapshot.result,
+          snapshot.error,
+          snapshot.compactionCount,
+          snapshot.tokenCount,
+          state.callTiers.get(nodeId)?.tier ?? tier,
         );
         result.attemptId = attemptId;
         if (!nested) this.commitCallTerminal(runId, nodeId, result);
-        if (status === "failed" && terminal.error) {
-          throw wrapError(new Error(terminal.error), { agentLabel: runOptions.label });
+        if (status === "failed" && snapshot.error) {
+          throw wrapError(new Error(snapshot.error), { agentLabel: runOptions.label });
         }
       }
-      return terminal.result ?? "";
-    } else {
-      pendingId = response.id;
-    }
-
-    const waitAbort = () => {
-      const waiter = state.agentWaiters.get(pendingId);
-      if (waiter && !waiter.settled) {
-        waiter.settled = true;
-        state.agentWaiters.delete(pendingId);
-        state.bufferedTerminals.delete(spawnKey);
-        // Stop acknowledges cancellation, not provider/tool finally completion.
-        void this.stopAndQuiesce(state, pendingId, owner, executionGeneration).then(() => {
-          waiter.reject(
-            new WorkflowError("workflow aborted", WorkflowErrorCode.WORKFLOW_ABORTED, { recoverable: true }),
-          );
-        });
-      }
-    };
-
-    // Wait for the terminal lifecycle event, consuming a matching terminal that
-    // arrived while the managed-spawn reply was still pending.
-    const terminal = await new Promise<ManagedSpawnResponse>((resolve, reject) => {
-      const waiter: AgentLifecycleWaiter = {
-        callIndex: nodeId,
-        generation,
-        executionGeneration,
-        onUsage: runOptions.onUsage,
-        onHistory: runOptions.onHistory,
-        onRunning: runOptions.onRunning,
-        startedNotified: false,
-        settled: false,
-        resolve,
-        reject,
-      };
-      state.agentWaiters.set(pendingId, waiter);
-      // A spawn that was admitted straight away is already running, and its
-      // `subagents:started` event fired before this waiter existed. Only a
-      // reply that says "queued" still has a start to wait for.
-      if (typeof response !== "string" && response.state !== "queued") notifyAgentRunning(waiter);
-      externalSignal.addEventListener("abort", waitAbort, { once: true });
-      if (externalSignal.aborted) {
-        waitAbort();
-        return;
-      }
-
-      const buffered = state.bufferedTerminals.get(spawnKey);
-      if (!buffered) return;
-      state.bufferedTerminals.delete(spawnKey);
+      const completedTierIdentity = state.callTiers.get(nodeId);
+      if (completedTierIdentity?.tier !== undefined) runOptions.onTierResolved?.(completedTierIdentity.tier);
+      if (!this.isCurrentState(state, executionGeneration, dispatchEpoch) || externalSignal.aborted)
+        throw new WorkflowError("stale workflow terminal", WorkflowErrorCode.WORKFLOW_ABORTED);
+      return snapshot.result ?? "";
+    } finally {
+      // Publication does not donate ownership to an observer or a replacement
+      // state. Even a terminal reply must STOP + QUIESCE its captured owner
+      // when observation retired this dispatch.
       if (
-        buffered.executionGeneration !== executionGeneration ||
-        state.executionGeneration !== executionGeneration ||
-        state.lifecycleSuspended ||
-        state.controller.signal.aborted ||
-        buffered.response.id !== pendingId ||
-        !sameWorkflowOwner(buffered.owner, owner)
+        pending.phase === "submitted" &&
+        (!terminalAccepted || !this.isCurrentState(state, executionGeneration, dispatchEpoch) || externalSignal.aborted)
       )
-        return;
-      this.resolveAgentWaiter(state, pendingId, waiter, buffered);
-    }).finally(() => {
-      externalSignal.removeEventListener("abort", waitAbort);
-    });
-
-    if (
-      this.runs.get(runId) !== state ||
-      this.branchEpoch !== dispatchEpoch ||
-      state.lifecycleSuspended ||
-      this.lifecyclePaused
-    ) {
-      throw new WorkflowError("stale workflow terminal", WorkflowErrorCode.WORKFLOW_ABORTED, { recoverable: true });
+        await cleanupResponse();
+      state.pendingSpawns.delete(spawnKey);
+      state.bufferedTerminals.delete(spawnKey);
     }
-    const snapshot = terminal.terminal;
-    if (!snapshot)
-      throw new WorkflowError("subagent settled without a terminal snapshot", WorkflowErrorCode.AGENT_EXECUTION_ERROR, {
-        recoverable: true,
-      });
-    const status = managedTerminalStatus(snapshot);
-    // Successful calls are journaled by the runtime's onAgentJournal (the
-    // single writer for completed results); only failures settle here so the
-    // resume journal reflects them.
-    if (status !== "completed") {
-      const result = resultFromLifecycle(
-        status,
-        terminal.id,
-        snapshot.result,
-        snapshot.error,
-        snapshot.compactionCount,
-        snapshot.tokenCount,
-        state.callTiers.get(nodeId)?.tier ?? tier,
-      );
-      result.attemptId = attemptId;
-      if (!nested) this.commitCallTerminal(runId, nodeId, result);
-      if (status === "failed" && snapshot.error) {
-        throw wrapError(new Error(snapshot.error), { agentLabel: runOptions.label });
-      }
-    }
-    const completedTierIdentity = state.callTiers.get(nodeId);
-    if (completedTierIdentity?.tier !== undefined) runOptions.onTierResolved?.(completedTierIdentity.tier);
-    return snapshot.result ?? "";
   }
 
   private journalCallResult(runId: string, entry: JournalEntry): void {
+    entry = structuredClone(entry);
     const state = this.runs.get(runId);
     if (!state) return;
     const run = state.run;
+    const executionGeneration = state.executionGeneration;
+    const epoch = this.branchEpoch;
     const nodeId = String(entry.index);
     const result = entry.result;
     const callTierIdentity: CallTierIdentity =
       entry.tier === undefined ? (run.callTiers[nodeId] ?? {}) : { tier: entry.tier };
+    const managed = state.managedCallFacts.get(nodeId);
+    const currentManaged =
+      managed?.executionGeneration === state.executionGeneration && managed.attemptId === run.attemptIds[nodeId]
+        ? managed
+        : undefined;
     const callResult: CallResult = {
+      ...(currentManaged
+        ? {
+            agentId: currentManaged.agentId,
+            ...(currentManaged.tokenCount === undefined ? {} : { tokenCount: currentManaged.tokenCount }),
+            ...(currentManaged.outputFile === undefined ? {} : { outputFile: currentManaged.outputFile }),
+          }
+        : {}),
       status: "completed",
       ...(typeof result === "string" && result.length === 0 ? {} : { result }),
       ...callTierIdentity,
-      compactionCount: 0,
+      compactionCount: currentManaged?.compactionCount ?? 0,
       updatedAt: Date.now(),
     };
+    // Checkpoints are local calls, not managed children. Give their completed
+    // result a journal identity without fabricating a manager record.
+    if (!run.attemptIds[nodeId]) {
+      const generation = (state.generations.get(nodeId) ?? 0) + 1;
+      const attemptId = `${runId}/${nodeId}/attempt-${generation}`;
+      this.appendRequired({
+        kind: "call_attempt",
+        schemaVersion: JOURNAL_SCHEMA_VERSION,
+        runId,
+        nodeId,
+        attemptId,
+        generation,
+        owner: { extension: "pi-workflows", runId, nodeId, attemptId },
+        timestamp: Date.now(),
+      });
+      if (!this.isCurrentState(state, executionGeneration, epoch)) return;
+      state.generations.set(nodeId, generation);
+      run.attemptTracking = true;
+      run.attempts[nodeId] = generation;
+      run.attemptIds[nodeId] = attemptId;
+      run.callStatus[nodeId] = "running";
+    }
     const attemptId = run.attemptIds[nodeId];
     if (attemptId) callResult.attemptId = attemptId;
     const event: JournalEvent = {
@@ -1537,16 +2133,23 @@ export class WorkflowEngine {
       ...(attemptId ? { owner: { extension: "pi-workflows", runId, nodeId, attemptId } } : {}),
       timestamp: Date.now(),
     };
-    this.persist(runId, `call-result:${nodeId}`, () => this.write(event));
+    const acceptedEvent = structuredClone(event);
+    this.persist(runId, `call-result:${nodeId}`, () => this.write(acceptedEvent));
+    if (!this.isCurrentState(state, executionGeneration, epoch)) return;
     run.callResults[nodeId] = callResult;
     run.callTiers[nodeId] = callResult.tier === undefined ? {} : { tier: callResult.tier };
     run.callStatus[nodeId] = "completed";
+    run.compactions[nodeId] = callResult.compactionCount;
+    state.managedCallFacts.delete(nodeId);
     run.updatedAt = Date.now();
   }
 
   private journalWorkflowResult(runId: string, entry: JournalEntry): void {
+    entry = structuredClone(entry);
     const state = this.runs.get(runId);
     if (!state) return;
+    const generation = state.executionGeneration;
+    const epoch = this.branchEpoch;
     const nodeId = String(entry.index);
     const result: CallResult = {
       status: "completed",
@@ -1573,6 +2176,7 @@ export class WorkflowEngine {
     // otherwise a transient append retry would arrive after the terminal
     // transition and be discarded as stale during restore.
     this.appendRequired(event);
+    if (!this.isCurrentState(state, generation, epoch)) return;
     state.run.workflowResultGenerations[nodeId] = event.generation;
     state.run.callResults[nodeId] = result;
     state.run.callTiers[nodeId] = result.tier === undefined ? {} : { tier: result.tier };
@@ -1580,10 +2184,12 @@ export class WorkflowEngine {
     state.run.updatedAt = Date.now();
   }
 
-  private commitCallTerminal(runId: string, nodeId: string, result: CallResult): void {
+  private commitCallTerminal(runId: string, nodeId: string, result: CallResult, required = false): void {
     const state = this.runs.get(runId);
     if (!state) return;
     const run = state.run;
+    const generation = state.executionGeneration;
+    const epoch = this.branchEpoch;
     const attemptId = result.attemptId ?? run.attemptIds[nodeId];
     const event: JournalEvent = {
       kind: "call_result",
@@ -1595,7 +2201,9 @@ export class WorkflowEngine {
       ...(attemptId ? { owner: { extension: "pi-workflows", runId, nodeId, attemptId } } : {}),
       timestamp: Date.now(),
     };
-    this.persist(runId, `call-terminal:${nodeId}`, () => this.write(event));
+    if (required) this.appendRequired(event);
+    else this.persist(runId, `call-terminal:${nodeId}`, () => this.write(event));
+    if (!this.isCurrentState(state, generation, epoch)) return;
     run.callResults[nodeId] = result;
     run.callTiers[nodeId] = result.tier === undefined ? {} : { tier: result.tier };
     run.callStatus[nodeId] = result.status;
@@ -1608,36 +2216,26 @@ export class WorkflowEngine {
 
   private reconcilePendingSpawns(state: ScriptRunState): void {
     for (const pending of state.pendingSpawns.values()) {
+      if (pending.phase !== "submitted" || pending.agentId) continue;
       const reconciliation = this.client.reconcileManaged?.(pending.spawnKey, pending.owner);
       void reconciliation?.catch(() => {});
     }
-    state.pendingSpawns.clear();
+    // Reconciliation is not positive exact-owner quiescence. The allocation
+    // lease remains with dispatch until terminal admission or owned cleanup.
     state.bufferedTerminals.clear();
-  }
-
-  private async quiescePendingSpawns(state: ScriptRunState): Promise<WorkflowQuiesceResult> {
-    const pending = [...state.pendingSpawns.values()];
-    if (pending.length === 0) return { settled: true, pending: [] };
-    if (!this.client.reconcileManaged) {
-      return { settled: false, pending: pending.map(({ spawnKey }) => spawnKey).slice(0, 256) };
-    }
-    const failed: string[] = [];
-    await Promise.all(
-      pending.map(async ({ spawnKey, owner }) => {
-        try {
-          const result = await this.client.reconcileManaged?.(spawnKey, owner);
-          if (result === undefined) failed.push(spawnKey);
-        } catch {
-          failed.push(spawnKey);
-        }
-      }),
-    );
-    return { settled: failed.length === 0, pending: failed.slice(0, 256) };
   }
 
   private cleanupAgents(runId: string): void {
     const state = this.runs.get(runId);
     if (!state) return;
+    // Retain captured allocations before reconciliation, abort, or branch replay
+    // can notify observers. Dispatch's finally may not run until a later turn;
+    // its cleanup and any waiter cleanup share this stable exact-owner lease.
+    for (const pending of state.pendingSpawns.values()) {
+      if (pending.phase !== "submitted") continue;
+      const agentId = pending.agentId ?? pending.startedAgentId ?? pending.spawnKey;
+      void this.stopAndQuiesce(state, agentId, pending.owner, pending.executionGeneration);
+    }
     this.reconcilePendingSpawns(state);
     for (const [agentId, waiter] of [...state.agentWaiters]) {
       if (waiter.settled) continue;
@@ -1648,14 +2246,17 @@ export class WorkflowEngine {
           recoverable: true,
         }),
       );
-      void this.client
-        .stopOwned?.(agentId, {
+      void this.stopAndQuiesce(
+        state,
+        agentId,
+        {
           extension: "pi-workflows",
           runId,
           nodeId: `call-${waiter.callIndex}`,
           attemptId: `attempt-${waiter.generation}`,
-        })
-        .catch(() => {});
+        },
+        state.executionGeneration,
+      );
     }
   }
 
@@ -1665,51 +2266,108 @@ export class WorkflowEngine {
     owner: WorkflowOwner,
     executionGeneration: number,
     unconfirmed?: string,
+    quiescence?: Promise<{ settled: boolean; pending: string[] }>,
   ): Promise<void> {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    let stopError: unknown;
-    try {
-      if (unconfirmed) throw new Error(unconfirmed);
-      await Promise.race([
-        (async () => {
+    const obligations = this.cleanupObligations.get(state) ?? new Map<string, OwnedCleanup>();
+    this.cleanupObligations.set(state, obligations);
+    const allocationKey = `${owner.runId}/${owner.nodeId}/${owner.attemptId}`;
+    const existing = [...obligations.entries()].find(([, cleanup]) => sameWorkflowOwner(cleanup.owner, owner));
+    const key = existing?.[0] ?? JSON.stringify([owner, agentId]);
+    let obligation = existing?.[1];
+    if (!obligation) {
+      let resolve!: () => void;
+      const confirmed = new Promise<void>((done) => {
+        resolve = done;
+      });
+      obligation = {
+        agentId,
+        ...(agentId === allocationKey ? { spawnKey: allocationKey } : {}),
+        owner: { ...owner },
+        epoch: this.branchEpoch,
+        confirmed,
+        resolve,
+      };
+      obligations.set(key, obligation);
+      this.retainedCleanupStates.add(state);
+      state.pendingCleanup.add(confirmed);
+    } else if (obligation.spawnKey && agentId !== allocationKey) {
+      // A late reply refines the same allocation lease, not a new obligation.
+      obligation.agentId = agentId;
+      obligation.spawnKey = undefined;
+    }
+    if (obligation.operation) return obligation.operation;
+    const accepted = obligation;
+    const currentOwner = () => this.isCurrentState(state, state.executionGeneration, accepted.epoch);
+    const operation = Promise.resolve().then(async () => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let stopError: unknown;
+      try {
+        if (unconfirmed) throw new Error(unconfirmed);
+        const cleanup = (async () => {
+          // An allocation without a confirmed id can only be retried by its exact spawn owner.
+          if (accepted.spawnKey) {
+            if (!this.client.reconcileManaged) throw new Error("owned allocation reconciliation unavailable");
+            const reply = await this.client.reconcileManaged(accepted.spawnKey, accepted.owner);
+            const id = typeof reply === "string" ? reply : reply?.id;
+            if (!id) throw new Error("cancelled spawn allocation could not be confirmed");
+            accepted.agentId = id;
+            accepted.spawnKey = undefined;
+          }
           try {
             if (!this.client.stopOwned) throw new Error("owned stop RPC unavailable");
-            await this.client.stopOwned(agentId, owner);
+            await this.client.stopOwned(accepted.agentId, accepted.owner);
           } catch (error: unknown) {
-            // Reconciliation may already have stopped the record. Only exact-owner
-            // quiescence confirms that provider/tool cleanup has actually settled.
             stopError = error;
           }
           if (!this.client.quiesceOwned) throw new Error("owned cleanup RPC unavailable");
-          const result = await this.client.quiesceOwned(owner.runId, [agentId], BRANCH_QUIESCE_TIMEOUT_MS, [owner]);
+          const result = await (quiescence ??
+            this.client.quiesceOwned(accepted.owner.runId, [accepted.agentId], BRANCH_QUIESCE_TIMEOUT_MS, [
+              accepted.owner,
+            ]));
           if (!result?.settled || result.pending.length !== 0) throw new Error("owned agents are not quiescent");
-        })(),
-        new Promise<never>((_resolve, reject) => {
-          timer = setTimeout(() => reject(new Error("owned cleanup timed out")), BRANCH_QUIESCE_TIMEOUT_MS + 1_000);
-        }),
-      ]);
-    } catch (error: unknown) {
-      // Never turn uncertain cleanup into a resumable interruption. Existing
-      // terminal recovery facts durably fence this run without a protocol change.
-      if (this.runs.get(owner.runId) !== state || state.executionGeneration !== executionGeneration) return;
-      const stopDiagnostic = stopError === undefined ? "" : `; stop failed: ${String(stopError)}`;
-      const diagnostic = `Owned cleanup unconfirmed for ${agentId}: ${error instanceof Error ? error.message : String(error)}${stopDiagnostic}; run is non-resumable`;
-      this.fenceExecution(state, executionGeneration, diagnostic);
+          // A bounded negative/error is not evidence that cleanup settled. Only
+          // this positive owner check releases the stable obligation, even late.
+          obligations.delete(key);
+          if (obligations.size === 0) this.retainedCleanupStates.delete(state);
+          state.pendingCleanup.delete(accepted.confirmed);
+          accepted.resolve();
+          if (currentOwner() && isTerminalWorkflow(state.run.status)) this.notifyTerminal(state);
+        })();
+        await Promise.race([
+          cleanup,
+          new Promise<never>((_resolve, reject) => {
+            timer = setTimeout(() => reject(new Error("owned cleanup timed out")), BRANCH_QUIESCE_TIMEOUT_MS + 1_000);
+          }),
+        ]);
+      } catch (error: unknown) {
+        if (!currentOwner() || state.executionGeneration !== executionGeneration) return;
+        const stopDiagnostic = stopError === undefined ? "" : `; stop failed: ${String(stopError)}`;
+        const diagnostic = `Owned cleanup unconfirmed for ${agentId}: ${error instanceof Error ? error.message : String(error)}${stopDiagnostic}; run is non-resumable`;
+        this.fenceExecution(state, executionGeneration, diagnostic);
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+      }
+    });
+    accepted.operation = operation;
+    try {
+      await operation;
     } finally {
-      if (timer !== undefined) clearTimeout(timer);
+      if (accepted.operation === operation) accepted.operation = undefined;
     }
   }
 
   private async drainExecution(state: ScriptRunState, execution?: Promise<unknown>): Promise<void> {
     if (!execution) return;
     const generation = state.executionGeneration;
+    const epoch = this.branchEpoch;
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       await Promise.race([
         execution.catch(() => {}),
         new Promise<void>((resolve) => {
           timer = setTimeout(() => {
-            this.fenceExecution(state, generation, "Workflow execution cleanup timed out; run is non-resumable");
+            if (this.isCurrentState(state, generation, epoch))
+              this.fenceExecution(state, generation, "Workflow execution cleanup timed out; run is non-resumable");
             resolve();
           }, EXECUTION_DRAIN_TIMEOUT_MS);
         }),
@@ -1721,7 +2379,8 @@ export class WorkflowEngine {
 
   private fenceExecution(state: ScriptRunState, generation: number, diagnostic: string): void {
     const run = state.run;
-    if (this.runs.get(run.runId) !== state || state.executionGeneration !== generation) return;
+    const epoch = this.branchEpoch;
+    if (!this.isCurrentState(state, generation, epoch)) return;
     if (run.nonResumable && run.status === "stopped") return;
     run.nonResumable = true;
     const blockedNodeIds = Object.keys(run.callStatus).filter((nodeId) => run.callStatus[nodeId] !== "completed");
@@ -1744,21 +2403,119 @@ export class WorkflowEngine {
       timestamp: Date.now(),
     };
     this.persist(run.runId, "cleanup-unconfirmed", () => this.write(event));
+    if (!this.isCurrentState(state, generation, epoch)) return;
     // Fence before aborting: synchronous abort handlers may re-enter cleanup.
     // Exact-owner cleanup continues, but no later result may revive this run.
     state.executionGeneration += 1;
+    state.presentation.reset(false);
+    this.notifyInspection(state);
+    if (!this.isCurrentState(state, generation + 1, epoch)) return;
     state.controller.abort();
+    if (!this.isCurrentState(state, generation + 1, epoch)) return;
     this.cleanupAgents(run.runId);
-    this.settleWaiters(run.runId, run);
+    // Uncertainty is an error, never a terminal result delivery. Foreground
+    // callers can unwind, while owner UI retains an explicit cleanup recheck.
+    if (state.pendingCleanup.size > 0) {
+      const all = this.waiters.get(run.runId);
+      this.waiters.delete(run.runId);
+      for (const waiter of all ?? []) {
+        if (waiter.settled) continue;
+        waiter.settled = true;
+        waiter.cleanup();
+        waiter.reject(new WorkflowWaitAbortedError());
+      }
+    } else this.notifyTerminal(state);
+  }
+
+  private async remove(state: ScriptRunState): Promise<void> {
+    if (state.removeOperation) return state.removeOperation;
+    const isBusy = () =>
+      state.activeExecutionGenerations.size > 0 ||
+      state.pendingCleanup.size > 0 ||
+      state.pendingSpawns.size > 0 ||
+      state.agentWaiters.size > 0 ||
+      state.stopOperation !== undefined;
+    if (isBusy()) throw new Error("cannot remove a workflow while owned cleanup is pending");
+    const epoch = this.branchEpoch;
+    const operation = Promise.resolve().then(async () => {
+      await this.drainJournal(state.run.runId);
+      if (
+        this.runs.get(state.run.runId) !== state ||
+        this.branchEpoch !== epoch ||
+        this.disposed ||
+        this.lifecyclePaused ||
+        state.lifecycleSuspended
+      )
+        throw new Error("workflow branch changed before removal");
+      if (isBusy()) throw new Error("cannot remove a workflow while owned cleanup is pending");
+      // No queued best-effort tombstone: memory survives failure so removal can be retried.
+      this.appendRequired({
+        kind: "run_removed",
+        schemaVersion: JOURNAL_SCHEMA_VERSION,
+        runId: state.run.runId,
+        timestamp: Date.now(),
+      });
+      this.runs.delete(state.run.runId);
+      this.waiters.delete(state.run.runId);
+      this.notifyInspection(state);
+    });
+    state.removeOperation = operation;
+    try {
+      await operation;
+    } finally {
+      if (state.removeOperation === operation) state.removeOperation = undefined;
+    }
   }
 
   private async stop(state: ScriptRunState): Promise<void> {
+    if (state.stopOperation) return state.stopOperation;
+    if (isTerminalWorkflow(state.run.status) && state.pendingCleanup.size === 0) return;
+    const generation = state.executionGeneration;
+    const epoch = this.branchEpoch;
+    const operation = Promise.resolve().then(async () => {
+      if (!this.isCurrentState(state, generation, epoch)) return;
+      const pending = [...(this.cleanupObligations.get(state)?.values() ?? [])];
+      if (pending.length > 0) {
+        await Promise.all(
+          pending.map((cleanup) => this.stopAndQuiesce(state, cleanup.agentId, cleanup.owner, generation)),
+        );
+        if (!this.isCurrentState(state, generation, epoch) || state.pendingCleanup.size > 0) return;
+        if (isTerminalWorkflow(state.run.status)) {
+          this.notifyTerminal(state);
+          return;
+        }
+      }
+      await this.stopExecution(state, generation, epoch);
+    });
+    state.stopOperation = operation;
+    try {
+      await operation;
+    } finally {
+      if (state.stopOperation === operation) state.stopOperation = undefined;
+    }
+  }
+
+  private async stopExecution(state: ScriptRunState, generation: number, epoch: number): Promise<void> {
     const run = state.run;
-    if (isTerminalWorkflow(run.status)) return;
+    const current = () => this.isCurrentState(state, generation, epoch);
+    if (!current() || isTerminalWorkflow(run.status)) return;
     this.setWorkflowStatus(run, "stopping", "workflow stopped", "stop");
+    if (!current()) return;
     run.nonResumable = true;
+    // Runtime abort listeners own exact cleanup. Rejecting their waiters here would
+    // falsely settle the dispatch before its stop-and-quiesce barrier completes.
     state.controller.abort();
-    this.cleanupAgents(run.runId);
+    if (!current()) return;
+    await this.drainExecution(state, state.execution);
+    if (!current() || state.pendingCleanup.size > 0) return;
+    try {
+      await this.drainJournal(run.runId);
+    } catch {
+      if (current())
+        this.fenceExecution(state, generation, "Could not drain workflow journal during stop; run is non-resumable");
+      return;
+    }
+    if (!current()) return;
     const terminalResults: RecoveryTerminalResult[] = [];
     for (const [nodeId, status] of Object.entries(run.callStatus)) {
       if (status !== "completed") {
@@ -1778,8 +2535,6 @@ export class WorkflowEngine {
           result,
           owner: { extension: "pi-workflows", runId: run.runId, nodeId, attemptId: run.attemptIds[nodeId] ?? "" },
         });
-        run.callResults[nodeId] = result;
-        run.callStatus[nodeId] = "stopped";
       }
     }
     const event: TerminalRecoveryEvent = {
@@ -1795,10 +2550,22 @@ export class WorkflowEngine {
       recoveryId: deriveRecoveryId({ runId: run.runId, rotations: [], timestamp: Date.now() }),
       timestamp: Date.now(),
     };
-    this.persist(run.runId, "stop-terminal", () => this.write(event));
+    try {
+      this.appendRequired(event);
+    } catch {
+      this.fenceExecution(state, generation, "Could not persist workflow stop terminal; run is non-resumable");
+      return;
+    }
+    if (!current()) return;
+    for (const terminal of terminalResults) {
+      run.callResults[terminal.nodeId] = terminal.result;
+      run.callStatus[terminal.nodeId] = "stopped";
+    }
     run.status = "stopped";
     run.updatedAt = Date.now();
-    this.settleWaiters(run.runId, run);
+    state.presentation.settle(run.status);
+    this.notifyInspection(state);
+    if (current()) this.notifyTerminal(state);
   }
 
   // ── journal writes ─────────────────────────────────────────────────────────
@@ -1811,15 +2578,24 @@ export class WorkflowEngine {
    * whose appends keep failing is marked blocked (reported once, not spammed).
    */
   private scheduleJournalRetry(runId: string, key: string, mutation: () => void): void {
-    const retryKey = `${runId}\u0000${key}`;
-    if (this.journalRetries.has(retryKey)) return;
-    const retry = { attempt: 0, timer: undefined as ReturnType<typeof setTimeout> | undefined };
+    // Every accepted fact has its own slot, including later retry generations
+    // for the same call. Coalescing by node key would silently drop that fact.
+    const retryKey = `${runId}\u0000${key}\u0000${++this.journalMutationSequence}`;
+    const predecessors = [...this.journalRetries.entries()]
+      .filter(([id]) => id.startsWith(`${runId}\u0000`))
+      .map(([, pending]) => pending.done);
+    let resolve!: () => void;
+    const done = new Promise<void>((settled) => {
+      resolve = settled;
+    });
+    const retry = { attempt: 0, timer: undefined as ReturnType<typeof setTimeout> | undefined, done, resolve };
     const attempt = (): void => {
       const current = this.journalRetries.get(retryKey);
       if (!current) return;
       current.timer = undefined;
       if (this.lifecyclePaused || !this.runs.has(runId)) {
         this.journalRetries.delete(retryKey);
+        current.resolve();
         return;
       }
       const previousKey = this.journalMutationKey;
@@ -1827,9 +2603,12 @@ export class WorkflowEngine {
       try {
         mutation();
         this.journalRetries.delete(retryKey);
+        current.resolve();
       } catch (error: unknown) {
         if (!(error instanceof JournalAppendError)) {
           this.journalRetries.delete(retryKey);
+          current.resolve();
+          this.journalBlockedRuns.add(runId);
           console.warn(
             `[pi-workflows] journal retry abandoned: ${error instanceof Error ? error.message : String(error)}`,
           );
@@ -1838,6 +2617,7 @@ export class WorkflowEngine {
         current.attempt += 1;
         if (current.attempt >= JOURNAL_RETRY_MAX_ATTEMPTS) {
           this.journalRetries.delete(retryKey);
+          current.resolve();
           this.journalBlockedRuns.add(runId);
           console.warn(`[pi-workflows] journal retry exhausted for ${runId}: ${error.message}`);
           return;
@@ -1852,7 +2632,19 @@ export class WorkflowEngine {
       }
     };
     this.journalRetries.set(retryKey, retry);
-    queueMicrotask(attempt);
+    void Promise.all(predecessors).then(attempt);
+  }
+
+  private async drainJournal(runId: string): Promise<void> {
+    let pending = [...this.journalRetries.entries()].filter(([id]) => id.startsWith(`${runId}\u0000`));
+    while (pending.length > 0) {
+      await Promise.all(pending.map(([, retry]) => retry.done));
+      pending = [...this.journalRetries.entries()].filter(([id]) => id.startsWith(`${runId}\u0000`));
+    }
+    if (this.journalBlockedRuns.has(runId))
+      throw new WorkflowError("Workflow journal has not settled", WorkflowErrorCode.PERSISTENCE_ERROR, {
+        recoverable: true,
+      });
   }
 
   private appendRequired(event: JournalEvent): void {
@@ -1888,6 +2680,18 @@ export class WorkflowEngine {
    * a transient failure, schedules a retry of the exact same append.
    */
   private persist(runId: string, key: string, mutation: () => void): void {
+    const acceptedState = this.runs.get(runId);
+    const epoch = this.branchEpoch;
+    const append = mutation;
+    mutation = () => {
+      if (this.disposed || this.lifecyclePaused || this.runs.get(runId) !== acceptedState || this.branchEpoch !== epoch)
+        return;
+      append();
+    };
+    if ([...this.journalRetries.keys()].some((id) => id.startsWith(`${runId}\u0000`))) {
+      this.scheduleJournalRetry(runId, key, mutation);
+      return;
+    }
     const previousKey = this.journalMutationKey;
     this.journalMutationKey = `${runId}:${key}`;
     try {
@@ -1942,8 +2746,9 @@ export class WorkflowEngine {
     this.providerResumeTimers.set(runId, timer);
   }
   private clearJournalRetries(): void {
-    for (const { timer } of this.journalRetries.values()) {
+    for (const { timer, resolve } of this.journalRetries.values()) {
       if (timer) clearTimeout(timer);
+      resolve();
     }
     this.journalRetries.clear();
     this.journalBlockedRuns.clear();
@@ -1959,6 +2764,10 @@ export class WorkflowEngine {
     finalResult?: unknown,
   ): void {
     if (isTerminalWorkflow(run.status) && !isTerminalWorkflow(status)) return;
+    const state = this.runs.get(run.runId);
+    const generation = state?.executionGeneration ?? 0;
+    const epoch = this.branchEpoch;
+    if (!state || state.run !== run || !this.isCurrentState(state, generation, epoch)) return;
     // Validate and isolate terminal values before best-effort persistence or any
     // status mutation. A bad result must still be able to transition the run to failed.
     const durableFinalResult = finalResult === undefined ? undefined : cloneWorkflowResult(finalResult);
@@ -1976,15 +2785,18 @@ export class WorkflowEngine {
         timestamp,
       }),
     );
+    if (!this.isCurrentState(state, generation, epoch)) return;
     run.status = status;
+    if (status === "running") run.error = undefined;
     if (error !== undefined) run.error = error;
     if (runFinalResult !== undefined) run.finalResult = runFinalResult;
     if (terminalIntent !== undefined) run.terminalIntent = terminalIntent;
     run.updatedAt = timestamp;
+    this.notifyInspection(state);
+    if (!this.isCurrentState(state, generation, epoch)) return;
     if (isTerminalWorkflow(status)) {
-      this.runs.get(run.runId)?.bufferedTerminals.clear();
-      this.settleWaiters(run.runId, run);
-      this.onRunSettled?.();
+      state.bufferedTerminals.clear();
+      this.notifyTerminal(state);
     }
   }
 
@@ -1992,6 +2804,9 @@ export class WorkflowEngine {
 
   restore(entries: readonly SessionEntryLike[], branchGeneration = 0): void {
     if (this.disposed) return;
+    const retiredStates = [...this.runs.values()];
+    this.branchEpoch++;
+    for (const state of retiredStates) state.lifecycleSuspended = true;
     // A branch replay is a replacement, not a merge. Runs absent from the new
     // branch must not remain controllable or append facts into it.
     this.clearJournalRetries();
@@ -2009,6 +2824,10 @@ export class WorkflowEngine {
     for (const run of runs.values()) {
       const state: ScriptRunState = {
         run,
+        presentation: new WorkflowPresentation(run.runId, true),
+        managedCallFacts: new Map(),
+        pendingCleanup: new Set(),
+        activeExecutionGenerations: new Set(),
         frozenOptions: {
           ...(run.frozenTokenBudget !== undefined ? { tokenBudget: run.frozenTokenBudget } : {}),
           ...(run.frozenMaxAgents !== undefined ? { maxAgents: run.frozenMaxAgents } : {}),
@@ -2043,6 +2862,8 @@ export class WorkflowEngine {
       run.updatedAt = Date.now();
       this.runs.set(run.runId, state);
     }
+    for (const state of retiredStates) this.notifyInspection(state);
+    for (const state of this.runs.values()) this.notifyInspection(state);
   }
 
   list(): Array<Record<string, unknown>> {
@@ -2058,6 +2879,18 @@ export class WorkflowEngine {
 
   getRun(runId: string): ScriptRun | undefined {
     return this.runs.get(runId)?.run;
+  }
+
+  /** Primitive-only Fleet metadata; avoids cloning full inspection arrays for every run. */
+  getInspectionHeader(runId: string): WorkflowInspectionHeader | undefined {
+    const state = this.runs.get(runId);
+    return state?.presentation.header(state.executionGeneration);
+  }
+
+  /** Detached bounded facts for late-opening UI mounts; no event callback ownership required. */
+  getInspection(runId: string): WorkflowInspection | undefined {
+    const state = this.runs.get(runId);
+    return state?.presentation.snapshot(state.run, state.executionGeneration);
   }
 
   summary(run: ScriptRun, detailed = false): Record<string, unknown> {
@@ -2081,7 +2914,7 @@ export class WorkflowEngine {
         return {
           index: Number(nodeId),
           status,
-          ...(result?.result !== undefined ? { resultPreview: String(result.result).slice(0, 300) } : {}),
+          ...(result?.result !== undefined ? { resultPreview: renderWorkflowValue(result.result).slice(0, 300) } : {}),
           ...(result?.error ? { error: result.error.slice(0, 300) } : {}),
           ...(result?.tokenCount !== undefined ? { tokenCount: result.tokenCount } : {}),
           ...(run.agentIds[nodeId] ? { agentId: run.agentIds[nodeId] } : {}),
@@ -2110,5 +2943,5 @@ export class WorkflowWaitAbortedError extends Error {
   }
 }
 
-export type { ScriptRun, WorkflowOwner };
+export type { ScriptRun, WorkflowInspection, WorkflowInspectionHeader, WorkflowOwner };
 export { createManagedSpawnClient, JOURNAL_ENTRY_TYPE, snapshotRun };

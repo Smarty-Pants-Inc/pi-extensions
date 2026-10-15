@@ -6,30 +6,31 @@ export function commandExists(command: string, cwd = process.cwd(), pathValue = 
   return resolveCommandPath(command, cwd, process.platform, pathValue) !== undefined;
 }
 
-export function commandPathValue(
-  env: Record<string, string> | undefined,
-  platform: NodeJS.Platform = process.platform,
-) {
-  return environmentValue(env, "PATH", platform) ?? environmentValue(process.env, "PATH", platform) ?? "";
+export function commandPathValue(env: NodeJS.ProcessEnv | undefined, platform: NodeJS.Platform = process.platform) {
+  return environmentValue(mergeEnvironment(env, platform), "PATH", platform) ?? "";
 }
 
 export function mergeEnvironment(
-  overrides: Record<string, string> | undefined,
+  overrides: NodeJS.ProcessEnv | undefined,
   platform: NodeJS.Platform = process.platform,
 ) {
-  const environment: NodeJS.ProcessEnv = { ...process.env };
+  const environment: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value !== undefined) environment[key] = value;
+  }
   for (const [key, value] of Object.entries(overrides ?? {})) {
     if (platform === "win32") {
       for (const existingKey of Object.keys(environment)) {
         if (existingKey.toLowerCase() === key.toLowerCase()) delete environment[existingKey];
       }
     }
-    environment[key] = value;
+    if (value === undefined) delete environment[key];
+    else environment[key] = value;
   }
   return environment;
 }
 
-function environmentValue(
+export function environmentValue(
   environment: NodeJS.ProcessEnv | Record<string, string> | undefined,
   name: string,
   platform: NodeJS.Platform,

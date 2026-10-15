@@ -627,6 +627,293 @@ describe("workflow journal replay (schema v4)", () => {
     expect(journal.get(`${runId}:0`)).toMatchObject({ hash: "new-hash", result: "new" });
   });
 
+  describe("resume cache reconciliation", () => {
+    const runId = "resume-reconciliation";
+    const firstAttemptId = `${runId}/0/attempt-1`;
+    const secondAttemptId = `${runId}/0/attempt-2`;
+    const owner = (attemptId: string) => ({ extension: "pi-workflows", runId, nodeId: "0", attemptId });
+    const seededCompletion = () =>
+      [
+        runCreated(runId, { attempts: { "0": 1 }, attemptIds: { "0": firstAttemptId } }),
+        callResult(runId, "0", 2, {
+          attemptId: firstAttemptId,
+          owner: owner(firstAttemptId),
+          result: { status: "completed", result: "OLD", attemptId: firstAttemptId, compactionCount: 0, updatedAt: 2 },
+          storeDelta: { old: true },
+        }),
+      ] as const;
+    const nextAttempt = () => ({
+      ...callAttempt(runId, "0", 3),
+      data: {
+        ...callAttempt(runId, "0", 3).data,
+        attemptId: secondAttemptId,
+        generation: 2,
+        owner: owner(secondAttemptId),
+      },
+    });
+    const nextResult = (status: "completed" | "failed" | "stopped", overrides: Record<string, unknown> = {}) =>
+      callResult(runId, "0", 4, {
+        attemptId: secondAttemptId,
+        owner: owner(secondAttemptId),
+        result: { status, result: "NEW", attemptId: secondAttemptId, compactionCount: 0, updatedAt: 4 },
+        storeDelta: { new: true },
+        ...overrides,
+      });
+    const rotation = () => ({
+      nodeId: "0",
+      sourceAttemptId: firstAttemptId,
+      sourceGeneration: 1,
+      sourceStatus: "completed",
+      attemptId: secondAttemptId,
+      generation: 2,
+      owner: owner(secondAttemptId),
+    });
+    const recovery = (kind: "attempt_recovery" | "run_recovery") => ({
+      type: "custom" as const,
+      customType: "pi-workflows:journal",
+      data: {
+        kind,
+        schemaVersion: JOURNAL_SCHEMA_VERSION,
+        runId,
+        branchGeneration: 1,
+        timestamp: 3,
+        ...(kind === "attempt_recovery"
+          ? { nodeId: "0", rotation: rotation() }
+          : { status: "interrupted", rotations: [rotation()], recoveryId: `r4-${"d".repeat(64)}` }),
+      },
+    });
+
+    it.each(["running", "failed", "stopped"] as const)(
+      "invalidates an older completed result when the accepted next attempt is %s",
+      (status) => {
+        const entries = [...seededCompletion(), nextAttempt(), ...(status === "running" ? [] : [nextResult(status)])];
+        const diagnostics: string[] = [];
+        const run = replayJournal(entries, { onInvalid: (message) => diagnostics.push(message) }).get(runId);
+        expect(diagnostics).toEqual([]);
+        expect(run?.attempts["0"]).toBe(2);
+        expect(run?.callStatus["0"]).toBe(status);
+        expect(buildResumeJournal(entries).has(`${runId}:0`)).toBe(false);
+      },
+    );
+
+    it.each(["attempt_recovery", "run_recovery"] as const)(
+      "invalidates a completed candidate after accepted %s without replacement",
+      (kind) => {
+        const entries = [...seededCompletion(), recovery(kind)];
+        const run = replayJournal(entries).get(runId);
+        expect(run?.attemptIds["0"]).toBe(secondAttemptId);
+        expect(run?.callResults["0"]).toBeUndefined();
+        expect(buildResumeJournal(entries).size).toBe(0);
+      },
+    );
+
+    it.each(["failed", "stopped", "completed"] as const)(
+      "invalidates a candidate overwritten by a %s terminal recovery result",
+      (status) => {
+        const entries = [
+          ...seededCompletion(),
+          {
+            type: "custom" as const,
+            customType: "pi-workflows:journal",
+            data: {
+              kind: "terminal_recovery",
+              schemaVersion: JOURNAL_SCHEMA_VERSION,
+              runId,
+              status: "failed",
+              terminalIntent: "failure",
+              branchGeneration: 1,
+              terminalResults: [
+                {
+                  nodeId: "0",
+                  attemptId: firstAttemptId,
+                  owner: owner(firstAttemptId),
+                  // Even identical completed content has no replay hash in a
+                  // recovery result and must supersede the old cached fact.
+                  result: { ...seededCompletion()[1].data.result, status },
+                },
+              ],
+              blockedNodeIds: [],
+              recoveryId: `r4-${"e".repeat(64)}`,
+              timestamp: 3,
+            },
+          },
+        ];
+        expect(replayJournal(entries).get(runId)?.callResults["0"]?.status).toBe(status);
+        expect(buildResumeJournal(entries).size).toBe(0);
+      },
+    );
+
+    it("invalidates a candidate overwritten by a run recovery terminal result", () => {
+      const recovered = recovery("run_recovery");
+      const entries = [
+        ...seededCompletion(),
+        {
+          ...recovered,
+          data: {
+            ...recovered.data,
+            rotations: [],
+            terminalResults: [
+              {
+                nodeId: "0",
+                attemptId: firstAttemptId,
+                owner: owner(firstAttemptId),
+                result: seededCompletion()[1].data.result,
+              },
+            ],
+          },
+        },
+      ];
+      expect(replayJournal(entries).get(runId)?.callResults["0"]?.result).toBe("OLD");
+      expect(buildResumeJournal(entries).size).toBe(0);
+    });
+
+    it.each(["missing hash", "missing value"])(
+      "invalidates a candidate after a completed replacement with %s",
+      (kind) => {
+        const replacement = nextResult("completed", {
+          ...(kind === "missing hash"
+            ? { callHash: undefined }
+            : { result: { status: "completed", attemptId: secondAttemptId, compactionCount: 0, updatedAt: 4 } }),
+        });
+        const entries = [...seededCompletion(), nextAttempt(), replacement];
+        expect(replayJournal(entries).get(runId)?.callStatus["0"]).toBe("completed");
+        expect(buildResumeJournal(entries).size).toBe(0);
+      },
+    );
+
+    it("keeps the successful replacement despite delayed stale results and attempts", () => {
+      const entries = [
+        ...seededCompletion(),
+        nextAttempt(),
+        nextResult("completed"),
+        // Both are rejected as stale, not accepted invalidations.
+        seededCompletion()[1],
+        callAttempt(runId, "0", 5),
+        callResult(runId, "0", 6, {
+          attemptId: firstAttemptId,
+          owner: owner(firstAttemptId),
+          result: { status: "failed", attemptId: firstAttemptId, compactionCount: 0, updatedAt: 6 },
+        }),
+      ];
+      expect(replayJournal(entries).get(runId)?.attempts["0"]).toBe(2);
+      expect(buildResumeJournal(entries).get(`${runId}:0`)).toEqual({
+        index: 0,
+        runId,
+        hash: "hash-0",
+        result: "NEW",
+        tier: "low",
+        storeDelta: { new: true },
+      });
+    });
+
+    it("invalidates a candidate when accepted call status is no longer completed", () => {
+      const entries = [
+        ...seededCompletion(),
+        {
+          type: "custom" as const,
+          customType: "pi-workflows:journal",
+          data: {
+            kind: "call_transition",
+            schemaVersion: JOURNAL_SCHEMA_VERSION,
+            runId,
+            nodeId: "0",
+            attemptId: firstAttemptId,
+            owner: owner(firstAttemptId),
+            status: "stopped",
+            timestamp: 3,
+          },
+        },
+      ];
+      expect(replayJournal(entries).get(runId)?.callStatus["0"]).toBe("stopped");
+      expect(buildResumeJournal(entries).size).toBe(0);
+    });
+
+    it("does not resurrect a removed run's candidate through recreation", () => {
+      const entries = [
+        ...seededCompletion(),
+        {
+          type: "custom" as const,
+          customType: "pi-workflows:journal",
+          data: { kind: "run_removed", schemaVersion: JOURNAL_SCHEMA_VERSION, runId, timestamp: 3 },
+        },
+        ...seededCompletion(),
+      ];
+      expect(replayJournal(entries).has(runId)).toBe(false);
+      expect(buildResumeJournal(entries).size).toBe(0);
+    });
+
+    it("discards quarantined candidates without affecting another run's valid cache", () => {
+      const entries = [
+        ...seededCompletion(),
+        runCreated("quarantined"),
+        callResult("quarantined", "0", 2, {
+          result: { status: "completed", result: "first", compactionCount: 0, updatedAt: 2 },
+        }),
+        callResult("quarantined", "0", 3, {
+          result: { status: "completed", result: "contradiction", compactionCount: 0, updatedAt: 3 },
+        }),
+      ];
+      expect(replayJournal(entries).has("quarantined")).toBe(false);
+      const journal = buildResumeJournal(entries);
+      expect(journal.size).toBe(1);
+      expect(journal.get(`${runId}:0`)?.result).toBe("OLD");
+    });
+
+    it("invalidates only the superseded nested boundary, preserving child namespace results", () => {
+      const entries = [
+        runCreated("parent"),
+        workflowResult("parent", "0", 2, { agentCount: 2, storeDelta: { parent: true } }),
+        runCreated("child"),
+        workflowResult("child", "0", 2, { agentCount: 1, storeDelta: { child: true } }),
+        callAttempt("parent", "0", 3),
+      ];
+      expect(replayJournal(entries).get("parent")?.callResults["0"]).toBeUndefined();
+      const journal = buildResumeJournal(entries);
+      expect(journal.has("parent:0")).toBe(false);
+      expect(journal.get("child:0")).toMatchObject({
+        generation: 1,
+        agentCount: 1,
+        storeDelta: { child: true },
+      });
+    });
+
+    it("invalidates a nested candidate after an accepted newer generation without a value", () => {
+      const entries = [
+        runCreated("parent"),
+        workflowResult("parent", "0", 2),
+        workflowResult("parent", "0", 3, {
+          generation: 2,
+          result: { status: "completed", compactionCount: 0, updatedAt: 3 },
+        }),
+      ];
+      expect(replayJournal(entries).get("parent")?.workflowResultGenerations["0"]).toBe(2);
+      expect(buildResumeJournal(entries).size).toBe(0);
+    });
+
+    it("preserves a nested candidate after an identical accepted retry and delayed identity transition", () => {
+      const result = workflowResult("parent", "0", 2);
+      const entries = [
+        runCreated("parent"),
+        result,
+        result,
+        {
+          type: "custom" as const,
+          customType: "pi-workflows:journal",
+          data: {
+            kind: "call_transition",
+            schemaVersion: JOURNAL_SCHEMA_VERSION,
+            runId: "parent",
+            nodeId: "0",
+            status: "running",
+            timestamp: 3,
+          },
+        },
+      ];
+      expect(replayJournal(entries).get("parent")?.callStatus["0"]).toBe("completed");
+      expect(buildResumeJournal(entries).get("parent:0")?.result).toEqual({ nested: true });
+    });
+  });
+
   it("deduplicates identical creation and honors durable removal", () => {
     const created = runCreated("r7");
     const revision = {

@@ -2,7 +2,7 @@ import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import path from "node:path";
 import process from "node:process";
 import { StringDecoder } from "node:string_decoder";
-import { commandPathValue, mergeEnvironment, resolveCommandPath } from "./command.js";
+import { environmentValue, mergeEnvironment, resolveCommandPath } from "./command.js";
 import { directoryUri } from "./files.js";
 import { positionAt } from "./text-edits.js";
 import type { CodeAction, JsonRpcMessage, LspDiagnostic, LspServerAdapter, ServerCommand } from "./types.js";
@@ -22,9 +22,25 @@ export function resolveSpawnCommand(
 // Quiet period (ms) after each publish before treating push diagnostics as settled.
 const PUBLISHED_DIAGNOSTICS_SETTLE_MS = 800;
 const STDERR_TAIL_BYTES = 16 * 1024;
+const TERMINATION_GRACE_MS = 500;
+const CLOSE_CONFIRMATION_MS = 500;
+
+interface OwnedProcess {
+  child: ChildProcessWithoutNullStreams;
+  // Cleanup can fail before close; a settled promise does not release ownership.
+  done: Promise<Error | undefined>;
+  completeCleanup: (error?: Error) => void;
+  closed: Promise<void>;
+  confirmClose: () => void;
+  signalError?: string;
+  terminating: boolean;
+  exited: boolean;
+  escalation?: NodeJS.Timeout;
+  confirmation?: NodeJS.Timeout;
+}
 
 export class LspClient {
-  #child?: ChildProcessWithoutNullStreams;
+  #process?: OwnedProcess;
   #buffer = Buffer.alloc(0);
   #nextId = 1;
   #pending = new Map<
@@ -52,21 +68,35 @@ export class LspClient {
   #command: ServerCommand;
   #cwd: string;
   #timeoutMs: number;
+  #environment?: NodeJS.ProcessEnv;
 
-  constructor(adapter: LspServerAdapter, command: ServerCommand, cwd: string, timeoutMs: number) {
+  constructor(
+    adapter: LspServerAdapter,
+    command: ServerCommand,
+    cwd: string,
+    timeoutMs: number,
+    environment?: NodeJS.ProcessEnv,
+  ) {
     this.#adapter = adapter;
     this.#command = command;
     this.#cwd = cwd;
     this.#timeoutMs = timeoutMs;
+    this.#environment = environment;
   }
 
   async start() {
-    if (this.#child) throw new Error(`${this.#adapter.name} LSP client is already started`);
+    // A close is synchronous, but a restart must wait until the old child is reaped.
+    if (this.#process?.terminating) {
+      const error = await this.#process.done;
+      if (error) throw error;
+    }
+    if (this.#process) throw new Error(`${this.#adapter.name} LSP client is already started`);
+    const environment = this.#environment ?? mergeEnvironment(this.#adapter.env);
     const commandPath = resolveCommandPath(
       this.#command.command,
       this.#cwd,
       process.platform,
-      commandPathValue(this.#adapter.env),
+      environmentValue(environment, "PATH", process.platform) ?? "",
     );
     if (!commandPath) {
       throw new Error(
@@ -80,15 +110,47 @@ export class LspClient {
     this.#publishedDiagnostics.clear();
     this.#serverCapabilities = {};
     this.#nextId = 1;
-    const spawnCommand = resolveSpawnCommand({ ...this.#command, command: commandPath });
+    const spawnCommand = resolveSpawnCommand(
+      { ...this.#command, command: commandPath },
+      process.platform,
+      environmentValue(environment, "ComSpec", process.platform),
+    );
     const child = spawn(spawnCommand.command, spawnCommand.args, {
       cwd: this.#cwd,
-      env: mergeEnvironment(this.#adapter.env),
+      env: environment,
       stdio: "pipe",
     });
-    this.#child = child;
+    let completeCleanup!: (error?: Error) => void;
+    const done = new Promise<Error | undefined>((resolve) => {
+      completeCleanup = resolve;
+    });
+    let confirmClose!: () => void;
+    const closed = new Promise<void>((resolve) => {
+      confirmClose = resolve;
+    });
+    const owned: OwnedProcess = {
+      child,
+      done,
+      completeCleanup,
+      closed,
+      confirmClose,
+      terminating: false,
+      exited: false,
+    };
+    this.#process = owned;
+    const finish = () => {
+      owned.exited = true;
+      clearTimeout(owned.escalation);
+      clearTimeout(owned.confirmation);
+      owned.escalation = undefined;
+      owned.confirmation = undefined;
+      this.#destroyStreams(child);
+      if (this.#process === owned) this.#process = undefined;
+      owned.completeCleanup();
+      owned.confirmClose();
+    };
     child.stdout.on("data", (chunk) => {
-      if (this.#child !== child) return;
+      if (this.#process !== owned || owned.terminating) return;
       try {
         this.#onData(chunk);
       } catch (error) {
@@ -98,7 +160,7 @@ export class LspClient {
       }
     });
     child.stderr.on("data", (chunk: Buffer) => {
-      if (this.#child !== child) return;
+      if (this.#process !== owned || owned.terminating) return;
       const tail = chunk.subarray(-STDERR_TAIL_BYTES);
       if (tail.length === STDERR_TAIL_BYTES) {
         tail.copy(this.#stderr);
@@ -113,26 +175,40 @@ export class LspClient {
       this.#stderrSize = Math.min(STDERR_TAIL_BYTES, this.#stderrSize + tail.length);
     });
     child.stdin.on("error", (error) => {
-      if (this.#child !== child) return;
+      if (this.#process !== owned || owned.terminating) return;
       this.#fail(`${this.#adapter.name} LSP stdin write failed: ${formatErrorMessage(error)}.${this.#formatStderr()}`);
     });
     child.once("exit", (code, signal) => {
-      if (this.#child !== child) return;
-      this.#child = undefined;
-      const reason = signal ? `signal ${signal}` : `code ${code ?? "unknown"}`;
-      this.#rejectPending(
-        (id) => `${this.#adapter.name} LSP server exited before response ${id} (${reason}).${this.#formatStderr()}`,
-      );
+      if (this.#process === owned) {
+        const reason = signal ? `signal ${signal}` : `code ${code ?? "unknown"}`;
+        this.#rejectPending(
+          (id) => `${this.#adapter.name} LSP server exited before response ${id} (${reason}).${this.#formatStderr()}`,
+        );
+      }
+      owned.exited = true;
+      owned.terminating = true;
+      clearTimeout(owned.escalation);
+      owned.escalation = undefined;
+      this.#destroyStreams(child);
+    });
+    // close follows exit (or a failed spawn) once the owned pipes are closed.
+    child.once("close", finish);
+    child.on("error", (error) => {
+      if (owned.terminating) {
+        // kill can emit an error synchronously and return false (e.g. EPERM).
+        owned.signalError = formatErrorMessage(error);
+        return;
+      }
+      if (this.#process === owned) {
+        this.#fail(`${this.#adapter.name} LSP process failed: ${error.message}.${this.#formatStderr()}`);
+      }
+      // A failed spawn has no PID and will not emit exit; close still settles done.
     });
 
     await new Promise<void>((resolve, reject) => {
       child.once("spawn", resolve);
       child.once("error", (error) => {
         const message = `${this.#adapter.name} LSP process failed to start: ${error.message}.${this.#formatStderr()}`;
-        if (this.#child === child) {
-          this.#rejectPending(message);
-          this.#child = undefined;
-        }
         reject(new Error(message));
       });
     });
@@ -180,7 +256,7 @@ export class LspClient {
   }
 
   didClose(uri: string) {
-    if (!this.#child) return false;
+    if (!this.#process || this.#process.terminating) return false;
     this.notify("textDocument/didClose", {
       textDocument: { uri },
     });
@@ -188,6 +264,9 @@ export class LspClient {
   }
 
   async diagnostics(uri: string) {
+    if (!this.#process || this.#process.terminating) {
+      throw new Error(`${this.#adapter.name} LSP server is not running.`);
+    }
     // Only pull if the server advertised it; otherwise use push diagnostics.
     if (!this.#serverCapabilities.diagnosticProvider) {
       return this.#waitForPublishedDiagnostics(
@@ -250,23 +329,89 @@ export class LspClient {
   }
 
   async shutdown() {
-    if (!this.#child) return;
+    const owned = this.#process;
+    if (!owned) return;
 
     try {
-      await this.request("shutdown", null);
-      this.notify("exit", undefined);
+      if (!owned.terminating) {
+        await this.request("shutdown", null);
+        if (this.#process === owned && !owned.terminating) this.notify("exit", undefined);
+      }
     } catch {
-      // The process may already be gone; close below still guarantees cleanup.
-    } finally {
-      this.close();
+      // The process may already be gone; attempt owned termination below.
     }
+    const error = await this.#terminate(owned, `${this.#adapter.name} LSP request cancelled.`);
+    if (error) throw error;
   }
 
   close() {
-    this.#rejectPending(`${this.#adapter.name} LSP request cancelled.`);
+    if (this.#process) void this.#terminate(this.#process, `${this.#adapter.name} LSP request cancelled.`);
+  }
 
-    if (this.#child && !this.#child.killed) this.#child.kill("SIGTERM");
-    this.#child = undefined;
+  /** A failed cleanup is not closure. Runner leases must await the actual close event. */
+  whenClosed(): Promise<void> {
+    return this.#process?.closed ?? Promise.resolve();
+  }
+
+  /** Synchronously snapshot whether admission must wait for this owned child. */
+  waitForTermination(): Promise<void> | undefined {
+    if (!this.#process?.terminating) return;
+    return this.#process.done.then((error) => {
+      if (error) throw error;
+    });
+  }
+
+  #terminate(owned: OwnedProcess, message: string) {
+    if (owned.exited || owned.terminating) return owned.done;
+    owned.terminating = true;
+    if (this.#process === owned) this.#rejectPending(message);
+    const { child } = owned;
+    this.#destroyStreams(child);
+    // killed only means a signal was sent, not that the process exited. Keep
+    // ownership until close and use the child handle, never a saved numeric PID.
+    const isRunning = () => !owned.exited && child.exitCode === null && child.signalCode === null;
+    const sendSignal = (signal: NodeJS.Signals) => {
+      owned.signalError = undefined;
+      try {
+        if (child.kill(signal)) return undefined;
+        return owned.signalError ?? "kill returned false";
+      } catch (error) {
+        return formatErrorMessage(error);
+      }
+    };
+    if (child.pid !== undefined && isRunning()) {
+      const termError = sendSignal("SIGTERM");
+      owned.escalation = setTimeout(() => {
+        owned.escalation = undefined;
+        if (!isRunning()) return;
+        const killError = sendSignal("SIGKILL");
+        // Even a true kill return only acknowledges the signal attempt. Bound
+        // close confirmation independently; exit alone does not release ownership.
+        const unconfirmed = () => {
+          owned.confirmation = undefined;
+          // Resolve a failure value: synchronous close cannot cause an unhandled rejection.
+          owned.completeCleanup(
+            new Error(
+              `${this.#adapter.name} LSP cleanup failed: ` +
+                (termError ? `SIGTERM: ${termError}; ` : "") +
+                (killError
+                  ? `SIGKILL: ${killError}. `
+                  : `No close within ${CLOSE_CONFIRMATION_MS} ms after SIGKILL. `) +
+                "Child termination is unconfirmed; restart is blocked until close.",
+            ),
+          );
+        };
+        if (killError && isRunning()) unconfirmed();
+        else owned.confirmation = setTimeout(unconfirmed, CLOSE_CONFIRMATION_MS);
+      }, TERMINATION_GRACE_MS);
+    }
+    return owned.done;
+  }
+
+  #destroyStreams(child: ChildProcessWithoutNullStreams) {
+    child.stdin.destroy();
+    child.stdout.destroy();
+    child.stderr.destroy();
   }
 
   #rejectPending(message: string | ((id: number | "diagnostics") => string)) {
@@ -284,9 +429,7 @@ export class LspClient {
   }
 
   #fail(message: string) {
-    this.#rejectPending(message);
-    if (this.#child && !this.#child.killed) this.#child.kill("SIGTERM");
-    this.#child = undefined;
+    if (this.#process) void this.#terminate(this.#process, message);
   }
 
   private request(method: string, params: unknown) {
@@ -314,11 +457,12 @@ export class LspClient {
   }
 
   #send(message: JsonRpcMessage) {
-    if (!this.#child) throw new Error(`${this.#adapter.name} LSP server is not running.`);
+    const owned = this.#process;
+    if (!owned || owned.terminating) throw new Error(`${this.#adapter.name} LSP server is not running.`);
 
     const body = JSON.stringify(message);
     try {
-      this.#child.stdin.write(`Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`);
+      owned.child.stdin.write(`Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`);
     } catch (error) {
       const errorMessage = `${this.#adapter.name} LSP stdin write failed: ${formatErrorMessage(error)}.${this.#formatStderr()}`;
       this.#fail(errorMessage);
@@ -388,6 +532,9 @@ export class LspClient {
     uri: string,
     fallback?: { afterVersion: number; diagnostics: LspDiagnostic[]; waitMs: number },
   ) {
+    if (!this.#process || this.#process.terminating) {
+      return Promise.reject(new Error(`${this.#adapter.name} LSP server is not running.`));
+    }
     // See PUBLISHED_DIAGNOSTICS_SETTLE_MS. Bounded by #timeoutMs.
     return new Promise<LspDiagnostic[]>((resolve, reject) => {
       let settleTimer: NodeJS.Timeout | undefined;

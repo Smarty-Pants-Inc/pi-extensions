@@ -1,5 +1,12 @@
 # @signalridge/pi-goal
 
+## 1.4.6
+### Patch Changes
+
+- c2fd867: Treat unknown continuation-shaped user comments as ordinary input while retaining owned stale-delivery rejection and provenance guards.
+- Updated dependencies [c2fd867]
+  - @signalridge/pi-ui@1.4.0
+
 ## 1.4.5
 ### Patch Changes
 
