@@ -168,9 +168,8 @@ user's own LLM and run on the user's own machine.
 A script edit replays the longest unchanged prefix from the journal and runs
 live from the first changed or inserted `agent()`/`checkpoint()` call. The
 original invocation `args` and execution limits are frozen and reused on manual
-or automatic resume. Save the edited script as a workflow file, then pass
-`resumeFromRunId` with its `name` to the `workflow` tool; unchanged
-calls report zero tokens,
+or automatic resume. Resume is a user action (`/workflows resume <runId>` or
+the navigator); unchanged calls report zero tokens,
 and edited calls rotate their managed spawn key generation so pi-subagents
 never raises a fingerprint conflict. A failed run accepted through
 `resumeFromRunId` first appends/applies a legal interrupted recovery after owned
@@ -180,9 +179,8 @@ checkpoints journal attempt identity without inventing a managed child, and a
 timed-out call journals its terminal failure after quiescence before returning
 recoverable `null`.
 
-There are two resume paths with different trust. A model-callable resume (the
-`workflow` tool) must pass a saved `name`, which is freshly resolved from disk;
-it does not execute the script source stored in the journal. A user-typed
+There is no model-callable resume: the `workflow` tool refuses
+`resumeFromRunId` like every other call. A user-typed
 `/workflows resume <runId>` or navigator resume is a deliberate trusted action:
 it executes the script stored in the run's journal as-is, including inline
 source recorded before inline scripts were disabled. The existing provider-limit
@@ -208,21 +206,15 @@ workflow, and the review skill before accepting a topology or recovery change.
 
 ## Tools and commands
 
-- `workflow`: run a saved workflow file (`name`) from the Pi agent directory
-  (`workflows/saved/` or the project's `workflows/projects/<id>/saved/`),
-  with `args`, `background` (default true), `maxAgents` (default 1000),
-  `concurrency` (defaults to the host's pool size), `agentRetries` (default 0),
-  `tokenBudget` (default unlimited), `agentTimeoutMs` (default 1800000, `null`
-  disables), and `resumeFromRunId`. The execution limits are tuned defaults: a
-  caller that names one narrower than the script needs stops the run rather
-  than shaping it.
-
-  The tool refuses any call that carries `script` (alone or with `name` or
-  `resumeFromRunId`) with "inline workflow scripts are disabled in this build:
-  node:vm is not a sandbox", before anything is executed. Workflow code runs in
-  `node:vm`, which is not a security boundary, so the tool runs only files the
-  user saved. Built-in workflows run through their slash commands, and a resume
-  must name a saved file rather than replay the stored script.
+- `workflow`: disabled in this build. Every call is refused before any file is
+  read or anything executes, whether it carries an inline `script`, a saved
+  workflow `name`, `resumeFromRunId`, or any combination, with one message that
+  names smarty-dev#11769, where an approval-bound or sandboxed path is tracked.
+  Workflow code runs in `node:vm`, which is not a security boundary, inside a
+  helper that inherits the parent environment; and a saved file in the agent
+  directory is not trusted input, because the model can write it. Saved and
+  built-in workflows run only through user-typed slash commands (`/<name>`,
+  `/workflows`).
 
   Concurrency is not configured here at all. A workflow agent occupies one of
   pi-subagents' `maxConcurrent` background slots like any other background
@@ -242,7 +234,7 @@ workflow, and the review skill before accepting a topology or recovery change.
 
   `agentTimeoutMs` counts from the moment the host reports the agent left its
   queue, so waiting for a slot is never charged against the work.
-- `workflow_control`: `list`, `get`, `pause`, `stop`, or `rm` a run; `rm` writes a durable removal tombstone. Its `resume` action is refused because it would replay the stored script; resume through the `workflow` tool with a saved `name`, or, as a trusted user action that replays the stored script, `/workflows resume` (see [Resume](#resume)).
+- `workflow_control`: `list`, `get`, `pause`, `stop`, or `rm` a run; `rm` writes a durable removal tombstone. Its `resume` action is refused because it would replay the stored script. Resume only as a trusted user action with `/workflows resume` (see [Resume](#resume)).
 - `pi.events` emits `pi-workflows:runtime` snapshots (`{ runId, event }`) for phase, task, quality, retry, and nested-workflow progress; observer failures are contained.
 - `/workflows`: TUI navigator plus `run`, `status`, `watch`, `stop`, `pause`,
   `resume`, `rm`, `save <name> [runId]`, and `strength` subcommands.
@@ -276,7 +268,7 @@ Results first enter context as a `pi-workflows:delivery` custom message with
 `triggerTurn: false`. The active branch must actually contain that message before
 pending markers are acknowledged. Delivery details record individual run IDs,
 so a partial acknowledgement failure cannot resend an already persisted member
-of a batch. Every accepted background resume (tool, navigator, or provider timer)
+of a batch. Every accepted background resume (user command, navigator, or provider timer)
 rearms its generation-owned observer; suspension is not final delivery.
 Pi's void `sendMessage` return is not an
 acceptance promise. A short `sendUserMessage` notification then uses the normal
@@ -309,7 +301,8 @@ retiring session.
 
 Typing the bounded word `workflow` or `workflows` in an ordinary message counts
 as an explicit opt-in to multi-agent orchestration. A request-local hidden
-`context` overlay tells the model the `workflow` tool is authorized for this turn;
+`context` overlay tells the model that the user opted into workflow use, points to
+user-typed slash commands, and names the disabled `workflow` tool gate;
 `before_agent_start` admits idle guidance but persists nothing. Keyword and standing
 `/effort high|ultra` guidance never append reminders or effort text to native user
 messages. Original text/images remain exact, even repeated literal copies of either
@@ -317,13 +310,14 @@ directive; only extension-owned custom guidance is filtered/rebuilt. Legacy owne
 hidden arming entries are excluded from public branch-summary/compaction preparation,
 without rewriting historical user text or stored entries.
 
-Arming **authorizes; it does not compel**. The hidden guidance says the model may run
-a workflow and may still decline, so "how do workflows work?" stays an ordinary
+Arming **opts into slash-command workflow use; it does not compel**. The hidden
+guidance points the model to user-typed slash commands and says the model-facing
+`workflow` tool is disabled, so "how do workflows work?" stays an ordinary
 question with an ordinary answer. Nothing is swallowed and no UI opens.
 This is **model guidance, not an execution permission gate**: the extension does
-not enforce the keyword inside `workflow.execute`. Direct tool calls remain
-subject to Pi's ordinary tool permissions; do not use the trigger as a security
-boundary.
+not use the trigger as a security boundary, and `workflow.execute` refuses every
+model tool call regardless of arming. The user-typed slash-command path remains
+the deliberate execution path.
 
 Only a standalone word arms. A workflow is also a thing people write code about,
 so none of `myworkflow`, `workflow_name`, `WorkflowEngine`, `--workflow-id`,

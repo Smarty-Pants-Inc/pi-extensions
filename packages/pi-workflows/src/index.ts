@@ -33,20 +33,28 @@ import {
 } from "./workflow-settings.js";
 
 /**
- * Refusal for any tool call that carries `script`. The runtime executes workflow
- * code with `node:vm`, which is not a security boundary, so code supplied in a
- * tool call is never executed. Only saved workflow files under the user's Pi
- * agent directory run through the model-callable tool; built-ins remain user commands.
+ * Refusal for every call to the model-callable `workflow` tool. The runtime
+ * executes workflow code with `node:vm`, which is not a security boundary, and a
+ * helper process that inherits the host environment. Neither inline `script`
+ * nor a saved workflow file runs from a tool call: a file in the agent directory
+ * is not trusted, because the model can write it. Saved and built-in workflows
+ * run only through user-typed slash commands. An approval-bound or sandboxed
+ * model path is tracked in smarty-dev#11769.
  */
-export const INLINE_WORKFLOW_DISABLED_MESSAGE =
-  "inline workflow scripts are disabled in this build: node:vm is not a sandbox";
+export const WORKFLOW_TOOL_DISABLED_MESSAGE =
+  "the workflow tool is disabled in this build: node:vm is not a sandbox, so neither inline scripts nor saved workflow files run from a tool call (approval-bound or sandboxed path tracked in smarty-dev#11769)";
+
+/** Retained for compatibility; the same gate and message as {@link WORKFLOW_TOOL_DISABLED_MESSAGE}. */
+export const INLINE_WORKFLOW_DISABLED_MESSAGE = WORKFLOW_TOOL_DISABLED_MESSAGE;
 
 const WorkflowToolSchema = Type.Object(
   {
     script: Type.Optional(
-      Type.String({ maxLength: 200_000, description: "Disabled: inline scripts are always refused. Use `name`." }),
+      Type.String({ maxLength: 200_000, description: "Disabled: always refused (smarty-dev#11769)." }),
     ),
-    name: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+    name: Type.Optional(
+      Type.String({ minLength: 1, maxLength: 128, description: "Disabled: always refused (smarty-dev#11769)." }),
+    ),
     args: Type.Optional(Type.Any()),
     background: Type.Optional(Type.Boolean()),
     maxAgents: Type.Optional(
@@ -83,7 +91,9 @@ const WorkflowToolSchema = Type.Object(
           "Wall clock per agent, there to bound a hang. Default 1800000 (30min), and it counts from when the agent actually starts, not from dispatch. An agent's real budget is the host's turn, tool and token ceiling. Omit it: a short value fails an entire fan-out as timeouts.",
       }),
     ),
-    resumeFromRunId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+    resumeFromRunId: Type.Optional(
+      Type.String({ minLength: 1, maxLength: 128, description: "Disabled: always refused (smarty-dev#11769)." }),
+    ),
   },
   { additionalProperties: false },
 );
@@ -97,7 +107,7 @@ const ControlSchema = Type.Object(
         Type.Literal("status", { description: "Alias for get — inspect one run" }),
         Type.Literal("pause", { description: "Pause a running workflow" }),
         Type.Literal("resume", {
-          description: "Disabled: resume through the workflow tool with a saved `name` and resumeFromRunId",
+          description: "Disabled: workflow execution from a tool call is refused (smarty-dev#11769)",
         }),
         Type.Literal("stop", { description: "Stop a running workflow" }),
         Type.Literal("rm", { description: "Remove a workflow run and its journal" }),
@@ -166,24 +176,6 @@ export function resolveControlTarget(
   if (explicitRunId) return explicitRunId;
   if (subcommand === "stop" || subcommand === "rm") return "";
   return firstListedRunId ?? "";
-}
-
-function formatStart(result: ScriptStartResult): string {
-  const lines = [
-    `Workflow ${result.background ? "started in background" : result.status}: ${result.runId}`,
-    `status=${result.status}`,
-  ];
-  if (result.waitAborted) {
-    lines.push(
-      "wait_aborted=true",
-      result.background
-        ? "Only the wait was cancelled; retrieve the detached run with workflow_control."
-        : "Foreground execution was cancelled; inspect its status with workflow_control before resuming.",
-    );
-  }
-  if (result.result) lines.push("", result.result.slice(0, 8_000));
-  if (result.error) lines.push("", `error=${result.error.slice(0, 2_000)}`);
-  return lines.join("\n");
 }
 
 /** Build the bounded planner → graph → synthesis script used by `/workflows run`. */
@@ -513,24 +505,6 @@ export default function piWorkflows(pi: ExtensionAPI): void {
   const resolveNestedWorkflow = (name: string): string | undefined =>
     loadSavedWorkflow(name, sessionCwd) ?? BUILTIN_WORKFLOWS[name]?.script;
 
-  /**
-   * Trust boundary for the model-callable `workflow` tool: only a saved file
-   * under the user's Pi agent directory (`workflows/saved/` or the project's
-   * `workflows/projects/<id>/saved/`) resolves. Built-ins stay reachable through
-   * their user-typed slash commands; journal-stored scripts are never replayed
-   * without a fresh saved-file resolution.
-   */
-  const resolveTrustedSavedScript = (name: string | undefined): { script: string; source: string } => {
-    if (name === undefined) {
-      throw new Error("Provide the `name` of a saved workflow file; the workflow tool runs nothing else.");
-    }
-    const saved = loadSavedWorkflow(name, sessionCwd);
-    if (saved) return { script: saved, source: `saved:${name}` };
-    throw new Error(
-      `Unknown workflow name "${name}": the workflow tool runs only saved workflow files from the Pi agent directory. Built-in workflows run through their slash commands.`,
-    );
-  };
-
   const registerSurface = (): void => {
     if (active) return;
     active = true;
@@ -567,16 +541,11 @@ export default function piWorkflows(pi: ExtensionAPI): void {
         name: "workflow",
         label: "Workflow",
         description:
-          "Run a saved workflow file (from the Pi agent directory) by `name` through the pi-subagents managed spawning protocol. Inline `script` input is refused: node:vm is not a sandbox. A workflow script declares `export const meta = { name, description, phases }` first and uses the runtime globals agent(), parallel(), pipeline(), orchestrate(), workflow(), verify(), judgePanel(), loopUntilDry(), completenessCheck(), retry(), gate(), checkpoint(), phase(), log(), args, cwd, process, and budget. Determinism is enforced: Date.now()/Math.random()/new Date() are unavailable.",
-        promptSnippet: "Run a saved workflow file by name",
+          "Disabled in this build: every call is refused, whether it carries an inline `script`, a saved workflow `name`, or `resumeFromRunId`. node:vm is not a sandbox and a file in the agent directory is not trusted input; an approval-bound or sandboxed path is tracked in smarty-dev#11769. Workflows run only when the user types their slash command.",
+        promptSnippet: "Disabled: workflow execution from a tool call is refused (smarty-dev#11769)",
         promptGuidelines: [
-          "Provide the `name` of a saved workflow file. Never pass `script`: inline workflow scripts are always refused. Built-in workflows run only through their slash commands.",
-          "Use orchestrate([{ id, dependsOn, run }]) for named dependency graphs; use parallel(() => agent(...), ...) for a simple fan-out and pipeline(items, ...stages) for sequential per-item stages.",
-          "Size the fan-out to the work: one agent per independent piece of evidence the task actually has. Ten to thirty agents is an ordinary review or audit, and a script that splits a broad task four ways is usually four agents each doing one agent's job. The gain is coverage, not speed — how many run at once is the host's pool, not the script's choice.",
-          "Pass name/args/background and nothing else unless the user named a specific limit. maxAgents, concurrency, agentRetries, tokenBudget and agentTimeoutMs already default to tuned values, and each one stops or fails the run when it is set too low.",
-          "Use background: true for long runs; retrieve results with workflow_control.",
-          "Use resumeFromRunId together with the saved workflow `name` to replay the unchanged prefix from cache and re-run the rest live.",
-          "Inside the script, never name a model, a thinking level, or a turn limit: `strength` is the only routing a call may express.",
+          "Do not call the workflow tool: every call is refused (smarty-dev#11769). If the user wants a workflow run, tell them to type its slash command themselves.",
+          "Use workflow_control only to list, inspect, pause, stop, or remove runs the user started.",
         ],
         parameters: WorkflowToolSchema,
         renderCall(args, theme) {
@@ -598,64 +567,12 @@ export default function piWorkflows(pi: ExtensionAPI): void {
             0,
           );
         },
-        async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-          // ponytail: remove inline execution at the tool boundary, not a pretend VM sandbox.
-          // Refuse every call that carries `script` (alone, with `name`, or with
-          // `resumeFromRunId`) before any resolution, vm.Script, or helper spawn.
-          if (params.script !== undefined) {
-            return textResult(INLINE_WORKFLOW_DISABLED_MESSAGE, { status: "failed", error: "inline-script-disabled" });
-          }
-          try {
-            const workflowEngine = currentEngine();
-            // Start and resume both require a fresh saved-file resolution; a
-            // resume without `name` would replay a journal-stored script.
-            const { script, source } = resolveTrustedSavedScript(params.name);
-            const options: ScriptStartOptions = {
-              args: params.args,
-              background: params.background ?? true,
-              maxAgents: params.maxAgents,
-              concurrency: params.concurrency,
-              agentRetries: params.agentRetries,
-              tokenBudget: params.tokenBudget,
-              agentTimeoutMs: params.agentTimeoutMs,
-              excludeTools: [...DEFAULT_EXCLUDED_TOOLS],
-              signal,
-              mainModel: ctx?.model?.id,
-              // Foreground checkpoint confirmation only when the run is not
-              // background — background runs are headless by contract.
-              confirm:
-                params.background === false && ctx?.hasUI
-                  ? async (promptText, checkpointOptions, signal) => {
-                      if (checkpointOptions.kind === "input")
-                        return ctx.ui.input(promptText, String(checkpointOptions.default ?? ""), { signal });
-                      if (checkpointOptions.kind === "select")
-                        return ctx.ui.select(promptText, checkpointOptions.choices ?? [], { signal });
-                      return ctx.ui.confirm(promptText, promptText, { signal });
-                    }
-                  : undefined,
-              loadSavedWorkflow: resolveNestedWorkflow,
-              strengths: workflowSettings.strengths,
-            };
-            if (params.resumeFromRunId) {
-              const resumed = await workflowEngine.resume(
-                params.resumeFromRunId,
-                ctx.sessionManager.getBranch(),
-                options,
-                script,
-              );
-              if (!resumed) return textResult(`Workflow run not found: ${params.resumeFromRunId}`);
-              return textResult(formatStart(resumed), resumed);
-            }
-            const result = await workflowEngine.start(script, options);
-            if (result.background) {
-              // The engine resolves the script's meta name for the delivery header.
-              void source;
-              void deliverBackgroundResult(workflowEngine, result.runId);
-            }
-            return textResult(formatStart(result), result);
-          } catch (error: unknown) {
-            return textResult(error instanceof Error ? error.message : String(error));
-          }
+        async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
+          // Refuse every call (inline `script`, saved `name`, `resumeFromRunId`,
+          // or any combination) before any saved-file read, engine call,
+          // vm.Script, or helper spawn. A saved file is not trusted: the model can
+          // write into the agent directory. See smarty-dev#11769.
+          return textResult(WORKFLOW_TOOL_DISABLED_MESSAGE, { status: "failed", error: "workflow-tool-disabled" });
         },
       }),
     );
@@ -693,11 +610,12 @@ export default function piWorkflows(pi: ExtensionAPI): void {
               throw new Error(`unknown workflow_control action: ${params.action}`);
             }
             if (action === "resume") {
-              // control("resume") replays the journal-stored script, which may be
-              // model-supplied inline code from an earlier build.
-              throw new Error(
-                "workflow_control resume is disabled: resume through the workflow tool with `name` of a saved workflow file and `resumeFromRunId`.",
-              );
+              // Refuse with the same gate as workflow.execute. Resume would replay
+              // journal-stored script, which may be model-supplied inline code.
+              return textResult(WORKFLOW_TOOL_DISABLED_MESSAGE, {
+                status: "failed",
+                error: "workflow-tool-disabled",
+              });
             }
             const runId = normalizeControlRunId(params as unknown as Record<string, unknown>);
             const workflowEngine = currentEngine();
@@ -1020,9 +938,9 @@ export default function piWorkflows(pi: ExtensionAPI): void {
     // /workflows-trigger: keyword arming (A5). Typing the bounded word
     // `workflow`/`workflows` — or a configured synonym — in an ordinary message
     // counts as an explicit opt-in to multi-agent orchestration, and the message
-    // receives hidden model guidance. Arming AUTHORIZES the tool; it never forces a run,
-    // and it never opens UI. A user asking a question about workflows still gets
-    // an ordinary answer.
+    // receives hidden model guidance. The model-facing workflow tool remains disabled
+    // (smarty-dev#11769); guidance never authorizes it, forces a run, or opens UI.
+    // A user asking a question about workflows still gets an ordinary answer.
     const TRIGGER_WORD_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,31}$/u;
     const persistTriggerSettings = (): void => {
       try {
@@ -1032,7 +950,8 @@ export default function piWorkflows(pi: ExtensionAPI): void {
       }
     };
     pi.registerCommand("workflows-trigger", {
-      description: "Arm the workflow tool on a keyword: set <keyword> | off | on | reset | status",
+      description:
+        "Configure keyword guidance; the model-facing workflow tool is disabled (smarty-dev#11769): set <keyword> | off | on | reset | status",
       handler: async (args: string, ctx: ExtensionCommandContext) => {
         const token = args.trim().split(/\s+/)[0] ?? "";
         if (token === "off") {

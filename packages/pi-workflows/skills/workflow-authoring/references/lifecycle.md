@@ -26,7 +26,7 @@ Always retain `{ id, status, result }` or an equivalent ledger for each intended
 
 ## Resume
 
-In this build, resume through the `workflow` tool with the saved `name` and `resumeFromRunId`; `workflow_control` `resume` is refused.
+In this build, resume is a user action (`/workflows resume <runId>`); the `workflow` tool refuses every call, including `resumeFromRunId`, and `workflow_control` `resume` is refused (smarty-dev#11769).
 
 Resume replays only the longest unchanged prefix of journaled calls. Once one call is new, changed, or unusable, that call and all later calls execute live. Stable lexical call ordering, prompts, labels, routing options, and inputs therefore matter. Retry chains can cascade after an upstream miss. A nested workflow is cached as one parent call; an unchanged child replays its complete result, while a changed or interrupted child runs live in a generation-scoped namespace.
 

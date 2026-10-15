@@ -28,23 +28,12 @@ custom dependency graph. Use the ordinary agent tool for small work and load
 
 ## Invocation contract
 
-In this build the `workflow` tool runs only a saved workflow file from the Pi
-agent directory, by `name`; inline `script` is always refused because node:vm
-is not a sandbox. Built-ins are not reachable through the tool: ask the user to
-run the built-in's slash command (for example `/deep-research`), or to place a
-reviewed copy in their saved workflows directory and then call it by name:
-
-```json
-{
-  "name": "deep-research",
-  "args": { "question": "What are the trade-offs between X and Y?" },
-  "background": true
-}
-```
-
-Never send `script`. `background` defaults to `true`; use
-`background: false` only when the caller needs the result inline or a human
-checkpoint must be shown.
+In this build the `workflow` tool refuses every call, whether it carries an
+inline `script`, a saved workflow `name`, or `resumeFromRunId`: node:vm is not
+a sandbox, and a file in the agent directory is not trusted input. An
+approval-bound or sandboxed path is tracked in smarty-dev#11769. Do not call
+the tool. Ask the user to run the built-in's slash command themselves (for
+example `/deep-research`), or a saved workflow's `/<name>` command.
 
 ## Input rules
 
@@ -66,8 +55,7 @@ and a final report. Failed worker calls can remain `null` or be omitted from tha
 aggregate, but stay visible in run details. A background call returns a run ID
 immediately; inspect it with `workflow_control` (`get`, `pause`, or `stop`)
 rather than starting a duplicate run. `workflow_control` `resume` is refused in
-this build; resume with a `workflow` call carrying the saved `name` and
-`resumeFromRunId`, or let the user run `/workflows resume`. If a provider limit
+this build; let the user run `/workflows resume`. If a provider limit
 pauses the run, resume the same run after the configured retry window. A changed script or saved workflow
 replays only its unchanged journal prefix, so preserve the original inputs when
 resuming.

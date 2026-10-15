@@ -13,6 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WORKFLOW_ARMED_DIRECTIVE } from "../src/arming.js";
 import { WorkflowEngine } from "../src/engine.js";
 import piWorkflows from "../src/index.js";
+import { runOnActiveEngine } from "./direct-engine-seam.js";
 
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
@@ -156,10 +157,9 @@ type WorkflowTool = {
   }>;
 };
 
-// The workflow tool refuses inline `script` input (node:vm is not a sandbox)
-// and runs only saved workflow files from the Pi agent directory. These cases
-// exercise the runtime, so each script is first written as such a trusted file
-// under a per-test agent directory and invoked by `name`.
+// Model tool calls are refused (smarty-dev#11769). These runtime/lifecycle
+// fixtures use saved files under a private agent directory and the test-only
+// direct-engine seam; actual model-tool refusal is covered in inline-script-gate.
 let testAgentDir: string | undefined;
 let previousAgentDir: string | undefined;
 let savedCounter = 0;
@@ -186,8 +186,13 @@ function asTrustedFile(params: unknown): unknown {
 }
 
 function workflowTool(fixture: ReturnType<typeof createPi>): WorkflowTool {
-  const tool = fixture.toolDefinitions.find((tool) => (tool as { name: string }).name === "workflow") as WorkflowTool;
-  return { execute: (id, params, ...rest) => tool.execute(id, asTrustedFile(params), ...rest) };
+  // The model `workflow` tool refuses all runs (smarty-dev#11769); fixtures run
+  // on the session's active engine via the test-only direct-engine seam.
+  const control = fixture.toolDefinitions.find((tool) => (tool as { name: string }).name === "workflow_control");
+  return {
+    execute: (_id, params, signal, _onUpdate, ctx) =>
+      runOnActiveEngine(control as never, asTrustedFile(params) as never, signal as never, ctx as never),
+  } as WorkflowTool;
 }
 
 describe("pi-workflows loader context isolation", () => {
@@ -626,9 +631,7 @@ return { local: [cwd, process.cwd()], nested: await workflow(${JSON.stringify(ch
     const activationPings = fixture.routing.pings;
     expect(activationPings).toBeGreaterThan(0);
 
-    const workflow = fixture.toolDefinitions.find((tool) => (tool as { name: string }).name === "workflow") as {
-      execute: (id: string, params: unknown, signal?: unknown, onUpdate?: unknown, ctx?: unknown) => Promise<unknown>;
-    };
+    const workflow = workflowTool(fixture);
     const script = "export const meta = { name: 'probe', description: 'no agents' }\nreturn 1";
     await workflow.execute("call-1", asTrustedFile({ script, background: false }), undefined, undefined, fixture.ctx);
     expect(fixture.routing.pings).toBe(activationPings + 1);

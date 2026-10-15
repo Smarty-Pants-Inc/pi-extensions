@@ -1424,7 +1424,7 @@ export async function runWorkflow<T = unknown>(
 
   const agentLimitError = () =>
     new WorkflowError(
-      `Agent limit exceeded (${shared.physicalAgentCount}/${maxAgents} real dispatches). Re-call workflow with resumeFromRunId="${runId}", the same script, and maxAgents: N (N>${maxAgents}) — journaled prefix replays free. /workflows resume alone cannot raise the cap.`,
+      `Agent limit exceeded (${shared.physicalAgentCount}/${maxAgents} real dispatches). Run ${runId} stopped at its configured agent cap. The user can resume it with /workflows resume (journaled prefix replays free), but resume keeps the same cap.`,
       WorkflowErrorCode.AGENT_LIMIT_EXCEEDED,
       { recoverable: false },
     );

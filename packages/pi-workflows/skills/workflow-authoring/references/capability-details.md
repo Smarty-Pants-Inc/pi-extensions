@@ -232,8 +232,8 @@ Every exact fact below is projected from the installed extension's capability co
 - Classification: `workflow-tool-input`
 - Support: `supported`
 - Signature: `name?: string`
-- Constraint: required for start and resume; resolves only a saved workflow file under the user's Pi agent directory
-- Constraint: inline script is always refused; built-ins remain user slash commands
+- Constraint: disabled in this build: every workflow tool call is refused before any saved file is read (smarty-dev#11769)
+- Constraint: saved and built-in workflows run only through user-typed slash commands
 
 <a id="workflow-tool-input-args"></a>
 ## args
@@ -301,7 +301,7 @@ Every exact fact below is projected from the installed extension's capability co
 - Classification: `workflow-tool-input`
 - Support: `supported`
 - Signature: `resumeFromRunId?: string`
-- Constraint: requires name to resolve a trusted saved-file replacement; journal-only and workflow_control resume are refused
+- Constraint: disabled in this build: refused by the workflow tool like every other call; workflow_control resume is refused too; resume is the user's /workflows resume
 - Constraint: original args and execution limits are reused on resume
 - Constraint: unchanged positional calls replay from cache until the first changed call
 - Constraint: always runs in the background

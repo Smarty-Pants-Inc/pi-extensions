@@ -260,8 +260,8 @@ export const WORKFLOW_CAPABILITIES: readonly CapabilityEntry[] = [
     signature: "name?: string",
     options: [],
     constraints: [
-      "required for start and resume; resolves only a saved workflow file under the user's Pi agent directory",
-      "inline script is always refused; built-ins remain user slash commands",
+      "disabled in this build: every workflow tool call is refused before any saved file is read (smarty-dev#11769)",
+      "saved and built-in workflows run only through user-typed slash commands",
     ],
   },
   { name: "args", classification: "workflow-tool-input", signature: "args?: unknown", options: [], constraints: [] },
@@ -325,7 +325,7 @@ export const WORKFLOW_CAPABILITIES: readonly CapabilityEntry[] = [
     signature: "resumeFromRunId?: string",
     options: [],
     constraints: [
-      "requires name to resolve a trusted saved-file replacement; journal-only and workflow_control resume are refused",
+      "disabled in this build: refused by the workflow tool like every other call; workflow_control resume is refused too; resume is the user's /workflows resume",
       "original args and execution limits are reused on resume",
       "unchanged positional calls replay from cache until the first changed call",
       "always runs in the background",

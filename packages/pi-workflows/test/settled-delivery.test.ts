@@ -4,10 +4,27 @@ import { join } from "node:path";
 import { PROTOCOL_CAPABILITIES, PROTOCOL_VERSION, routingPolicyFingerprint } from "@signalridge/pi-subagents-protocol";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import piWorkflows from "../src/index.js";
+import { runOnActiveEngine } from "./direct-engine-seam.js";
 
-// The model-callable workflow tool refuses inline `script` input and runs only
-// saved workflow files from the Pi agent directory. Each script below is a named
-// trusted-file fixture written under a private per-test agent directory.
+// The model `workflow` tool refuses all runs (smarty-dev#11769); fixtures start
+// on the session's active engine through the test-only direct-engine seam.
+const directRun = (
+  tools: Map<string, unknown>,
+  _id: string,
+  params: unknown,
+  signal: unknown,
+  _u: unknown,
+  ctx: unknown,
+) =>
+  runOnActiveEngine(
+    tools.get("workflow_control") as never,
+    params as never,
+    signal as AbortSignal | undefined,
+    ctx as never,
+  );
+
+// Saved fixture files live under a private per-test agent directory. They are
+// runtime inputs, not a claim of model-callable file trust.
 let testAgentDir: string | undefined;
 let previousAgentDir: string | undefined;
 beforeEach(() => {
@@ -200,7 +217,8 @@ function fixture(
     },
     run: async () => {
       const count = pending().length;
-      const result = await tools.get("workflow")?.execute(
+      const result = await directRun(
+        tools,
         "delivery",
         {
           name: trustedWorkflow(
@@ -217,7 +235,8 @@ function fixture(
       return result?.details.runId;
     },
     admit: () =>
-      tools.get("workflow")?.execute(
+      directRun(
+        tools,
         "retired",
         {
           name: trustedWorkflow("retired", 'export const meta = { name: "retired", description: "test" }; return 1;'),
@@ -233,7 +252,7 @@ function fixture(
 const tick = () => new Promise((resolve) => setTimeout(resolve, 10));
 
 describe("settled workflow result delivery", () => {
-  it("keeps workflow/control and per-call bash/write denials at the actual tool/RPC boundary", async () => {
+  it("passes explicit engine exclusions through the managed RPC boundary", async () => {
     const f = fixture();
     await f.start();
     let denied: unknown;
@@ -248,7 +267,8 @@ describe("settled workflow result delivery", () => {
         },
       });
     });
-    await f.tools.get("workflow")?.execute(
+    await directRun(
+      f.tools,
       "denials",
       {
         name: trustedWorkflow(
@@ -289,7 +309,7 @@ describe("settled workflow result delivery", () => {
     await f.shutdown();
   });
 
-  it.each(["tool", "navigator", "provider"] as const)(
+  it.each(["user-command", "navigator", "provider"] as const)(
     "rearms final delivery after %s-owned resume, not at suspension",
     async (path) => {
       const f = fixture();
@@ -315,7 +335,8 @@ describe("settled workflow result delivery", () => {
           data: { id: `resume-${attempts}`, ...(terminal ? { terminal } : { state: "running" }) },
         });
       });
-      const start = await f.tools.get("workflow")?.execute(
+      const start = await directRun(
+        f.tools,
         "resume-delivery",
         {
           name: trustedWorkflow(
@@ -328,7 +349,7 @@ describe("settled workflow result delivery", () => {
         undefined,
         f.ctx,
       );
-      if (!start) throw new Error("workflow tool missing");
+      if (!start.details.runId) throw new Error("workflow fixture did not start");
       await vi.waitFor(() => expect(attempts).toBe(1));
       if (path !== "provider") {
         await f.tools
@@ -336,19 +357,16 @@ describe("settled workflow result delivery", () => {
           ?.execute("pause-delivery", { action: "pause", runId: start.details.runId }, undefined, undefined, f.ctx);
         expect(f.pi.sendMessage).not.toHaveBeenCalled();
         finish = true;
-        // The model-callable resume path is the workflow tool with the saved
-        // `name` and `resumeFromRunId`; workflow_control resume is refused.
-        if (path === "tool")
-          await f.tools
-            .get("workflow")
-            ?.execute(
-              "resume-delivery",
-              { name: "resumed", resumeFromRunId: start.details.runId, background: true },
-              undefined,
-              undefined,
-              f.ctx,
-            );
-        else {
+        // Model-callable resume is refused (smarty-dev#11769: workflow tool and
+        // workflow_control resume). Drive the real user
+        // `/workflows resume <runId>` command and assert the same delivery.
+        if (path === "user-command") {
+          const workflows = f.pi.registerCommand.mock.calls.find(([name]) => name === "workflows")?.[1] as
+            | { handler: (args: string, ctx: unknown) => Promise<void> }
+            | undefined;
+          if (!workflows) throw new Error("/workflows command missing");
+          await workflows.handler(`resume ${start.details.runId}`, f.ctx);
+        } else {
           f.ctx.mode = "tui";
           f.ctx.hasUI = true;
           let screen = 0;

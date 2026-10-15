@@ -13,13 +13,14 @@ import type {
  *
  * Typing the bounded word `workflow` (or `workflows`, or a configured synonym)
  * in an ordinary message is an explicit opt-in to multi-agent orchestration, so
- * hidden model context tells the model the tool is available for this
- * turn. Two properties matter, and both are easy to get wrong:
+ * hidden model context points the model to the user-typed slash-command path;
+ * the model-facing tool remains disabled. Two properties matter, and both are
+ * easy to get wrong:
  *
- *  1. **Arming authorizes; it does not compel.** The directive says the model
- *     MAY run a workflow and may still decline, so "how do workflows work?"
- *     stays an ordinary question with an ordinary answer. A trigger that forced
- *     a run would make the word unusable in conversation.
+ *  1. **Arming opts into slash-command workflow use; it does not compel.** The
+ *     directive points the model to user-typed slash commands while the
+ *     model-facing `workflow` tool remains disabled. So "how do workflows work?"
+ *     stays an ordinary question with an ordinary answer.
  *
  *  2. **Only a real word counts.** A workflow is something people also write
  *     code about, so `myworkflow`, `workflow_name`, `src/workflow-editor.ts`,
@@ -32,12 +33,12 @@ import type {
 export const DEFAULT_TRIGGER_WORD = "workflow";
 
 /**
- * Hidden guidance for an armed turn. Phrased as permission with an explicit escape
- * hatch: the model is told the user opted in, and told it may still answer
- * directly when a workflow would be overkill.
+ * Hidden guidance for an armed turn. It points to user-typed slash commands
+ * while explicitly refusing the disabled model-facing tool, and retains an
+ * escape hatch for direct answers when a workflow would be overkill.
  */
 export const WORKFLOW_ARMED_DIRECTIVE =
-  "<system-reminder>You typed the workflow trigger word, which counts as an explicit opt-in to multi-agent orchestration: the `workflow` tool is authorized for this turn. It runs in the background by default — the turn ends and the result is delivered back into the conversation when it finishes, which is expected rather than a stall, so you need not stay and block. Pass background:false only when the user is waiting for the result inline. This is permission, not an instruction: if the request is conversational, trivial, or better answered directly, answer it directly and do not run a workflow.</system-reminder>";
+  "<system-reminder>You typed the workflow trigger word, which counts as an explicit opt-in to multi-agent orchestration. The model-facing `workflow` tool is disabled in this build and refuses every call (approval-bound or sandboxed path tracked in smarty-dev#11769). When the user wants a workflow run, use a user-typed slash command such as `/workflows` or `/<saved-name>`; do not call the disabled tool. This is permission, not an instruction: if the request is conversational, trivial, or better answered directly, answer it directly and do not run a workflow.</system-reminder>";
 
 /** Standing effort is permission, but does not imply the user typed a keyword. */
 export const WORKFLOW_EFFORT_ARMED_DIRECTIVE = WORKFLOW_ARMED_DIRECTIVE.replace(

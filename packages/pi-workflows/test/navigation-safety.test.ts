@@ -4,10 +4,27 @@ import { join } from "node:path";
 import { PROTOCOL_CAPABILITIES, PROTOCOL_VERSION, routingPolicyFingerprint } from "@signalridge/pi-subagents-protocol";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import piWorkflows from "../src/index.js";
+import { runOnActiveEngine } from "./direct-engine-seam.js";
 
-// The model-callable workflow tool refuses inline `script` input and runs only
-// saved workflow files from the Pi agent directory. Each script below is a named
-// trusted-file fixture written under a private per-test agent directory.
+// The model `workflow` tool refuses all runs (smarty-dev#11769); fixtures start
+// on the session's active engine through the test-only direct-engine seam.
+const directRun = (
+  tools: Map<string, unknown>,
+  _id: string,
+  params: unknown,
+  signal: unknown,
+  _u: unknown,
+  ctx: unknown,
+) =>
+  runOnActiveEngine(
+    tools.get("workflow_control") as never,
+    params as never,
+    signal as AbortSignal | undefined,
+    ctx as never,
+  );
+
+// Saved fixture files live under a private per-test agent directory. They are
+// runtime inputs, not a claim of model-callable file trust.
 let testAgentDir: string | undefined;
 let previousAgentDir: string | undefined;
 beforeEach(() => {
@@ -169,7 +186,8 @@ function fixture(subagentsFirst: boolean, hangQuiesce = false) {
       await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, ctx);
     },
     run: async () => {
-      const result = await tools.get("workflow")?.execute(
+      const result = await directRun(
+        tools,
         "navigation-run",
         {
           name: trustedWorkflow(
@@ -285,7 +303,8 @@ describe("workflow navigation preflight", () => {
       expect(f.pi.sendMessage).not.toHaveBeenCalled();
       expect(f.pi.sendUserMessage).not.toHaveBeenCalled();
       expect(f.entries.some((entry) => entry.customType === "pi-workflows:pending-delivery")).toBe(false);
-      const retired = await f.tools.get("workflow")?.execute(
+      const retired = await directRun(
+        f.tools,
         "retired",
         {
           name: trustedWorkflow("retired", 'export const meta = { name: "retired", description: "test" }; return 1;'),
@@ -344,7 +363,8 @@ describe("workflow navigation preflight", () => {
       await new Promise((resolve) => setImmediate(resolve));
       expect(f.ctx.sessionManager.getBranch()).toEqual([]);
       expect(f.entries.some((entry) => (entry.data as { runId?: string }).runId === oldRunId)).toBe(true);
-      const fresh = await f.tools.get("workflow")?.execute(
+      const fresh = await directRun(
+        f.tools,
         "fresh",
         {
           name: trustedWorkflow("fresh", 'export const meta = { name: "fresh", description: "test" }; return 1;'),
