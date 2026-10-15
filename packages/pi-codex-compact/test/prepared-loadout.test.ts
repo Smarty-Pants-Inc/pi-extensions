@@ -36,7 +36,8 @@ const runtime: CodexCompactSettingsRuntime = {
   get: () => ({
     kind: "loaded",
     path: "unused",
-    settings: DEFAULT_CODEX_COMPACT_SETTINGS,
+    // This fixture tests prepared-tool consistency; consent denial has its own suite.
+    settings: { ...DEFAULT_CODEX_COMPACT_SETTINGS, allowCanonicalHistory: true },
     document: {},
   }),
   async reload() {
