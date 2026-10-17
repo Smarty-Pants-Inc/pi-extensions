@@ -1,6 +1,9 @@
 merge_queue:
   mode: serial
-  max_parallel_checks: 1
+  # Second speculative check; https://docs.mergify.com/merge-queue/performance/#parallel-checks; Paul 10-17 17:55Z via chief-of-staff (turn on Mergify features), smarty-dev#14537
+  max_parallel_checks: 2
+  # Skip intermediate batch results for anti-flake protection; https://docs.mergify.com/merge-queue/batches/#skip-intermediate-results-anti-flake-protection; Paul 10-17 17:55Z via chief-of-staff (turn on Mergify features), smarty-dev#14537
+  skip_intermediate_results: true
   reset_on_external_merge: always
 
 # smarty-dev's plain rule (smarty-dev#865), as on pi and herdr: the PR, its required checks and this queue
