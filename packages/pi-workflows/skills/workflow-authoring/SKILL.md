@@ -2,7 +2,7 @@
 name: workflow-authoring
 description: Design, write, review, and debug Pi JavaScript workflows that coordinate multiple subagents. Use when a request needs named dependencies, bounded fan-out, per-item pipelines, quality gates, saved or nested workflows, pause/resume, or workflow progress; do not use it merely to run an existing named workflow.
 metadata:
-  version: "1.7.5"
+  version: "1.8.0"
 ---
 
 # Workflow authoring
@@ -11,6 +11,15 @@ A workflow is a small program that coordinates subagents; it is not a long promp
 that asks one agent to do every step. Keep semantic work in agents and keep
 identity, ordering, bounds, failure handling, and aggregation deterministic in
 JavaScript.
+
+**Build restriction.** This fork's `workflow` tool refuses every call (inline
+`script`, saved `name`, or `resumeFromRunId`) and `workflow_control` `resume`:
+node:vm is not a sandbox, and a file in the agent directory is not trusted
+input (smarty-dev#11769). Write the script as a file, ask the user to review it
+and place it in their saved workflows directory
+(`<agentDir>/workflows/saved/<name>.js`, or via `/workflows save`), then ask
+the user to run its `/<name>` command; resume is the user's `/workflows resume`.
+The examples here are file contents, not tool payloads.
 
 ## Operating contract
 
@@ -89,7 +98,8 @@ JavaScript.
    `completenessCheck`) is not the effort that gate deserves.
 7. **Aggregate and report.** Return a bounded JSON result containing the answer,
    coverage, and important failures. If the workflow runs in the background,
-   the run ID is the handle for later control/resume.
+   the run ID is the handle for later control and for the user's
+   `/workflows resume`.
 8. **Review the script.** Use [the review checklist](references/review.md), then
    test with deterministic fake agents when changing topology or recovery.
 

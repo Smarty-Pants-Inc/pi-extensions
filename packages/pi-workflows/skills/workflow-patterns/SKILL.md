@@ -2,7 +2,7 @@
 name: workflow-patterns
 description: Choose and run one of Pi's built-in multi-agent workflows for research, adversarial review, code review, multi-perspective analysis, or codebase auditing. Use when the request matches a named pattern; use workflow-authoring instead for a new script or custom topology.
 metadata:
-  version: "1.7.5"
+  version: "1.8.0"
 ---
 
 # Built-in workflow patterns
@@ -28,21 +28,12 @@ custom dependency graph. Use the ordinary agent tool for small work and load
 
 ## Invocation contract
 
-The model-facing call is a `workflow` tool call, not JavaScript:
-
-```json
-{
-  "name": "deep-research",
-  "args": { "question": "What are the trade-offs between X and Y?" },
-  "background": true
-}
-```
-
-`name` resolves a saved workflow before the built-in. A saved workflow with the
-same name intentionally overrides the built-in. Do not send `script` together
-with `name`; choose one form. `background` defaults to `true`; use
-`background: false` only when the caller needs the result inline or a human
-checkpoint must be shown.
+In this build the `workflow` tool refuses every call, whether it carries an
+inline `script`, a saved workflow `name`, or `resumeFromRunId`: node:vm is not
+a sandbox, and a file in the agent directory is not trusted input. An
+approval-bound or sandboxed path is tracked in smarty-dev#11769. Do not call
+the tool. Ask the user to run the built-in's slash command themselves (for
+example `/deep-research`), or a saved workflow's `/<name>` command.
 
 ## Input rules
 
@@ -62,9 +53,10 @@ checkpoint must be shown.
 Every built-in returns a bounded aggregate of successful intermediate results
 and a final report. Failed worker calls can remain `null` or be omitted from that
 aggregate, but stay visible in run details. A background call returns a run ID
-immediately; inspect it with `workflow_control` (`get`, `pause`, `resume`, or
-`stop`) rather than starting a duplicate run. If a provider limit pauses the run, resume the same
-run after the configured retry window. A changed script or saved workflow
+immediately; inspect it with `workflow_control` (`get`, `pause`, or `stop`)
+rather than starting a duplicate run. `workflow_control` `resume` is refused in
+this build; let the user run `/workflows resume`. If a provider limit
+pauses the run, resume the same run after the configured retry window. A changed script or saved workflow
 replays only its unchanged journal prefix, so preserve the original inputs when
 resuming.
 

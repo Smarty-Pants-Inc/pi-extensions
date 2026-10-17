@@ -1,6 +1,51 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PROTOCOL_CAPABILITIES, PROTOCOL_VERSION, routingPolicyFingerprint } from "@signalridge/pi-subagents-protocol";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import piWorkflows from "../src/index.js";
+import { runOnActiveEngine } from "./direct-engine-seam.js";
+
+// The model `workflow` tool refuses all runs (smarty-dev#11769); fixtures start
+// on the session's active engine through the test-only direct-engine seam.
+const directRun = (
+  tools: Map<string, unknown>,
+  _id: string,
+  params: unknown,
+  signal: unknown,
+  _u: unknown,
+  ctx: unknown,
+) =>
+  runOnActiveEngine(
+    tools.get("workflow_control") as never,
+    params as never,
+    signal as AbortSignal | undefined,
+    ctx as never,
+  );
+
+// Saved fixture files live under a private per-test agent directory. They are
+// runtime inputs, not a claim of model-callable file trust.
+let testAgentDir: string | undefined;
+let previousAgentDir: string | undefined;
+beforeEach(() => {
+  previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  testAgentDir = mkdtempSync(join(tmpdir(), "workflows-navigation-agent-dir-"));
+  process.env.PI_CODING_AGENT_DIR = testAgentDir;
+});
+afterEach(() => {
+  if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+  else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+  if (testAgentDir) rmSync(testAgentDir, { recursive: true, force: true });
+  testAgentDir = undefined;
+});
+
+function trustedWorkflow(name: string, script: string): string {
+  if (!testAgentDir) throw new Error("test agent directory missing");
+  const dir = join(testAgentDir, "workflows", "saved");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, `${name}.js`), script);
+  return name;
+}
 
 class Bus {
   private handlers = new Map<string, Set<(value: unknown) => void>>();
@@ -88,6 +133,7 @@ function fixture(subagentsFirst: boolean, hangQuiesce = false) {
       leaf = id;
     },
     sendMessage: vi.fn(),
+    sendUserMessage: vi.fn(),
     registerTool: (tool: {
       name: string;
       execute: (...args: unknown[]) => Promise<{ details: { runId: string; status: string } }>;
@@ -115,11 +161,14 @@ function fixture(subagentsFirst: boolean, hangQuiesce = false) {
     cwd: process.cwd(),
     mode: "rpc",
     hasUI: true,
+    isIdle: () => true,
+    hasPendingMessages: () => false,
     ui: { notify: (message: string) => notices.push(message), setWidget: vi.fn() },
     sessionManager,
   };
   return {
     bus,
+    pi,
     handlers,
     tools,
     entries,
@@ -137,10 +186,14 @@ function fixture(subagentsFirst: boolean, hangQuiesce = false) {
       await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, ctx);
     },
     run: async () => {
-      const result = await tools.get("workflow")?.execute(
+      const result = await directRun(
+        tools,
         "navigation-run",
         {
-          script: 'export const meta = { name: "navigation", description: "test" }; return await agent("work");',
+          name: trustedWorkflow(
+            "navigation",
+            'export const meta = { name: "navigation", description: "test" }; return await agent("work");',
+          ),
           background: true,
         },
         undefined,
@@ -213,6 +266,59 @@ describe("workflow navigation preflight", () => {
     await f.shutdown();
   });
 
+  it.each([true, false])(
+    "bus-first shutdown fences a late run result and retains cleanup journal ownership (subagents first: %s)",
+    async (subagentsFirst) => {
+      const f = fixture(subagentsFirst);
+      await f.start();
+      const runId = await f.run();
+      let quiescence: Promise<unknown> | undefined;
+      let reentrant: Promise<unknown> | undefined;
+      f.bus.on("subagents:rpc:quiesce-owned", () => {
+        f.bus.emit("pi-workflows:shutdown-quiesce", {
+          respond: (promise: Promise<unknown>) => {
+            reentrant = promise;
+          },
+        });
+      });
+      f.bus.emit("pi-workflows:shutdown-quiesce", {
+        respond: (promise: Promise<unknown>) => {
+          quiescence = promise;
+        },
+      });
+      expect(quiescence).toBeDefined();
+      expect(reentrant).toBe(quiescence);
+      await quiescence;
+      await vi.waitFor(() =>
+        expect(
+          f.entries.some((entry) => {
+            const fact = entry.data as { kind?: string; status?: string; runId?: string };
+            return fact.kind === "run_recovery" && fact.status === "interrupted" && fact.runId === runId;
+          }),
+        ).toBe(true),
+      );
+      // The waiter resolves during the earlier peer shutdown, before the native
+      // workflows shutdown hook. No delivery may wake that retiring session.
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(f.pi.sendMessage).not.toHaveBeenCalled();
+      expect(f.pi.sendUserMessage).not.toHaveBeenCalled();
+      expect(f.entries.some((entry) => entry.customType === "pi-workflows:pending-delivery")).toBe(false);
+      const retired = await directRun(
+        f.tools,
+        "retired",
+        {
+          name: trustedWorkflow("retired", 'export const meta = { name: "retired", description: "test" }; return 1;'),
+          background: true,
+        },
+        undefined,
+        undefined,
+        f.ctx,
+      );
+      expect(retired?.details.runId).toBeUndefined();
+      await f.shutdown();
+    },
+  );
+
   it("times out failed shutdown quiescence and fences late callbacks", async () => {
     const f = fixture(false, true);
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -257,15 +363,17 @@ describe("workflow navigation preflight", () => {
       await new Promise((resolve) => setImmediate(resolve));
       expect(f.ctx.sessionManager.getBranch()).toEqual([]);
       expect(f.entries.some((entry) => (entry.data as { runId?: string }).runId === oldRunId)).toBe(true);
-      const fresh = await f.tools
-        .get("workflow")
-        ?.execute(
-          "fresh",
-          { script: 'export const meta = { name: "fresh", description: "test" }; return 1;', background: false },
-          undefined,
-          undefined,
-          f.ctx,
-        );
+      const fresh = await directRun(
+        f.tools,
+        "fresh",
+        {
+          name: trustedWorkflow("fresh", 'export const meta = { name: "fresh", description: "test" }; return 1;'),
+          background: false,
+        },
+        undefined,
+        undefined,
+        f.ctx,
+      );
       expect(fresh?.details.status).toBe("completed");
       expect(
         f.ctx.sessionManager.getBranch().some((entry) => (entry.data as { runId?: string }).runId === oldRunId),

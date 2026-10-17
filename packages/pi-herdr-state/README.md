@@ -14,6 +14,8 @@ headless sessions allocate no poll. Shared `herdr:blocked` notifications must be
 non-array objects with a boolean `active` and an optional string `label`.
 Malformed notifications cannot acquire or release a wait.
 
+Queued reports, heartbeat callbacks, and socket connect/write/retry continuations check the live TUI mode, including while an earlier session handler is awaited. Losing eligibility retires timers and aborts owned pending sockets without reporting to the new context. Quit release has a separate owner with the same live-mode check; report retirement alone does not cancel a valid quit release. Human permission and prompt ownership are unchanged.
+
 ## Install
 
 ```bash

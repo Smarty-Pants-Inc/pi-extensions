@@ -10,6 +10,7 @@ import {
 } from "../src/fresh-implementation.js";
 import { showReadyPlanMenu } from "../src/plan-action-menus.js";
 import planMode from "../src/plan-mode.js";
+import { nativeInput } from "./native-input.js";
 import { createCustomSelectorHarness, createMockContext, createMockPi } from "./support.js";
 
 const PLAN = `# Fresh implementation plan
@@ -412,7 +413,7 @@ test("fresh destination adopts setup state before the first kickoff context for 
     assert.deepEqual(mock.rawPi.getActiveTools(), ["read", "edit"]);
 
     const firstContext = (await mock.events.get("context")?.[0]?.(
-      { messages: [{ role: "user", content: handoff }] },
+      { messages: [await nativeInput(mock, context.ctx, handoff)] },
       context.ctx,
     )) as { messages: unknown[] };
     assert.match(JSON.stringify(firstContext.messages), /Fresh implementation plan/);

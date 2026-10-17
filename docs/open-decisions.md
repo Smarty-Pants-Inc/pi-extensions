@@ -1,10 +1,9 @@
 # Open decisions
 
-Two questions this repository cannot answer for itself are followed by one
-completed reference review and one decision that has since been settled. The
-questions are written up rather than acted on, because each is a policy or
-ownership choice rather than a defect: implementing any of them unilaterally
-would decide something the maintainer has not decided.
+This document records settled ownership decisions, individually scoped package
+proposals, and a completed reference review. Open proposals are written up
+rather than adopted as a batch: each adds a policy or maintenance surface and
+needs its own concrete use and acceptance evidence.
 
 Each open section states the current state, the options, and a recommendation.
 None is blocking; the code is coherent as it stands under every option below.
@@ -45,39 +44,18 @@ Revisit only if per-call isolation turns out never to be used.
 
 ---
 
-## 2. The dynamic-import rule
+## 2. The dynamic-import rule — **settled**
 
-**Current state.** `AGENTS.md` says "Avoid dynamic imports and `any`". The tree
-contains exactly ten dynamic imports, in five packages (`pi-btw` ×3,
-`pi-recall` ×3, `pi-goal` ×2, `pi-codex-compact` ×1, `pi-stamp` ×1). Every one
-of them is the same call:
+`AGENTS.md` permits exactly the narrow exception recommended by the reference
+review: defer a TUI-only dependency so headless paths do not load it. Menu code
+may therefore load `@narumitw/pi-tui-kit` after confirming it will draw a TUI.
+This is not permission for arbitrary dynamic source imports, private host
+patches, or importing another extension's implementation. The general rule to
+avoid dynamic imports and `any` remains in force.
 
-```ts
-const { defineMenu, runMenu } = await import("@narumitw/pi-tui-kit");
-```
-
-They are deliberate. The kit is a TUI library, and the import is deferred so
-that headless, print-mode, and RPC paths — which never draw a menu — do not pay
-to load it. That is a real benefit and the rule as written forbids it.
-
-So the rule and the code disagree, and the code is right. The question is only
-which one to change.
-
-**The options.**
-
-- **Narrow the rule.** Reword to something like: *"Avoid dynamic imports, except
-  to defer loading a TUI-only dependency out of headless paths."* One sentence,
-  no code changes, and the exception is narrow enough to stay meaningful.
-- **Convert the ten call sites** to static imports and delete the exception.
-  Simpler rule, but every extension then loads the TUI kit on every path,
-  including the ones that will never render.
-- **Leave both as they are.** Not recommended: a rule the codebase openly
-  violates in ten places stops being read as a rule at all, which costs more
-  than either fix.
-
-**Recommendation: narrow the rule.** The exception is specific, it has a stated
-reason, and it is already the design. Writing it down makes the remaining
-prohibition mean something again.
+The rule and implementation no longer disagree. Keep TUI capability checks
+before deferred loading and continue testing print/RPC paths without that
+rendering dependency.
 
 ---
 
@@ -90,9 +68,9 @@ prohibition mean something again.
 **Why this is a decision and not a task.** Each new package is a permanent
 maintenance surface: a version line, a changeset discipline, a peer-range entry
 in the shared-dependency check, a README that ships in a tarball, and a place in
-the release ordering. Twenty-seven packages is already a lot to keep honest;
-seven more is a ~26% increase in that overhead, taken on before any of them has
-a user.
+the release ordering. Thirty packages is already a lot to keep honest;
+seven more adds another independently maintained set before any of them has a
+concrete user.
 
 **One hard constraint, whatever is decided.** `/import` is a native Pi command.
 `pi-import-cc-codex` **must not register it** — registering over a host command
@@ -126,7 +104,10 @@ External coding-agent implementations suggest two complementary patterns:
 
 The package adopts the safe subset: named dependency graphs with deterministic
 layer barriers, status-aware results, bounded task retries/failure policies,
-whole-batch fatal barriers, and a replayable nested-workflow boundary. Worker
-isolation and provider-specific adaptive scheduling remain separate follow-up
-seams because adding them without changing ownership and lifecycle contracts
-would make recovery less honest, not more capable.
+whole-batch fatal barriers, and a replayable nested-workflow boundary. Script VM
+execution and user callbacks now run in an owned, terminable Node helper; native
+bindings, managed dispatch, budgets and journal authority remain in the parent.
+This fences asynchronous CPU stalls without claiming an OS security sandbox or
+isolating arbitrary external resources. Provider-specific adaptive scheduling
+remains a separate follow-up seam: changing admission without explicit ownership
+and lifecycle evidence would make recovery less honest, not more capable.

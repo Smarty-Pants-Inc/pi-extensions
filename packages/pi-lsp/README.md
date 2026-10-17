@@ -13,7 +13,16 @@ The extension is language-agnostic: servers are selected by config and file exte
 - Supports multiple servers for the same extension, for example `ty` and `ruff` for `.py`/`.pyi` diagnostics.
 - Uses one internal LSP runner for JSON-RPC framing, subprocess lifecycle, diagnostics, code actions, and workspace edit application.
 - Supports workspace roots, file limits, recursive file discovery, server overrides, and write-or-preview edits.
-- Starts language servers only for tool calls, then shuts them down.
+- Starts language servers only for tool calls, then shuts them down. Cleanup closes owned pipes,
+  sends `SIGTERM`, and escalates to `SIGKILL` after 500 ms if the child has not exited. Tool calls
+  wait for confirmed child closure, including after cancellation or protocol failure. After KILL,
+  closure has a separate 500 ms confirmation deadline, even if the signal attempt returns true.
+  Failed signalling (for example, permission denied) or missing confirmation reports a cleanup
+  error without claiming the child was reaped. Ownership is retained across runner invocations:
+  diagnostics and fixes for the same adapter/launcher/environment and real workspace root stay
+  blocked until confirmed close; other adapters or roots remain independent. Active calls may
+  still run concurrently. An existing tool-call error takes precedence over a cleanup error. This does not manage
+  descendant processes launched by a server.
 - Shows statusline activity only while LSP tools are running.
 
 ## When to use pi-lsp
@@ -281,6 +290,7 @@ packages/pi-lsp/
 │   ├── index.ts
 │   ├── adapters.ts
 │   ├── command.ts
+│   ├── client-leases.ts
 │   ├── files.ts
 │   ├── lsp-client.ts
 │   ├── pi-lsp.ts

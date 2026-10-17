@@ -49,13 +49,19 @@ You ask Pi to set up a ralph-wiggum loop.
   - All tasks are done and final verification is externally rerunnable (Pi sends `<promise>COMPLETE</promise>`)
   - Max iterations (default 50)
   - You hit `esc` (pausing the loop)
-If you hit `esc`, you can run `/ralph-stop` to clear the loop. Alternatively, just tell Pi to continue to keep going.
+If you hit `esc`, you can run `/ralph-stop` to clear the loop. Use `/ralph resume <name>` to explicitly resume a paused or unbound loop.
 
 ## Iterations, sessions and context windows
 
 An iteration is a new agent turn in the same Pi session, not a fresh context window. `ralph_done` queues the next prompt and the task file carries durable progress, while Pi's normal compaction can summarise older conversation when the context grows. This extension deliberately uses that flat, in-session design; it does not launch a new Pi process or session for each iteration.
 
-Each active loop is owned by the Pi session that started or explicitly resumed it. Reloading or compacting that same session restores its loop automatically. A different session in the same working directory can see that active loops exist, but it does not receive Ralph prompt injection unless the user explicitly runs `/ralph resume <name>`, which transfers ownership.
+Each active loop is owned by its live Pi session and branch prefix. Ordinary appends retain ownership; committed tree navigation or live branch divergence retires automatic delivery without changing another branch's loop state. Reload restores a loop only when its recorded branch proves ownership. Older state without that proof, a different session, or a navigated branch requires `/ralph resume <name>`.
+
+Each iteration delivery has a private, one-use identity, consumed at accepted native binding rather than at a later context hook. Loop instructions are request-local hidden context, not edits to real user text or images. Accepted user continuations can work on the current loop; unrelated extension wakes cannot advance or complete it. Distinct queued text/images do not erase a uniquely attributed continuation, regardless of steer/follow-up ordering. Identical-content collisions across sources or lanes fail closed; unobserved or transformed content cannot acquire ownership.
+
+Pending provenance expires after five minutes and is bounded to 256 candidates and 128 deliveries. Authenticated runtime nonces still recognize stale deliveries after eviction or retirement without retaining old task bodies or an unbounded replay list. An expired queued iteration needs an explicit `/ralph resume <name>`. Pause, cancel, and confirmed nuke synchronously retire ownership before deleting state. An active authenticated iteration also aborts immediately through its public operation context, so a later awaited tool-call handler cannot let a previously permitted substantive tool execute. The abort is pinned to the accepted nonce, live manager/session/branch, and original signal; it never transfers to a new root, ordinary manual user turn, or unrelated background wake. User continuations may advance loop progress without transferring ownership of their operation. Late tools from retired extension iterations remain blocked until settlement.
+
+State publication uses private temporary files and atomic rename. Malformed state warns by filename, remains unchanged, and does not prevent other valid loops from loading.
 
 ## Completion gate
 
@@ -68,7 +74,7 @@ For build/test/refactor tasks, Ralph prompts the agent not to complete based onl
 
 ## Stale prompt guard
 
-If an already-queued Ralph prompt arrives after a loop has completed, the agent should reload `.ralph/<name>.state.json` before doing work. If the loop state is `completed`, it should ignore the stale prompt, avoid file edits and task commands, and not call `ralph_done`.
+Known paused, completed, replayed, or retired iteration deliveries are rejected before provider work; native-context and tool boundaries also recheck live ownership. Unknown marker-shaped user literals remain ordinary text. Completion requires a positively owned iteration and an exact standalone `<promise>COMPLETE</promise>` line outside quotes and fenced code; quoting or discussing the marker does not complete a loop.
 
 ## Commands
 

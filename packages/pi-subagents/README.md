@@ -46,7 +46,15 @@ From the repository root:
 pi -e ./packages/pi-subagents
 ```
 
-**Verified host baseline:** Pi 1.0.4. Wildcard peer dependency ranges and retained capability fallbacks do not establish support for older host versions.
+**Verified host baseline:** Pi 1.0.4. Offline resource-ownership, child tool-policy, and native Fleet input barriers are additionally exercised on Pi 1.1.0; that focused coverage is not complete host qualification. Wildcard peer dependency ranges and retained capability fallbacks do not establish support for older host versions.
+
+## Upstream and local divergence
+
+Derived from [tintinweb/pi-subagents](https://github.com/tintinweb/pi-subagents); the upstream MIT license is preserved. The FleetView editor-focus fix from [commit `7da6bef828d7582ee33386ece9379c170e7742c4`](https://github.com/tintinweb/pi-subagents/commit/7da6bef828d7582ee33386ece9379c170e7742c4) (2026-10-09, #374; reported by @BarrMan) is selectively ported: callable `getText`/`setText` identifies non-inheriting custom editors without taking dialog or selector keys. No clone-parent-history behavior is imported; raw `inherit_context: true` remains refused. This fork also excludes `pi-background` from child resource loading until asynchronous child continuation has manager-owned lifecycle accounting.
+
+The container-first FleetView and bounded drill-down patterns are independently adapted from tintinweb/pi-subagents at [`221df02323c6b6350ea8474579e0ee0f6cc84cea`](https://github.com/tintinweb/pi-subagents/tree/221df02323c6b6350ea8474579e0ee0f6cc84cea/src/ui) and [`fd8d81618d80ae83a3faf40cb87dae99cca33264`](https://github.com/tintinweb/pi-subagents/tree/fd8d81618d80ae83a3faf40cb87dae99cca33264/src/ui). Collision-only child-label discriminators are inspired by [nicobailon/pi-subagents `69673c7fbf3351e54a5b0786a7e9d9fff625a749`](https://github.com/nicobailon/pi-subagents/blob/69673c7fbf3351e54a5b0786a7e9d9fff625a749/src/tui/render-helpers.ts). This is **not** the upstream workflow engine or full phase inspector: there are no inferred workflow names, phases, statuses, or workflow-wide controls, no new RPC, and no workflow source imports.
+
+The opt-in parent clarification broker is locally implemented. It uses the existing main session, not an upstream LLM arbitrator, cloned parent history, private UI automation, or an additional Agent per question. Permission gates remain human-owned.
 
 ## Lint policy
 
@@ -70,6 +78,40 @@ Foreground agents block until complete and return results inline. Background age
 At a TUI prompt, `@explore find it` starts one background Explore agent. In model mention mode, a hidden, throwaway turn uses **only the current mention text** to draft the task prompt; it does not receive the parent's conversation, system prompt, other tools, compaction summaries, or context hooks. This prevents raw parent history from reaching a separate provider before request-local privacy hooks can redact it. The resulting Agent spawn is still attributed to the parent; raw `inherit_context: true` is refused before the child starts (see below). If the hidden turn cannot start the agent, the extension starts it directly unless the parent runtime itself is unavailable. A pending mention is discarded if you switch sessions or branches before it starts; the off-screen provider turn is cancelled if the switch happens during streaming. An already-started agent is not started twice if a later UI or event update fails.
 
 **Pi runtime requirement:** On hosts where child sessions require the parent's `ModelRuntime`, Pi currently exposes it to extensions only through the registry's private `.runtime` property. If that bridge is missing or incompatible, Agent, mentions, and managed spawns refuse before allocating an ID or making a provider request; they do not silently construct a fresh runtime that would lose custom providers, credentials, or virtual routes. Existing managed idempotency keys remain readable. An explicit child model is validated against the parent runtime *after* final model selection, so a stale `ctx.model` alone does not block a valid physical child model. The error advises updating to a host that exposes the parent runtime, or disabling dispatch until one does.
+
+### Opt-in parent clarification (background only)
+
+By default, `contact_supervisor` still asks the human. Explicitly opt a **fresh, non-isolated top-level background** child into ordinary main-agent clarification:
+
+```js
+Agent({
+  subagent_type: "Explore",
+  prompt: "Investigate the schema. Ask only ordinary task clarifications, never approval.",
+  description: "Investigate schema",
+  run_in_background: true,
+  supervisor_questions: "parent",
+})
+```
+
+The child awaits an in-process answer promise. Only its explicit bounded question reaches the main model: sanitized request-local context contains a one-use `questionId`, original `agentId`, and numbered choice tokens. The main-only `answer_subagent_question({ questionId, answer })` accepts free text, an offered `option:N` token, or an empty answer to decline. Display labels are separate from the original choice data returned to the child; duplicate identical answers never resume it twice. Question text is untrusted data, not new instructions or authorization.
+
+The broker coalesces at most 16 pending questions (one per child), issues at most 64 IDs per session/branch generation, and expires unanswered questions after two minutes. Each question is displayed in hidden request-local context at most once. It requests one normal prepared extension turn only when the root is idle, has no queued messages, has no **observed input/preparation** in progress, and is not waiting on a dialog; otherwise questions join the next ordinary model context or wake after final `agent_settled`, never at retry-prone `agent_end`. No question means no extra model request. It does not edit genuine user text or images, transfer parent history/credentials into the child, poll a model, persist a separate question history, or automatically retry unanswered questions.
+
+Idle wakes are factory-local authenticated control tokens, not a claim on a familiar sentence. Recognition requires `input.source === "extension"` and an exact namespace/nonce/MAC; an interactive/RPC literal, foreign-namespace extension literal, or invalid MAC remains ordinary input. Admission replaces only the extension-owned input with a distinct frame token. While that admission remains unambiguous, preparation adds an authenticated **empty-content** native custom message as prompt-local frame evidence, never persistent model guidance. Native `message_start` identifies the executing frame; the promptless `agent_start` and old branch messages cannot identify it. Superseding genuine input invalidates wake authorization without forgetting accepted control identity. Request-local context removes only proven control pairs; verbatim user quotations remain unchanged. Historical proof recognition uses a fixed-size secret and constant recognition state, not an accumulating ledger. At most 16 unresolved or ambiguous admissions are retained independently of the flight; an exhausted admission budget refuses further wakes rather than forgetting unresolved frames.
+
+`before_agent_start` exposes no input source or delivery ID: token text alone cannot prove identity. If genuine INPUT copies an admitted token **before** its preparation reaches this package, both matching frames become ambiguous. That admission is retained inert within the same cap, neither frame receives a control proof or question context, neither is aborted or stripped by token text, and the flight's unannounced questions receive structured no-answer. The extension does not alter literal text or images. Native SDK image normalization can append a hint and resize an attachment; question suppression still requires the first text's authenticated token boundary and its retained ambiguous admission, never generic hint prose. This evidence cannot authorize a control proof or abort. The package cannot atomically cancel the unidentifiable control request before native persistence/provider dispatch. Ambiguous preparations cannot release a genuine input's readiness; idle wakes remain conservatively fenced until session retirement, but later ordinary inputs can still receive new questions normally. An already-prepared wake retains its positive native proof and cannot donate it to a later literal quotation.
+
+An owned request-local `context` delivery is the ACK. Each question has **one wake attempt**: no ACK within 30 seconds clears only that flight and returns structured no-answer for its still-unannounced questions. Async native authentication rejection and earlier input interception cannot occupy the flight indefinitely or retry acknowledged questions. A superseding genuine prompt retains its own preparation readiness; except for the explicit copied-token ambiguity above, its questions join that prompt or expire normally. Executing-frame ownership separately captures the public `ctx.signal` and its matching native `agent_end`. A competing preparation's busy-failure `agent_settled` cannot clear that frame while the core operation still owns a public signal; only a proven ended and released owner permits cleanup. Native preparation can record inert control tokens and empty frame proofs in ordinary session history; question text and answers are not stored as separate broker entries.
+
+**Public-hook limits:** handlers run in registration/load order. Observed genuine INPUT retires idle readiness synchronously, before later awaits. This package's mention interception releases only its own INPUT-scoped preparation on a native `handled` result; a thrown handler is not handled (Pi reports it and continues), and another concurrently preparing input is never released by that mention. Pi exposes neither an earlier handler's in-progress input nor a generic input-handled/auth-rejection completion notification. External handling/rejection after observation can therefore retain preparation readiness until session retirement; no timer guesses that a genuine prompt is inactive. Unresolved accepted wake preparations also retain their bounded admission slots until preparation arrives or the activation is replaced.
+
+Pi has no cancellable post-preparation/pre-persistence boundary. Already-prepared competing prompts cannot be atomically serialized or cancelled before native persistence through public hooks. Cancellation can leave an inert native control record; a proven invalidated control frame is never reclassified as ordinary instructions or given question context. Abort is issued only after an authenticated native message boundary proves the currently executing owned frame, never from a global accepted-token guess or to stop a genuine/other run. SDK 1.0.4 coverage includes later-preparation release orders, user/proof message-start and message-end awaits, copied unprepared tokens with and without images, default AUTO resizing of real 4096x4096 PNGs in both release orders while another child's question stays pending, and guard-disabled controls. Native concurrent prompts can still reject with “already processing”; the package preserves observed frame identity but does not guarantee native concurrent-prompt acceptance or atomic pre-persistence cancellation. This is not a private SDK/renderer/history patch.
+
+Answers are **not human approval or permission grants**. `ask_tools`, `createAskGate`, project trust, external permission dialogs, and human rejections are unchanged. A decision outside existing user task authorization must be declined and left to the human. Cancellation (including an aborted main turn), child stop/removal, timeout, navigation, or reload returns structured no-answer/assumption guidance, never approval. Pending IDs capture the public root session-manager identity, session ID, and complete native branch-entry prefix (including non-model metadata) at child channel construction **and at every question invocation from the live root context**, plus the current child attempt. A terminal child's background resume keeps its channel guard but cannot reuse that older prefix as the origin of a new question. Admission, context reads, and answer dispatch validate both live ancestries, not only generation events or model-text projections. Ordinary appends retain ownership; metadata-distinct divergent ancestry retires it even if an earlier asynchronous committed-tree handler has delayed this extension's notification. Old IDs cannot answer a replacement run.
+
+Foreground parent-mode calls are rejected **before spawn**: a main model blocked waiting for a child cannot execute another answering tool. Schedules and changing question mode on `resume` are also unsupported. An existing parent-mode child can resume only in background with `supervisor_questions` omitted; it retains its mode. Do not call `get_subagent_result(wait: true)` while an ordinary clarification is pending: that wait blocks the answering model until cancellation or the question timeout. Nested children cannot opt in or call the root answering tool. Managed protocol-v4 requests do not carry this new mode and remain unchanged; this MVP supports direct `Agent` calls and in-process `SpawnOptions.supervisorQuestions: "parent"` only when the root manager has issued the channel. No new global configuration is added. The existing Supervisor questions setting must remain enabled; `supervisor_questions: "off"` withholds contact for one fresh call.
+
+Install the changed package and reload/restart Pi to use this feature; an already running older installed package does not acquire new tools or parameters from checkout edits.
 
 ### Scheduling
 
@@ -114,7 +156,7 @@ above-editor widget is gone.
 Runs that enter through the scheduler or a cross-extension spawn appear in the
 list too, alongside `Agent`-tool runs.
 
-Every string these surfaces take from a child run — its description, activity preview, error, the `Agent` tool's own result and completion notification, and the conversation overlay's messages, tool results and command output — is text the extension did not author, so it is neutralized before rendering: terminal escape sequences are dropped, bidirectional overrides and other cursor-moving code points are shown as `[U+XXXX]`, and binary content is replaced with a placeholder. An agent file's `display_name` and `description` get the same treatment as they are loaded, since a cloned repository supplies them. A subagent that reads a poisoned file or fetches a hostile page cannot repaint or reorder the parent's terminal.
+Every string these surfaces take from a child run — its description, activity preview, error, the `Agent` tool's own result and completion notification, and the conversation overlay's messages, tool results and command output — is text the extension did not author, so it is neutralized before rendering. Fleet, conversation labels and scheduled-job selectors/confirmations/notifications use `@signalridge/pi-ui` display encoding (controls shown as `\\uXXXX`). Transcript previews drop terminal escape sequences, name remaining unsafe code points as `[U+XXXX]`, and replace binary content with a placeholder. These are display copies, not changes to stored prompts, paths, or messages. An agent file's `display_name` and `description` get the same treatment as they are loaded, since a cloned repository supplies them. A subagent that reads a poisoned file or fetches a hostile page cannot repaint or reorder the parent's terminal.
 
 The token field is annotated with two optional signals inside parens:
 - **`NN%`** — context-window utilization (color-coded: <70% dim, 70–85% warning, >=85% error). Omitted when the model has no declared `contextWindow`, or briefly right after compaction.
@@ -142,6 +184,10 @@ font fallback, and a fallback glyph is usually double-width, which would push
 the rest of the row out of alignment on some terminals and not others.
 
 The list is ordered earliest-launched first, and only shows agents you can actually open (pending/queued agents with no session yet appear once they start). At an **empty prompt**, press down or left to move focus from the prompt into the list. Up and down move the selection, Enter opens the selected agent's live conversation overlay (it auto-updates as the agent works), and Esc (or up above `main`) returns to the prompt. Selecting `main` returns to the normal view. The conversation overlay uses a complete `╭─╮` / `│` / `╰─╯` border. Press Enter to chat with a running agent — type a message and Enter to send it (Esc or an empty submit returns). For a queued agent that has no session yet, type `@handle message` in the main prompt; the message is delivered when it starts. Press `x` twice to stop a running agent. A viewer stays open when its agent finishes so you can read the final output, and finished agents linger in the list for a few seconds before dropping out. Typing anything at a non-empty prompt behaves normally — the list only captures navigation keys when the prompt is empty. Disable it entirely via `/agents → Settings → Fleet view`.
+
+Workflow-owned records appear in container rows **above ordinary agents**: `Workflow <runId> · N retained children`. These groups use only validated, already-available `owner.extension` and `owner.runId`; their counts describe records the manager still retains, not total workflow calls or authoritative run status. Opening one gives a terminal-height-bounded child list with stable-ID selection, Up/Down, PageUp/PageDown, Home/End and Enter to view a conversation; Esc returns from the conversation to the child list, then to FleetView. Sessionless queued children remain visible with an explicit unavailable-session message. Completed owned children remain inspectable while retained, independent of the ordinary four-second linger. Duplicate descriptions receive an ID discriminator only when needed. Detached records are excluded, and controls opened on an old thread attempt cannot steer/stop a replacement attempt.
+
+Steering rejection (including a child finishing while the composer is open) preserves the draft and shows an error; Esc explicitly discards it. Completed conversation headers fall back to the retained lifetime usage and compaction count when live activity has been removed.
 
 Individual agent results use restrained text status labels:
 
@@ -231,7 +277,7 @@ All fields are optional — sensible defaults for everything.
 | `description` | filename | Agent description shown in tool listings |
 | `display_name` | — | Display name for UI (e.g. the agent list, the conversation overlay) |
 | `tools` | all 7 | Which tools the agent can call. Built-in names (`read, grep, …`), `*` / `all` (all built-ins), `none`, and `ext:<extension>` / `ext:<extension>/<tool>` selectors for extension tools. See [Tool & extension scoping](#tool--extension-scoping) below |
-| `extensions` | `true` | Which extensions to load for the agent. `true` (all defaults), `false` (none), or an explicit list: `[mcp, "/abs/path.ts", "*"]`. See [Tool & extension scoping](#tool--extension-scoping) below |
+| `extensions` | `true` | Which extensions to load for the agent. `true` (all child-safe defaults), `false` (none), or an explicit list: `[mcp, "/abs/path.ts", "*"]`. `pi-background` is excluded; intentional selection is refused by name. See [Tool & extension scoping](#tool--extension-scoping) below |
 | `exclude_extensions` | — | Extension denylist applied after `extensions:` — exclude wins. Plain names only (case-insensitive), no paths or `*`. Useful with `extensions: true` to drop one extension (e.g. `pi-notify`) |
 | `skills` | `true` | `true` uses Pi's discovered skills, including skills supplied by loaded extensions; `false` exposes none; a comma-separated list preloads only those named skills into the system prompt (see [Skill Preloading](#skill-preloading) for discovery locations) |
 | `memory` | — | Persistent agent memory scope: `project`, `local`, or `user`. Auto-detects read-only agents |
@@ -295,7 +341,7 @@ Genuine user/global resources outside denied roots remain available subject to t
 `extensions:` decides **which extensions load**, `tools:` decides **which tools surface to the LLM**. They compose:
 
 ```yaml
-# Default (both omitted): all extensions load, all 7 built-ins surface
+# Default (both omitted): child-safe extensions load, all 7 built-ins surface
 
 tools: read, grep, find           # narrow to listed built-ins; extensions still load
 tools: "*"                        # all 7 built-ins (alias: `all`)
@@ -317,16 +363,18 @@ isolated: true                    # hermetic: built-ins only, no extensions/skil
 
 A few rules the examples don't make obvious:
 
-- `extensions:` is the sole loading authority. `ext:foo` in `tools:` narrows what surfaces; it can't load `foo` on its own. Mismatches fire `extension-error:…` warnings.
+- `extensions:` is the loading authority, subject to child lifecycle safety. `pi-background` is excluded **before its factory loads**, including under default inheritance and `"*"`; an `extension-error:…` warning names it. Its jobs can wake a retained child after `session.prompt()` finishes, when the manager has marked the record terminal, released its concurrency slot, and removed its worktree. Until manager-owned asynchronous continuation exists, explicitly selecting `pi-background` (by name, alias, package path, or entry path) is refused by name rather than silently dropped. `ext:pi-background` cannot override this boundary and warns as an unloaded selector. Ordinary extensions remain available; parent sessions are unaffected. This does not add or change another extension's settings.
+- `ext:foo` in `tools:` narrows what surfaces; it can't load `foo` on its own. Mismatches fire `extension-error:…` warnings.
 - Any `ext:` entry flips extension tools to an explicit allowlist — unnamed extensions still load (handlers fire) but expose no tools. So `tools: "*, ext:mcp/search"` exposes only `search` from `mcp`, nothing from any other extension.
 - Extension names match case-insensitively (`[Mcp]` = `[mcp]`); tool names in `ext:foo/bar` stay case-sensitive.
 - Extensions that register tools **lazily** work too. MCP-backed extensions typically can't enumerate their tools until their servers connect, so they register from `session_start` or `before_agent_start` rather than at load. Subagent scoping is re-derived as tools appear, including under `ext:` selectors. Scoping does not override Pi's own exposure: `deferred`/`codemode` tools and `defaultActive: false` tools are not activated for the model, and tools deliberately deactivated during a session stay inactive on later turns. Pi may still allow nested `ctx.executeTool()` calls to deferred/codemode tools, but the child's selector and `ask_tools:` approval gate both model-issued and nested calls.
 - A configured `defaultToolTimeoutMs` bounds the public `tool_call` policy and each selected extension handler using one deadline per call, including nested calls and handlers registered later with `pi.on`. On expiry the call is blocked; a Promise race returns control but **cannot cancel side effects** of a misbehaving hook that keeps running. Interactive `ask_tools:` confirmation is human decision time, not tool execution time: the deadline starts after approval. The separate execution timeout can still abort a tool whose `execute()` hangs.
-- When the SDK exports public codemode, tool-search, and MCP factories (as on the verified Pi 1.0.4 baseline), they are included as built-in extensions in children. `extensions: false` omits them; `extensions: [mcp]` selects MCP; `exclude_extensions: mcp` removes it; and `tools: ext:codemode`, `ext:tool-search`, or `ext:mcp/<tool>` narrows their tools like any other extension. Capability checks omit factories that the host does not export; this fallback is not an older-host support guarantee. For restrictive `extensions:` or `exclude_extensions:` policies, the child uses Pi's public package resolver to select discovered paths **before** loading factories. Thus an excluded extension cannot register a conflicting `/mcp` command and displace a selected replaceable built-in before filtering. Resolution can perform configured package installs, as Pi's normal loader does, and a selected extension that fails to load is reported rather than silently dropped.
+- When the SDK exports public codemode, tool-search, and MCP factories (as on the verified Pi 1.0.4 baseline), they are included as built-in extensions in children. `extensions: false` omits them; `extensions: [mcp]` selects MCP; `exclude_extensions: mcp` removes it; and `tools: ext:codemode`, `ext:tool-search`, or `ext:mcp/<tool>` narrows their tools like any other extension. Capability checks omit factories that the host does not export; this fallback is not an older-host support guarantee. Whenever extensions are enabled, the child uses Pi's public package resolver to select discovered paths **before** loading factories. Thus an excluded extension cannot register a conflicting `/mcp` command and displace a selected replaceable built-in before filtering. Resolution can perform configured package installs, as Pi's normal loader does, and a selected extension that fails to load is reported rather than silently dropped.
+- Explicit sources are validated separately before canonical deduplication, so a real file plus its file alias, or two package-directory aliases, load once without falsely reporting a missing source. Ownership names are unioned for admission/exclusion, but whole-package priority uses each resource's declaring package; direct entries use the canonical declaring owner. A package that aliases another package's entry does not lose its unrelated entries when the target is explicitly selected. Directory-backed modules are matched to Node's supported module entry without evaluating factories; undeclared siblings are not attributed to that package.
 - An installed **package** extension matches by its package short name (`@scope/pi-subagents` → `[pi-subagents]`), in addition to its path-derived name (a package whose entry is `src/index.ts` also answers to `[src]`). Prefer the package name — the path-derived one is incidental.
 - Plain `tools:` typos fail loudly: `tools: reed, grep` fires `tools-error:…` instead of silently producing an under-tooled agent.
 - `exclude_extensions:` wins over `extensions:` and over `ext:` selectors — an excluded extension never loads and a `tools: ext:` entry can't pull it back. Plain names only (no paths, no `*`); a name matching nothing fires an `extension-error:…` warning.
-- `exclude_extensions:` is **not a sandbox**: when the built-in factory capability enables preselection, the restrictive prefilter prevents excluded discovered factories from loading into the child, but resolving configured packages can still install code. The retained fallback without that capability filters post-load and can run an excluded factory before suppressing its tools and bound lifecycle hooks; a factory that subscribes directly to the shared `pi.events` bus may remain live. Don't rely on extension selection to contain untrusted packages.
+- `exclude_extensions:` is **not a sandbox**: preselection prevents excluded discovered factories from loading into the child, but resolving configured packages can still install code. Allowed extensions run with the Pi process's permissions. Don't rely on extension selection to contain untrusted packages.
 - Array and string forms are equivalent: `[a, b]` == `"a, b"`.
 
 ## Tools
@@ -343,6 +391,7 @@ Launch a sub-agent.
 | `tier` | string | no | Model tier for this spawn, by name. Overrides the agent's own default tier. Unknown tiers are rejected, not substituted — see [Model tiers](#model-tiers) |
 | `max_turns` | number | no | Max agentic turns. Omit for unlimited (default) |
 | `run_in_background` | boolean | no | Run without blocking |
+| `supervisor_questions` | `"human"` / `"parent"` / `"off"` | no | Default human; parent routes only ordinary clarification from fresh non-isolated background calls. No schedules or mode-changing resumes |
 | `resume` | string | no | Agent ID to resume a previous session |
 | `isolated` | boolean | no | No extension/MCP tools |
 | `isolation` | `"worktree"` | no | Run in an isolated git worktree |
@@ -368,6 +417,10 @@ Send a chat message to a running or queued agent. A running agent receives it af
 |-----------|------|----------|-------------|
 | `agent_id` | string | yes | Agent ID to steer |
 | `message` | string | yes | Message to inject into agent conversation |
+
+### `answer_subagent_question` (main only)
+
+Answer a current opted-in background child's ordinary clarification: `questionId` is the bounded one-use ID in extension context; `answer` is at most 2,000 characters, an offered `option:N` token for choices, or empty to decline. Forged, expired, cancelled, or stale IDs and unoffered choices are rejected. The tool is never inherited or injected into children and cannot grant permission or override a human rejection.
 
 ## Commands
 
@@ -966,11 +1019,14 @@ src/
   prompts.ts          # Config-driven system prompt builder
   context.ts          # Pure parent-context renderer (not used for child dispatch)
   context-boundary.ts # Raw inheritance and persisted-session guards
+  parent-questions.ts # Opt-in clarification broker, authenticated bounded outbox, public preparation/ACK gates
+  question-origin.ts # Public manager identity and complete native branch-prefix ownership
   model-runtime-bridge.ts # Checked parent runtime compatibility bridge
   env.ts              # Environment detection (git, platform)
   ui/
     agent-display.ts      # Shared agent formatting: spinner frames, activity, stats, names
     conversation-viewer.ts # Live conversation overlay for viewing agent sessions
+    owner-group.ts        # Bounded retained workflow-child inspector (no engine coupling)
     select-item.ts         # Numbered identity-safe selectors for duplicate labels
 ```
 

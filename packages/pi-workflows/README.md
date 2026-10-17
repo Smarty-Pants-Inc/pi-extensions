@@ -1,7 +1,7 @@
 # @signalridge/pi-workflows
 
 JavaScript orchestration for Pi. A workflow is a raw JavaScript module executed
-in a determinism-guarded `node:vm` realm; the runtime supplies `agent()`,
+in a determinism-guarded `node:vm` realm inside an owned Node helper; the runtime supplies `agent()`,
 `parallel()`, `pipeline()`, `orchestrate()`, `workflow()`, quality helpers (`verify`,
 `judgePanel`, `loopUntilDry`, `completenessCheck`, `retry`, `gate`), human
 `checkpoint()`, `phase()`, `log()`, `args`, `cwd`, restricted `process`, and
@@ -39,6 +39,52 @@ paths; without it, first remove the installed copies (`pi remove
 registration.
 
 Pi activates each package from its own `pi.extensions` manifest.
+
+### JavaScript execution boundary
+
+Only workflow-authored JavaScript and its callbacks run in the helper. Agent
+policy/dispatch, scheduling, limits, shared state, journals, and managed-child
+cleanup stay in the parent. Callback arguments cross bounded, validated IPC as
+opaque callback identities; the parent never executes workflow function objects.
+Nested saved workflows get their own helper frame, share the same parent-owned
+limits, and remain limited to one nested level. There are no new public globals,
+protocol changes, TypeScript helper loaders, or extra runtime dependencies.
+
+A Node host uses its Node executable. Bun or a compiled host requires `node` on
+PATH; missing Node fails with an actionable diagnostic. `NODE_OPTIONS` is inherited
+unchanged, including debugger flags. A helper that does not announce readiness
+within five seconds fails (including `--inspect-brk` awaiting a debugger).
+
+Initial synchronous evaluation retains its one-second VM guard. A local-process
+heartbeat detects JavaScript CPU stalls after awaits and in callbacks (including
+DAG, gate, retry, and loop callbacks); a stalled heartbeat fails after 1.5 seconds.
+This is not a wall-clock deadline for legitimate agent awaits, and never polls a
+model. Cancellation/failure closes the actual owned helper through TERM, KILL
+escalation after 250ms, and a bounded 1.5-second close wait. Managed children must
+still settle exact-owner cleanup before terminal publication or resumability; a
+cleanup failure is fenced, not claimed as success. A returned value closes new
+root-call admission but drains every accepted native operation and nested frame
+before success; callbacks needed by those operations remain available. Infinite
+awaits in forgotten helpers still require cancellation. Ignored native RPC promises
+are observed without changing their awaited/caught values or helper error policy.
+Repeated parent event-loop lag earns only one I/O turn per actual heartbeat advance,
+never a synthetic heartbeat or an indefinitely renewed stall exemption.
+
+Helpers have a 128MiB V8 heap limit, 4MiB IPC message limit, bounded 32MiB queued
+and retained request payloads, 8,192 callbacks/pending requests, 100,000 non-heartbeat
+messages, and intermediate value limits of 100,000 nodes/64 levels. Log entries
+are bounded to 64KiB characters and 1MiB total bytes per frame. Intermediate arrays,
+plain objects, maps, sets, dates, regexes, bigint values, registered callback
+references, and error names/classification cross IPC. Input and callback snapshots
+use the workflow realm's built-in constructors (including standard error subclasses),
+preserve cycles, array holes and undefined, and return registered callbacks to their
+original closures. Data transfers do not preserve arbitrary custom prototypes or
+cross-transfer object identity.
+VM-origin exceptions retain their provenance rather than acquiring native provider
+classification from words like "quota"; exception coercion stays in the helper.
+Final results must serialize to JSON and return their JSON projection. `phase()`
+and `log()` remain synchronous; budget reads mirror parent accounting at RPC replies.
+These bounds are guardrails for trusted scripts, **not an OS/security sandbox**.
 
 ## Writing a workflow
 
@@ -84,9 +130,9 @@ user's own LLM and run on the user's own machine.
   plain JSON Schema; the reply is parsed and validated client-side with bounded
   repair across attempts, and exhaustion throws `SCHEMA_NONCOMPLIANCE`.
   `strength` is the provider-neutral workflow route; `thread` chains sequential turns
-  within a named conversation thread. A legacy programmatic `model` option may
-  still be accepted by non-managed callers, but workflow meta/phase model or
-  thinking fields are rejected and are never a workflow policy source. Pre-schema-v4
+  within a named conversation thread. Per-call `model`, `thinking`, and `tier`
+  options are rejected; workflow meta/phase model or thinking fields are also
+  rejected and are never a workflow policy source. Pre-schema-v4
   journal runs are quarantined and cannot be resumed.
 - `parallel(thunks)` — run thunks concurrently, preserve input order. Recoverable
   thunk failures become `null`; non-recoverable failures (token budget, agent
@@ -122,10 +168,26 @@ user's own LLM and run on the user's own machine.
 A script edit replays the longest unchanged prefix from the journal and runs
 live from the first changed or inserted `agent()`/`checkpoint()` call. The
 original invocation `args` and execution limits are frozen and reused on manual
-or automatic resume. Pass `resumeFromRunId` with the edited script; unchanged
-calls report zero tokens,
+or automatic resume. Resume is a user action (`/workflows resume <runId>` or
+the navigator); unchanged calls report zero tokens,
 and edited calls rotate their managed spawn key generation so pi-subagents
-never raises a fingerprint conflict.
+never raises a fingerprint conflict. A failed run accepted through
+`resumeFromRunId` first appends/applies a legal interrupted recovery after owned
+cleanup and journal settlement; terminal status is never mutated directly to
+running. Intentional stops and unconfirmed cleanup remain non-resumable. Local
+checkpoints journal attempt identity without inventing a managed child, and a
+timed-out call journals its terminal failure after quiescence before returning
+recoverable `null`.
+
+There is no model-callable resume: the `workflow` tool refuses
+`resumeFromRunId` like every other call. A user-typed
+`/workflows resume <runId>` or navigator resume is a deliberate trusted action:
+it executes the script stored in the run's journal as-is, including inline
+source recorded before inline scripts were disabled. The existing provider-limit
+retry also uses stored source for an already-started run. Only resume a run
+whose stored script you trust. Workflow code runs in the owned Node helper,
+which inherits the parent environment and permissions; the `node:vm` realm is
+not a sandbox.
 
 ## Skills
 
@@ -144,13 +206,15 @@ workflow, and the review skill before accepting a topology or recovery change.
 
 ## Tools and commands
 
-- `workflow`: run a script (`script`) or a saved/built-in workflow (`name`),
-  with `args`, `background` (default true), `maxAgents` (default 1000),
-  `concurrency` (defaults to the host's pool size), `agentRetries` (default 0),
-  `tokenBudget` (default unlimited), `agentTimeoutMs` (default 1800000, `null`
-  disables), and `resumeFromRunId`. The execution limits are tuned defaults: a
-  caller that names one narrower than the script needs stops the run rather
-  than shaping it.
+- `workflow`: disabled in this build. Every call is refused before any file is
+  read or anything executes, whether it carries an inline `script`, a saved
+  workflow `name`, `resumeFromRunId`, or any combination, with one message that
+  names smarty-dev#11769, where an approval-bound or sandboxed path is tracked.
+  Workflow code runs in `node:vm`, which is not a security boundary, inside a
+  helper that inherits the parent environment; and a saved file in the agent
+  directory is not trusted input, because the model can write it. Saved and
+  built-in workflows run only through user-typed slash commands (`/<name>`,
+  `/workflows`).
 
   Concurrency is not configured here at all. A workflow agent occupies one of
   pi-subagents' `maxConcurrent` background slots like any other background
@@ -170,7 +234,7 @@ workflow, and the review skill before accepting a topology or recovery change.
 
   `agentTimeoutMs` counts from the moment the host reports the agent left its
   queue, so waiting for a slot is never charged against the work.
-- `workflow_control`: `list`, `get`, `pause`, `resume`, `stop`, or `rm` a run; `rm` writes a durable removal tombstone.
+- `workflow_control`: `list`, `get`, `pause`, `stop`, or `rm` a run; `rm` writes a durable removal tombstone. Its `resume` action is refused because it would replay the stored script. Resume only as a trusted user action with `/workflows resume` (see [Resume](#resume)).
 - `pi.events` emits `pi-workflows:runtime` snapshots (`{ runId, event }`) for phase, task, quality, retry, and nested-workflow progress; observer failures are contained.
 - `/workflows`: TUI navigator plus `run`, `status`, `watch`, `stop`, `pause`,
   `resume`, `rm`, `save <name> [runId]`, and `strength` subcommands.
@@ -189,19 +253,71 @@ workflow, and the review skill before accepting a topology or recovery change.
   `session_start` (Pi cannot unregister commands, so registration happens there
   rather than at factory time, and existing commands are never overwritten).
 
+### Background result notifications
+
+Completed background runs are buffered in branch-local pending-delivery markers
+(up to 256, expiring after seven days). Notifications wait for an owned, idle
+session with no queued input, input preparation, compaction, or navigation in
+progress. A cancellable one-shot timer defers handoff out of the notification-only
+`agent_settled` handler and rechecks ownership and readiness; later handlers can navigate
+or compact without receiving an old result. Up to eight results are coalesced
+per notification, each preview bounded to 8,000 characters. There is no model
+polling or repeating delivery timer.
+
+Results first enter context as a `pi-workflows:delivery` custom message with
+`triggerTurn: false`. The active branch must actually contain that message before
+pending markers are acknowledged. Delivery details record individual run IDs,
+so a partial acknowledgement failure cannot resend an already persisted member
+of a batch. Every accepted background resume (user command, navigator, or provider timer)
+rearms its generation-owned observer; suspension is not final delivery.
+Pi's void `sendMessage` return is not an
+acceptance promise. A short `sendUserMessage` notification then uses the normal
+input and `before_agent_start` path, so prompt preparation hooks still run.
+Internal wakes disable command/template expansion and carry private, unique,
+one-use admission tokens (at most 256 in memory). Our input hook checks the
+original generation, engine, context, and branch ownership before accepting a
+wake and removes its token from model-facing text. If an earlier input hook
+awaits while navigation or shutdown retires the owner, the obsolete
+extension-sourced wake is handled without starting a turn. Interactive/RPC
+input and other extensions' messages are not consumed by this guard.
+
+This is a handoff check, not a navigation lock: public hooks cannot fence an
+arbitrary later async input or preparation handler that navigates after our
+input hook has accepted the wake. Earlier transforms must preserve the private
+token until this check; a hook that removes it also removes its ownership evidence.
+
+Unacknowledged markers recover from the active branch on session start or tree
+commit; siblings never inherit abandoned-branch results. A blocked or failed
+handoff waits for a later lifecycle boundary, not a retry loop. If input or
+navigation is abandoned without a completion event, delivery stays conservative
+until a fresh prompt (and its eventual settlement) or session/tree rebind.
+
+Shutdown immediately retires both admission and delivery before aborting the
+engine, including a peer's bus-first shutdown handshake. Cleanup retains the
+outgoing journal until native shutdown finishes; late results cannot wake the
+retiring session.
+
 ### Keyword arming
 
 Typing the bounded word `workflow` or `workflows` in an ordinary message counts
-as an explicit opt-in to multi-agent orchestration: the message is annotated to
-tell the model the `workflow` tool is authorized for this turn.
+as an explicit opt-in to multi-agent orchestration. A request-local hidden
+`context` overlay tells the model that the user opted into workflow use, points to
+user-typed slash commands, and names the disabled `workflow` tool gate;
+`before_agent_start` admits idle guidance but persists nothing. Keyword and standing
+`/effort high|ultra` guidance never append reminders or effort text to native user
+messages. Original text/images remain exact, even repeated literal copies of either
+directive; only extension-owned custom guidance is filtered/rebuilt. Legacy owned
+hidden arming entries are excluded from public branch-summary/compaction preparation,
+without rewriting historical user text or stored entries.
 
-Arming **authorizes; it does not compel**. The annotation says the model may run
-a workflow and may still decline, so "how do workflows work?" stays an ordinary
+Arming **opts into slash-command workflow use; it does not compel**. The hidden
+guidance points the model to user-typed slash commands and says the model-facing
+`workflow` tool is disabled, so "how do workflows work?" stays an ordinary
 question with an ordinary answer. Nothing is swallowed and no UI opens.
 This is **model guidance, not an execution permission gate**: the extension does
-not enforce the keyword inside `workflow.execute`. Direct tool calls remain
-subject to Pi's ordinary tool permissions; do not use the trigger as a security
-boundary.
+not use the trigger as a security boundary, and `workflow.execute` refuses every
+model tool call regardless of arming. The user-typed slash-command path remains
+the deliberate execution path.
 
 Only a standalone word arms. A workflow is also a thing people write code about,
 so none of `myworkflow`, `workflow_name`, `WorkflowEngine`, `--workflow-id`,
@@ -210,6 +326,39 @@ sentence-ending dot is not a filename dot: "please run a workflow." arms, and
 `workflow.json` does not. Set a different word with `/workflows-trigger set
 <word>` (matched exactly — only the default word also matches its plural) or
 turn it off entirely with `/workflows-trigger off`.
+
+Only observed interactive/RPC input can arm a turn; extension-sourced
+notifications cannot. Idle admission is one-use and requires unchanged prompt
+text, images, session and leaf. Queued follow-up and steering input can also arm:
+Pi continues them without a fresh `before_agent_start`, so one bounded queued
+admission binds to its public `message_start` and a unique persisted user entry
+on the owning branch. The public `context` hook adds a model-only overlay; it
+never enters native history. Both paths retire guidance after settlement,
+navigation or reload. Standing `/effort high|ultra` permission identifies the
+standing setting, not a keyword the user did not type.
+
+Pi's public preparation event has no input source/request ID, and chained input
+handlers have no public post-`handled` notification. Overlapping or unmatched
+input is therefore denied rather than transferring authorization to another
+prompt, even if the text is identical. Multiple unresolved queued observations
+are ambiguous and suppress queued guidance until settlement. A consumed idle
+prompt may similarly suppress arming on the next ordinary turn. Template
+expansion, later text/image transforms, or non-unique native-message evidence
+also fail closed. These limits affect advisory guidance only, never direct tool
+authorization.
+
+The fix applies to **new messages after updating and reloading the extension**;
+source changes do not update an already installed/running package. Previously
+persisted user messages containing raw reminders remain unchanged. Pi's public
+UI API does not provide a history rewrite: those messages can still appear in
+the native TUI, fork selector or editor history. No private renderer patch or
+generic reminder stripping is used. Regression tests exercise the real SDK,
+faux provider, and native user-message component, not a physical terminal or a
+live model service.
+
+Navigator/result metadata is sanitized only in display copies through `pi-ui`;
+stored results and journals stay original. Detail screens keep actions reachable
+in a row-bounded viewport; PgUp/PgDn scroll the detail independently of ↑↓ actions.
 
 Saved workflows use project scope first and a user scope fallback; writes are atomic and names are path-safe.
 
@@ -396,4 +545,4 @@ used it.
 - **Agent registry and tier catalogue ownership.** `agentType` and the tier catalogue resolve in pi-subagents; the workflow package supplies only a tier key its own `strengths` table chose, avoiding a second model/thinking policy.
 - **Schema validation is client-side.** The managed request does not assume a structured-output tool; the runtime asks for JSON, parses, validates (including `additionalProperties`), and repairs across bounded attempts.
 
-State is persisted as `pi.appendEntry("pi-workflows:journal", ...)` custom entries (schema v4), including frozen invocation args, resolved tier identity, terminal result previews, script revisions, named nested-workflow result boundaries, and durable removals. Interrupted/provider-limited runs replay from the journal; pre-schema-v4 journals are quarantined rather than replayed. Foreground `AbortSignal`s stop owned children through explicit owner-scoped stop/quiescence, and dispose/branch replacement reject stale waiters. For tree navigation, bus and native pre-tree notifications share quiescence within one host signal; a later attempt rechecks runs started since a veto, after any earlier cleanup settles. This only prevents reuse of stale quiescence: Pi does not provide a post-veto, precommit hook, so the initial canceled attempt can still interrupt active runs. Hosts without a pre-tree signal retain legacy deduplication.
+State is persisted as `pi.appendEntry("pi-workflows:journal", ...)` custom entries (schema v4), including frozen invocation args, resolved tier identity, terminal result previews, script revisions, named nested-workflow result boundaries, and durable removals. Interrupted/provider-limited runs replay from the journal; pre-schema-v4 journals are quarantined rather than replayed. Foreground `AbortSignal`s stop owned children through explicit owner-scoped stop/quiescence, and dispose/branch replacement reject stale waiters. Navigation preflight vetoes while agents or workflows are active or cleaning up, without interrupting them. An accepted tree commit fences old callbacks in either extension load order and restores only the committed branch; preflight itself is not a commit point.

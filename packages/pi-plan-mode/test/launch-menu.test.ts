@@ -401,5 +401,5 @@ test("start is completed while longer start text remains an inline prompt", asyn
   assert.ok(completions?.some((item) => item.value === "start"));
 
   await mock.commands.get("plan")?.handler("start a migration", context.ctx);
-  assert.equal(mock.sentUserMessages.at(-1)?.text, "start a migration");
+  assert.match(mock.sentUserMessages.at(-1)?.text ?? "", /^start a migration\n\n<!-- pi-plan-delivery:/u);
 });

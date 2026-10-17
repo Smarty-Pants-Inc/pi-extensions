@@ -15,7 +15,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { Component, TUI } from "@earendil-works/pi-tui";
 import type { MenuContext, RunMenuResult } from "@narumitw/pi-tui-kit";
-import { wrapCustomUi } from "@signalridge/pi-ui";
+import { withPreservedCustomEditor, wrapCustomUi } from "@signalridge/pi-ui";
 import {
   type BtwBringToMainSegment,
   type BtwBringToMainSummary,
@@ -34,6 +34,7 @@ import {
   runBtwMenuPreservingEditor,
   showBtwCommandMenu,
 } from "./menu.js";
+import { captureSessionOrigin } from "./session-origin.js";
 import {
   type BtwSettings,
   effectiveRememberThinkingLevelChanges,
@@ -125,6 +126,7 @@ interface ResolveBtwModelOptions {
   currentModel: Model<Api> | undefined;
   modelRegistry: BtwModelRegistry;
   warn?: (message: string) => void;
+  isCurrent?: () => boolean;
 }
 
 export interface ResolvedBtwModel {
@@ -149,14 +151,16 @@ export async function resolveBtwModel({
   currentModel,
   modelRegistry,
   warn,
+  isCurrent = () => true,
 }: ResolveBtwModelOptions): Promise<ResolvedBtwModel | undefined> {
+  if (!isCurrent()) return undefined;
   const reportWarning = (message: string) => warn?.(sanitizeSingleLine(message));
   if (settings.model) {
     const fallback = currentModel ? `${currentModel.provider}/${currentModel.id}` : "the current model";
     const reference = parseBtwModelReference(settings.model);
     if (!reference) {
       reportWarning(`pi-btw model ${settings.model} is invalid; falling back to ${fallback}.`);
-      return resolveBtwModel({ settings: {}, currentModel, modelRegistry, warn: reportWarning });
+      return resolveBtwModel({ settings: {}, currentModel, modelRegistry, warn: reportWarning, isCurrent });
     }
     const configuredModel = modelRegistry.find(reference.provider, reference.modelId);
     if (!configuredModel) {
@@ -168,21 +172,25 @@ export async function resolveBtwModel({
       const fallbackAction = sameAsCurrent ? "no distinct current model is available" : `falling back to ${fallback}`;
       if (isVirtualBtwModel(configuredModel)) return { model: configuredModel, auth: {} };
       try {
+        if (!isCurrent()) return undefined;
         const auth = await modelRegistry.getApiKeyAndHeaders(configuredModel);
+        if (!isCurrent()) return undefined;
         if (auth.ok) return resolvedPhysicalBtwModel(configuredModel, auth);
         const reason = auth.error;
         reportWarning(`pi-btw model ${settings.model} is unavailable (${reason}); ${fallbackAction}.`);
       } catch (error: unknown) {
+        if (!isCurrent()) return undefined;
         reportWarning(`pi-btw model ${settings.model} credentials failed (${formatError(error)}); ${fallbackAction}.`);
       }
       if (sameAsCurrent) return undefined;
     }
   }
 
-  if (!currentModel) return undefined;
+  if (!isCurrent() || !currentModel) return undefined;
   if (isVirtualBtwModel(currentModel)) return { model: currentModel, auth: {} };
   try {
     const auth = await modelRegistry.getApiKeyAndHeaders(currentModel);
+    if (!isCurrent()) return undefined;
     if (auth.ok) return resolvedPhysicalBtwModel(currentModel, auth);
   } catch {
     // The caller reports the final lack of an available model.
@@ -340,7 +348,9 @@ export default function btw(pi: ExtensionAPI, dependencies: BtwExtensionDependen
       const commandSessionManager = ctx.sessionManager;
       const commandSessionId = commandSessionManager.getSessionId?.();
       const commandGeneration = sessionGeneration;
+      const ownsOrigin = captureSessionOrigin(ctx);
       const ownsCommandSession = () =>
+        ownsOrigin() &&
         commandGeneration === sessionGeneration &&
         activeSessionManager === commandSessionManager &&
         commandSessionManager.getSessionId?.() === commandSessionId;
@@ -382,7 +392,8 @@ export default function btw(pi: ExtensionAPI, dependencies: BtwExtensionDependen
       const startingTurnCount = state?.thread.turns.length ?? 0;
 
       try {
-        const settings = await loadSettings(ctx);
+        if (!ownsCommandSession()) return;
+        const settings = await loadSettings(ctx, ownsCommandSession);
         if (!ownsCommandSession()) return;
         const registerLoaderClose = (close: () => void) => {
           if (!ownsCommandSession()) close();
@@ -481,8 +492,13 @@ async function showCommandMenuForBtw(
   });
 }
 
-async function loadSettingsForCommand(ctx: ExtensionCommandContext): Promise<BtwSettings> {
+async function loadSettingsForCommand(
+  ctx: ExtensionCommandContext,
+  isCurrent: () => boolean = () => true,
+): Promise<BtwSettings> {
+  if (!isCurrent()) return {};
   const settingsResult = await readBtwSettings();
+  if (!isCurrent()) return {};
   if (settingsResult.kind === "loaded") return settingsResult.settings;
   if (settingsResult.kind === "invalid") {
     notifySafely(ctx, `pi-btw settings ignored: ${settingsResult.reason}`, "warning");
@@ -548,6 +564,7 @@ async function resolveBtwModelWithLoader(
         settings,
         currentModel: ctx.model,
         modelRegistry: ctx.modelRegistry,
+        isCurrent: () => !settled && isSessionCurrent(),
         warn: (message) => {
           if (!settled && isSessionCurrent()) notifySafely(ctx, message, "warning");
         },
@@ -589,6 +606,7 @@ interface BtwThreadSteeringControl {
   submit: (question: string) => void;
   thinking: BtwThreadThinkingControl;
   prepareContext: () => string | false;
+  isCurrent: () => boolean;
 }
 
 type BtwBringToMainChoice =
@@ -682,9 +700,11 @@ export async function runBtwThread({
   const sessionManager = ctx.sessionManager;
   const sessionId = sessionManager.getSessionId?.();
   const thread = state?.thread ?? createSideThread();
+  const ownsOrigin = captureSessionOrigin(ctx);
   const ownsSession = (): boolean => {
     try {
       return (
+        ownsOrigin() &&
         (!isSessionCurrent || isSessionCurrent()) &&
         ctx.sessionManager === sessionManager &&
         sessionManager.getSessionId?.() === sessionId
@@ -710,15 +730,16 @@ export async function runBtwThread({
     level: activeThinkingLevel,
     levels: thinkingLevels,
     onChange: (level) => {
-      if (!thinkingLevels.includes(level)) return;
+      if (!ownsSession() || !thinkingLevels.includes(level)) return;
       activeThinkingLevel = level;
       if (state) state.thinkingLevel = level;
       if (!rememberThinkingLevelChanges) return;
       let write!: Promise<void>;
       write = Promise.resolve()
-        .then(() => persistThinkingLevel(level))
+        .then(() => (ownsSession() ? persistThinkingLevel(level) : undefined))
         .then(() => undefined)
         .catch((error: unknown) => {
+          if (!ownsSession()) return;
           notifySafely(
             ctx,
             `Thinking level changed to ${level}, but could not be remembered in pi-btw.json: ${formatError(error)}`,
@@ -766,9 +787,12 @@ export async function runBtwThread({
           ? parsed
           : await ask(thread, question, selected, activeThinkingLevel, ctx, {
               questions: steeringQuestions,
-              submit: (question) => steeringQuestions.push(question),
+              submit: (question) => {
+                if (ownsSession()) steeringQuestions.push(question);
+              },
               thinking: createThinkingControl(),
               prepareContext: () => prepareContext(parsed.includeParent),
+              isCurrent: ownsSession,
             });
       if (!ownsSession()) return { kind: "closed" };
       if (result.kind === "aborted") {
@@ -803,26 +827,7 @@ async function showBtwCustomPreservingEditor<T>(
   ownsSession: () => boolean,
 ): Promise<T | undefined> {
   if (!ownsSession()) return undefined;
-  let liveEditorText = ctx.ui.getEditorText();
-  let completed = false;
-  const result = await ctx.ui.custom<T>((tui, theme, keybindings, done) =>
-    factory(tui, theme, keybindings, (value) => {
-      try {
-        if (ownsSession()) liveEditorText = ctx.ui.getEditorText();
-      } catch {
-        // Keep completion finite if session replacement invalidates the editor context.
-      }
-      completed = true;
-      done(value);
-    }),
-  );
-  if (completed && ownsSession()) {
-    try {
-      if (ctx.ui.getEditorText() !== liveEditorText && ownsSession()) ctx.ui.setEditorText(liveEditorText);
-    } catch {
-      // A replaced context owns a different editor and must not receive stale restoration.
-    }
-  }
+  const result = await withPreservedCustomEditor(ctx).ui.custom<T>(factory);
   return ownsSession() ? result : undefined;
 }
 
@@ -1154,6 +1159,7 @@ async function askThreadQuestion(
   ctx: ExtensionCommandContext,
   steering: BtwThreadSteeringControl,
 ) {
+  if (!steering.isCurrent()) return { kind: "aborted" } as const;
   return ctx.ui.custom<Awaited<ReturnType<typeof completeSideThreadTurn>>>((tui, theme, keybindings, done) => {
     let settled = false;
     const view = new BtwAnsweringView(
@@ -1184,11 +1190,12 @@ async function askThreadQuestion(
       signal: view.signal,
       completeSimple: createModelRegistryCompleteSimple(ctx.modelRegistry),
       prepareContext: steering.prepareContext,
+      isCurrent: steering.isCurrent,
     }).then((result) => {
       if (settled) return;
       settled = true;
       view.finish();
-      done(result);
+      done(steering.isCurrent() ? result : { kind: "aborted" });
     });
     return view;
   });

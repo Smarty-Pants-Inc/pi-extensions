@@ -28,7 +28,7 @@ pi -e ./packages/pi-input-history
 
 ### Persistent history
 
-On session start, your last 100 prompts across all sessions are loaded into the editor. Use **↑/↓** arrows to browse them as usual. If you submit a prompt or use history navigation before the background scan finishes, that editor is not seeded: your newer native history and browsing state take priority. The scanned prompts remain available through **Ctrl+Alt+R**, without replacing the editor or disturbing private paste contents.
+On session start, your last 100 prompts across all sessions are loaded into the editor. Use **↑/↓** arrows to browse them as usual. If you submit a prompt or use history navigation before the background scan finishes, that editor is not seeded: your newer native history and browsing state take priority. The scanned prompts remain available through **Ctrl+Alt+R**, without replacing the editor. Startup replacement preserves a completed large paste through the focused editor's public expanded-text API when available; unknown focus and older hosts without that API use the host's normal text-copy behavior.
 
 ### Fuzzy popup (Ctrl+Alt+R)
 
@@ -47,12 +47,14 @@ On session start, your last 100 prompts across all sessions are loaded into the 
 
 Arrow and Emacs bindings follow the list (`Ctrl+P`/`Ctrl+N` = previous/next line). Press **Ctrl+Alt+R** again to walk further back in history, including while the background scan is pending. Inside the popup, `Ctrl+R` remains a compatible older-entry alias and `Ctrl+S` moves toward newer entries; outside it, `Ctrl+R` remains available for Pi's session rename. Below 76 columns the preview pane is dropped and the list takes the full width.
 
+History stores the original leading/trailing whitespace and multiline text. All ordered text parts are concatenated without adding separators; search and previews use separate display copies. Recall is **text-only**: image-bearing messages contribute their text, but images are not restored. The host editor may normalize tabs and line endings when text is inserted.
+
 ## Features
 
 - **fzf-style two-pane popup** — a live-filtered list plus a preview pane showing the highlighted prompt in full, instead of a single-line prompt.
 - **Cross-session persistence** — history survives across sessions automatically.
 - **Fuzzy subsequence matching** — type partial characters in order, multi-token support with spaces.
-- **Character-level highlighting** — matched positions shown with accent color underline on a full-width selection bar.
+- **Grapheme-safe highlighting** — matched positions shown with accent color underline on a full-width selection bar.
 - **Deduplication** — no duplicate entries across sessions.
 - **Current session awareness** — merges live branch history with cached cross-session history.
 

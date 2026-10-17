@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.9
+### Patch Changes
+
+- c2fd867: Preserve ordered multipart prompt text and whitespace independently of display/search copies, match code points with grapheme-safe highlighting, keep preview bottom lines reachable after scrolling/resizing, and restore completed startup pastes through public editor APIs. Document text-only recall.
+
 ## 1.2.8
 ### Patch Changes
 

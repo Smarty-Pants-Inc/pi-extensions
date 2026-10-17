@@ -20,8 +20,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { ManagedSpawnResponse } from "@signalridge/pi-subagents-protocol";
 import { isManagedAgentTier } from "@signalridge/pi-subagents-protocol";
-import { WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
+import { describeWorkflowError, WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
 import {
+  applyRecoveryEvent,
   buildResumeJournal,
   type CallResult,
   type CallTierIdentity,
@@ -31,6 +32,7 @@ import {
   type JournalEvent,
   type JournalWriter,
   type RecoveryTerminalResult,
+  type RunRecoveryEvent,
   replayJournal,
   type ScriptRun,
   type SessionEntryLike,
@@ -311,6 +313,8 @@ export class WorkflowEngine {
   private readonly runs = new Map<string, ScriptRunState>();
   /** Fired when a run settles terminal; wired by the UI surface for widget refresh. */
   onRunSettled: (() => void) | undefined;
+  /** Every accepted background execution, including automatic and UI resumes. */
+  onBackgroundExecution: ((runId: string) => void) | undefined;
   /** Optional in-process observer for phase/task/quality runtime events. */
   onRuntimeEvent: ((runId: string, event: WorkflowRuntimeEvent) => void) | undefined;
   /**
@@ -339,10 +343,14 @@ export class WorkflowEngine {
   private admissionsClosed = false;
   private pendingAdmissions = 0;
   private recoveryBranchGeneration = 0;
-  private readonly journalRetries = new Map<string, { timer?: ReturnType<typeof setTimeout>; attempt: number }>();
+  private readonly journalRetries = new Map<
+    string,
+    { timer?: ReturnType<typeof setTimeout>; attempt: number; done: Promise<void>; resolve: () => void }
+  >();
   private readonly journalBlockedRuns = new Set<string>();
   private readonly providerResumeTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private journalMutationKey: string | undefined;
+  private journalMutationSequence = 0;
   private readonly quarantinedRunIds = new Set<string>();
 
   constructor(
@@ -867,8 +875,52 @@ export class WorkflowEngine {
       clearTimeout(providerTimer);
       this.providerResumeTimers.delete(runId);
     }
-    if (run.nonResumable || (isTerminalWorkflow(run.status) && run.status !== "failed" && run.status !== "stopped"))
+    if (
+      run.nonResumable ||
+      run.terminalIntent === "stop" ||
+      (isTerminalWorkflow(run.status) && run.status !== "failed" && run.status !== "stopped")
+    )
       return undefined;
+    if (isTerminalWorkflow(run.status)) {
+      await this.drainExecution(state, state.execution);
+      for (const [nodeId, agentId] of Object.entries(run.agentIds)) {
+        if (run.callStatus[nodeId] !== "running") continue; // Completed/local calls own no live child.
+        const attemptId = run.attemptIds[nodeId];
+        if (!attemptId) continue;
+        await this.stopAndQuiesce(
+          state,
+          agentId,
+          {
+            extension: "pi-workflows",
+            runId,
+            nodeId: `call-${nodeId}`,
+            attemptId: `attempt-${generationFromAttemptId(attemptId)}`,
+          },
+          state.executionGeneration,
+        );
+      }
+      if (run.nonResumable || this.runs.get(runId) !== state || epoch !== this.branchEpoch || this.lifecyclePaused)
+        return undefined;
+      if (
+        this.journalBlockedRuns.has(runId) ||
+        [...this.journalRetries.keys()].some((key) => key.startsWith(`${runId}\u0000`))
+      )
+        throw new Error("Workflow journal has not settled; retry resume after persistence recovers");
+      const timestamp = Date.now();
+      const recovery: RunRecoveryEvent = {
+        kind: "run_recovery",
+        schemaVersion: JOURNAL_SCHEMA_VERSION,
+        runId,
+        status: "interrupted",
+        branchGeneration: this.recoveryBranchGeneration,
+        rotations: [],
+        recoveryId: deriveRecoveryId({ runId, rotations: [], timestamp }),
+        timestamp,
+      };
+      this.appendRequired(recovery);
+      applyRecoveryEvent(run, recovery);
+      state.result = undefined;
+    }
     if (replacementScript !== undefined) {
       const parsed = parseWorkflowScript(replacementScript);
       const revision = (run.revision ?? 0) + 1;
@@ -931,7 +983,10 @@ export class WorkflowEngine {
     );
     const execution = state.execution;
     void execution.catch(() => {});
-    if (options.background) return { runId, status: run.status, background: true };
+    if (options.background) {
+      this.onBackgroundExecution?.(runId);
+      return { runId, status: run.status, background: true };
+    }
     try {
       const settled = await this.waitFor(runId, options.signal);
       return { runId, status: settled.status, background: false };
@@ -1170,6 +1225,9 @@ export class WorkflowEngine {
           recoverable: true,
         });
       }
+      // A terminal frame cannot overtake accepted journal facts. In particular,
+      // a delayed call_attempt must precede its result, not reset it on replay.
+      await this.drainJournal(runId);
       const live = this.runs.get(runId);
       const run = live?.run;
       if (run && isSameBranch() && !isTerminalWorkflow(run.status)) {
@@ -1181,7 +1239,7 @@ export class WorkflowEngine {
       await runner.waitForCleanup?.();
       const run = this.runs.get(runId)?.run;
       if (run && isSameBranch() && !isTerminalWorkflow(run.status)) {
-        const message = error instanceof Error ? error.message : String(error);
+        const message = describeWorkflowError(error);
         const workflowError = error instanceof WorkflowError ? error : wrapError(error);
         if (workflowError.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT) {
           this.setWorkflowStatus(run, "paused", message);
@@ -1417,7 +1475,36 @@ export class WorkflowEngine {
         state.agentWaiters.delete(pendingId);
         state.bufferedTerminals.delete(spawnKey);
         // Stop acknowledges cancellation, not provider/tool finally completion.
-        void this.stopAndQuiesce(state, pendingId, owner, executionGeneration).then(() => {
+        void this.stopAndQuiesce(state, pendingId, owner, executionGeneration).then(async () => {
+          if (
+            !nested &&
+            this.runs.get(runId) === state &&
+            state.executionGeneration === executionGeneration &&
+            !run.nonResumable
+          ) {
+            const result = resultFromLifecycle(
+              "stopped",
+              pendingId,
+              undefined,
+              "workflow call cancelled",
+              run.compactions[nodeId] ?? 0,
+              undefined,
+              resolvedTierIdentity?.tier ?? tier,
+            );
+            result.attemptId = attemptId;
+            try {
+              await this.drainJournal(runId);
+              this.commitCallTerminal(runId, nodeId, result, true);
+            } catch (error) {
+              this.fenceExecution(
+                state,
+                executionGeneration,
+                "Could not persist cancelled call terminal fact; run is non-resumable",
+              );
+              waiter.reject(error);
+              return;
+            }
+          }
           waiter.reject(
             new WorkflowError("workflow aborted", WorkflowErrorCode.WORKFLOW_ABORTED, { recoverable: true }),
           );
@@ -1521,6 +1608,27 @@ export class WorkflowEngine {
       compactionCount: 0,
       updatedAt: Date.now(),
     };
+    // Checkpoints are local calls, not managed children. Give their completed
+    // result a journal identity without fabricating a manager record.
+    if (!run.attemptIds[nodeId]) {
+      const generation = (state.generations.get(nodeId) ?? 0) + 1;
+      const attemptId = `${runId}/${nodeId}/attempt-${generation}`;
+      this.appendRequired({
+        kind: "call_attempt",
+        schemaVersion: JOURNAL_SCHEMA_VERSION,
+        runId,
+        nodeId,
+        attemptId,
+        generation,
+        owner: { extension: "pi-workflows", runId, nodeId, attemptId },
+        timestamp: Date.now(),
+      });
+      state.generations.set(nodeId, generation);
+      run.attemptTracking = true;
+      run.attempts[nodeId] = generation;
+      run.attemptIds[nodeId] = attemptId;
+      run.callStatus[nodeId] = "running";
+    }
     const attemptId = run.attemptIds[nodeId];
     if (attemptId) callResult.attemptId = attemptId;
     const event: JournalEvent = {
@@ -1580,7 +1688,7 @@ export class WorkflowEngine {
     state.run.updatedAt = Date.now();
   }
 
-  private commitCallTerminal(runId: string, nodeId: string, result: CallResult): void {
+  private commitCallTerminal(runId: string, nodeId: string, result: CallResult, required = false): void {
     const state = this.runs.get(runId);
     if (!state) return;
     const run = state.run;
@@ -1595,7 +1703,8 @@ export class WorkflowEngine {
       ...(attemptId ? { owner: { extension: "pi-workflows", runId, nodeId, attemptId } } : {}),
       timestamp: Date.now(),
     };
-    this.persist(runId, `call-terminal:${nodeId}`, () => this.write(event));
+    if (required) this.appendRequired(event);
+    else this.persist(runId, `call-terminal:${nodeId}`, () => this.write(event));
     run.callResults[nodeId] = result;
     run.callTiers[nodeId] = result.tier === undefined ? {} : { tier: result.tier };
     run.callStatus[nodeId] = result.status;
@@ -1811,15 +1920,24 @@ export class WorkflowEngine {
    * whose appends keep failing is marked blocked (reported once, not spammed).
    */
   private scheduleJournalRetry(runId: string, key: string, mutation: () => void): void {
-    const retryKey = `${runId}\u0000${key}`;
-    if (this.journalRetries.has(retryKey)) return;
-    const retry = { attempt: 0, timer: undefined as ReturnType<typeof setTimeout> | undefined };
+    // Every accepted fact has its own slot, including later retry generations
+    // for the same call. Coalescing by node key would silently drop that fact.
+    const retryKey = `${runId}\u0000${key}\u0000${++this.journalMutationSequence}`;
+    const predecessors = [...this.journalRetries.entries()]
+      .filter(([id]) => id.startsWith(`${runId}\u0000`))
+      .map(([, pending]) => pending.done);
+    let resolve!: () => void;
+    const done = new Promise<void>((settled) => {
+      resolve = settled;
+    });
+    const retry = { attempt: 0, timer: undefined as ReturnType<typeof setTimeout> | undefined, done, resolve };
     const attempt = (): void => {
       const current = this.journalRetries.get(retryKey);
       if (!current) return;
       current.timer = undefined;
       if (this.lifecyclePaused || !this.runs.has(runId)) {
         this.journalRetries.delete(retryKey);
+        current.resolve();
         return;
       }
       const previousKey = this.journalMutationKey;
@@ -1827,9 +1945,12 @@ export class WorkflowEngine {
       try {
         mutation();
         this.journalRetries.delete(retryKey);
+        current.resolve();
       } catch (error: unknown) {
         if (!(error instanceof JournalAppendError)) {
           this.journalRetries.delete(retryKey);
+          current.resolve();
+          this.journalBlockedRuns.add(runId);
           console.warn(
             `[pi-workflows] journal retry abandoned: ${error instanceof Error ? error.message : String(error)}`,
           );
@@ -1838,6 +1959,7 @@ export class WorkflowEngine {
         current.attempt += 1;
         if (current.attempt >= JOURNAL_RETRY_MAX_ATTEMPTS) {
           this.journalRetries.delete(retryKey);
+          current.resolve();
           this.journalBlockedRuns.add(runId);
           console.warn(`[pi-workflows] journal retry exhausted for ${runId}: ${error.message}`);
           return;
@@ -1852,7 +1974,19 @@ export class WorkflowEngine {
       }
     };
     this.journalRetries.set(retryKey, retry);
-    queueMicrotask(attempt);
+    void Promise.all(predecessors).then(attempt);
+  }
+
+  private async drainJournal(runId: string): Promise<void> {
+    let pending = [...this.journalRetries.entries()].filter(([id]) => id.startsWith(`${runId}\u0000`));
+    while (pending.length > 0) {
+      await Promise.all(pending.map(([, retry]) => retry.done));
+      pending = [...this.journalRetries.entries()].filter(([id]) => id.startsWith(`${runId}\u0000`));
+    }
+    if (this.journalBlockedRuns.has(runId))
+      throw new WorkflowError("Workflow journal has not settled", WorkflowErrorCode.PERSISTENCE_ERROR, {
+        recoverable: true,
+      });
   }
 
   private appendRequired(event: JournalEvent): void {
@@ -1888,6 +2022,10 @@ export class WorkflowEngine {
    * a transient failure, schedules a retry of the exact same append.
    */
   private persist(runId: string, key: string, mutation: () => void): void {
+    if ([...this.journalRetries.keys()].some((id) => id.startsWith(`${runId}\u0000`))) {
+      this.scheduleJournalRetry(runId, key, mutation);
+      return;
+    }
     const previousKey = this.journalMutationKey;
     this.journalMutationKey = `${runId}:${key}`;
     try {
@@ -1942,8 +2080,9 @@ export class WorkflowEngine {
     this.providerResumeTimers.set(runId, timer);
   }
   private clearJournalRetries(): void {
-    for (const { timer } of this.journalRetries.values()) {
+    for (const { timer, resolve } of this.journalRetries.values()) {
       if (timer) clearTimeout(timer);
+      resolve();
     }
     this.journalRetries.clear();
     this.journalBlockedRuns.clear();
@@ -1977,6 +2116,7 @@ export class WorkflowEngine {
       }),
     );
     run.status = status;
+    if (status === "running") run.error = undefined;
     if (error !== undefined) run.error = error;
     if (runFinalResult !== undefined) run.finalResult = runFinalResult;
     if (terminalIntent !== undefined) run.terminalIntent = terminalIntent;
@@ -2081,7 +2221,7 @@ export class WorkflowEngine {
         return {
           index: Number(nodeId),
           status,
-          ...(result?.result !== undefined ? { resultPreview: String(result.result).slice(0, 300) } : {}),
+          ...(result?.result !== undefined ? { resultPreview: renderWorkflowValue(result.result).slice(0, 300) } : {}),
           ...(result?.error ? { error: result.error.slice(0, 300) } : {}),
           ...(result?.tokenCount !== undefined ? { tokenCount: result.tokenCount } : {}),
           ...(run.agentIds[nodeId] ? { agentId: run.agentIds[nodeId] } : {}),

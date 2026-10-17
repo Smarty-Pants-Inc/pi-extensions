@@ -2,6 +2,7 @@ import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { PROTOCOL_CAPABILITIES, PROTOCOL_VERSION, routingPolicyFingerprint } from "@signalridge/pi-subagents-protocol";
 import { describe, expect, it, vi } from "vitest";
 import piWorkflows from "../src/index.js";
+import { runOnActiveEngine } from "./direct-engine-seam.js";
 
 class Bus {
   private readonly handlers = new Map<string, Set<(value: unknown) => void>>();
@@ -33,7 +34,7 @@ function fixture() {
   const anchor = session.appendMessage({ role: "user", content: "anchor", timestamp: 3 });
   const bus = new Bus();
   const lifecycle = new Map<string, (event: unknown, ctx: unknown) => unknown>();
-  let workflowTool: {
+  let workflowControl: {
     execute: (
       id: string,
       params: unknown,
@@ -61,8 +62,8 @@ function fixture() {
     events: bus,
     on: (name: string, handler: (event: unknown, ctx: unknown) => unknown) => lifecycle.set(name, handler),
     appendEntry: (type: string, data: unknown) => session.appendCustomEntry(type, data),
-    registerTool: (tool: typeof workflowTool & { name: string }) => {
-      if (tool.name === "workflow") workflowTool = tool;
+    registerTool: (tool: typeof workflowControl & { name: string }) => {
+      if (tool.name === "workflow_control") workflowControl = tool;
     },
     registerCommand: vi.fn(),
     getCommands: () => [],
@@ -83,7 +84,15 @@ function fixture() {
     anchor,
     start: async () => lifecycle.get("session_start")?.({ type: "session_start" }, ctx),
     shutdown: async () => lifecycle.get("session_shutdown")?.({ type: "session_shutdown" }, ctx),
-    run: () => workflowTool.execute("journal-branch", { script, background: false }, undefined, undefined, ctx),
+    // Baseline: on 47f0a6e every case called the `workflow` tool with inline
+    // `script` and was refused. The model tool now refuses all runs
+    // (smarty-dev#11769), so the anchor fixture runs on the session's active
+    // engine via the test-only direct-engine seam.
+    run: () =>
+      runOnActiveEngine(workflowControl, { script, background: false }, undefined, ctx) as Promise<{
+        details: { status: string };
+        content: Array<{ text: string }>;
+      }>,
   };
 }
 

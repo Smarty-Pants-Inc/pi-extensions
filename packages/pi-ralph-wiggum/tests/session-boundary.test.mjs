@@ -22,9 +22,12 @@ import ralphExtension from "../index.ts";
 
 function makeCtx(cwd, sessionId = "fresh-session") {
   const statuses = [];
+  const branch = [{ id: "root", type: "custom" }];
   return {
+    branch,
     cwd,
-    sessionManager: { getSessionId: () => sessionId },
+    sessionManager: { getSessionId: () => sessionId, getBranch: () => branch },
+    abort() {},
     hasUI: true,
     /** Every status line this session has drawn, newest last. */
     statuses,
@@ -99,7 +102,17 @@ async function boot(cwd, sessionId) {
 }
 
 /** What this session would inject into the next turn's system prompt. */
-const inject = (pi, ctx) => pi.events.get("before_agent_start")({ systemPrompt: "base prompt" }, ctx);
+let nativeTimestamp = 0;
+const inject = async (pi, ctx, prompt = "Continue", source = "interactive") => {
+  await pi.events.get("input")({ text: prompt, source }, ctx);
+  await pi.events.get("before_agent_start")({ prompt, systemPrompt: "base prompt" }, ctx);
+  const message = { role: "user", content: [{ type: "text", text: prompt }], timestamp: ++nativeTimestamp };
+  await pi.events.get("message_start")({ message }, ctx);
+  ctx.branch.push({ id: `native-${nativeTimestamp}`, type: "message", message });
+  const result = await pi.events.get("context")({ messages: [message] }, ctx);
+  const directive = result.messages.find((message) => message.customType === "ralph-iteration-context");
+  return directive ? { systemPrompt: `base prompt\n${directive.content}` } : undefined;
+};
 
 const baseState = {
   iteration: 1,
@@ -111,6 +124,7 @@ const baseState = {
   status: "active",
   startedAt: "2026-07-08T11:54:18.989Z",
   lastReflectionAt: 0,
+  ownerBranchIds: ["root"],
 };
 
 after(() => {
@@ -135,6 +149,27 @@ describe("loop ownership across sessions", () => {
 
     const { pi, ctx } = await boot(cwd, "fresh-session");
     assert.equal(await inject(pi, ctx), undefined);
+  });
+
+  test("a matching session ID without a nonempty branch proof requires explicit resume", async () => {
+    for (const proof of [undefined, []]) {
+      const cwd = makeTempDir("ralph-session-proof-");
+      const state = {
+        ...baseState,
+        name: "unbound",
+        taskFile: ".ralph/unbound.md",
+        ownerSessionId: "owner",
+        ownerBranchIds: proof,
+      };
+      writeLoop(cwd, state);
+      const { pi, ctx } = await boot(cwd, "owner");
+      assert.equal(await inject(pi, ctx), undefined);
+      await pi.commands.get("ralph").handler("resume unbound", ctx);
+      assert.match(
+        (await inject(pi, ctx, pi.sentUserMessages.at(-1).message, "extension"))?.systemPrompt ?? "",
+        /RALPH LOOP - unbound/,
+      );
+    }
   });
 
   test("the owning session rehydrates its loop after a reload or compaction", async () => {
@@ -292,6 +327,7 @@ describe("loop lifecycle", () => {
       ownerSessionId: "owner",
     });
     const { pi, ctx } = await boot(cwd, "owner");
+    await inject(pi, ctx);
     await pi.tools.get("ralph_done").execute("advance", {}, undefined, undefined, ctx);
     assert.equal(readLoop(cwd, "final").iteration, 3);
     assert.equal(pi.sentUserMessages.length, 1);
@@ -300,6 +336,7 @@ describe("loop lifecycle", () => {
     assert.equal(readLoop(cwd, "final").status, "active");
     assert.equal(pi.sentUserMessages.length, 1, "queued a premature terminal banner");
     ctx.hasPendingMessages = () => false;
+    await inject(pi, ctx, pi.sentUserMessages.at(-1).message, "extension");
     await pi.events.get("agent_end")({ messages: [{ role: "assistant", stopReason: "stop", content: [] }] }, ctx);
     assert.equal(readLoop(cwd, "final").status, "completed");
     assert.equal(pi.sentUserMessages.length, 2);

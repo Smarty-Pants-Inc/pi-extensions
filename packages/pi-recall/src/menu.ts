@@ -1,6 +1,6 @@
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { MenuDefinition } from "@narumitw/pi-tui-kit";
-import { withBorderedCustomUi } from "@signalridge/pi-ui";
+import { withBorderedCustomUi, withPreservedCustomEditor } from "@signalridge/pi-ui";
 import {
   candidateIdentity,
   filterRecallMessages,
@@ -158,6 +158,7 @@ export function createRecallMenu(
     },
     actions: {
       saveMessage: async ({ ctx, state, signal, itemId }) => {
+        if (signal.aborted || !isCurrent(ownership)) return { kind: "close" };
         const candidate = state.candidates.find(({ entryId }) => entryId === itemId);
         if (!candidate) return { kind: "rejected", error: new Error("Message is unavailable") };
         await source.save(candidate, signal);
@@ -268,7 +269,7 @@ export function createRecallMenu(
           return { kind: "close" };
         }
 
-        const result = await chooseSavedInRpc(ctx, state, signal, selectedScope);
+        const result = await chooseSavedInRpc(ctx, state, signal, selectedScope, ownership);
         if (signal.aborted || !isCurrent(ownership)) return { kind: "close" };
         if (!result || result.kind === "back") return { kind: "stay" };
         if (result.kind === "close") return { kind: "close" };
@@ -298,6 +299,7 @@ export function createRecallMenu(
         return { kind: "close" };
       },
       deleteMessage: async ({ ctx, state, signal }) => {
+        if (signal.aborted || !isCurrent(ownership)) return { kind: "close" };
         if (!state.selected) return { kind: "back" };
         const deleted = await source.delete(state.selected.id, signal);
         if (deleted && !signal.aborted && isCurrent(ownership)) {
@@ -327,7 +329,7 @@ export async function showRecallMenu(
   const { runMenu } = await import("@narumitw/pi-tui-kit");
   if (ownership.signal.aborted || !ownership.isCurrent()) return;
   const controller = createRecallMenu(source, { ...ownership, mode: ctx.mode });
-  await runMenu(withBorderedCustomUi(ctx), controller.menu, {
+  await runMenu(withBorderedCustomUi(withPreservedCustomEditor(ctx)), controller.menu, {
     getState: controller.getState,
     signal: ownership.signal,
     isCurrent: ownership.isCurrent,
@@ -404,22 +406,25 @@ async function chooseSavedInTui(
 ): Promise<ScopedRecallPickerResult | undefined> {
   const { runCustomInteraction } = await import("@narumitw/pi-tui-kit");
   if (signal.aborted || !isCurrent(ownership)) return undefined;
-  const interaction = await runCustomInteraction<ScopedRecallPickerResult>(withBorderedCustomUi(ctx), {
-    signal,
-    isCurrent: () => isCurrent(ownership),
-    create: ({ tui, theme, keybindings, complete }) =>
-      new ScopedRecallPicker({
-        tui,
-        theme,
-        keybindings,
-        records: state.records,
-        current: state.current,
-        initialScope,
-        initialSelectedId,
-        initialQuery,
-        complete,
-      }),
-  });
+  const interaction = await runCustomInteraction<ScopedRecallPickerResult>(
+    withBorderedCustomUi(withPreservedCustomEditor(ctx)),
+    {
+      signal,
+      isCurrent: () => isCurrent(ownership),
+      create: ({ tui, theme, keybindings, complete }) =>
+        new ScopedRecallPicker({
+          tui,
+          theme,
+          keybindings,
+          records: state.records,
+          current: state.current,
+          initialScope,
+          initialSelectedId,
+          initialQuery,
+          complete,
+        }),
+    },
+  );
   return interaction.kind === "completed" ? interaction.value : undefined;
 }
 
@@ -428,12 +433,14 @@ async function chooseSavedInRpc(
   state: RecallMenuState,
   signal: AbortSignal,
   initialScope: RecallScope,
+  ownership: { isCurrent?: () => boolean },
 ): Promise<ScopedRecallPickerResult | undefined> {
+  if (signal.aborted || !isCurrent(ownership)) return undefined;
   const scopeOptions = ["Current cwd", "All", "Current session", "Back"];
   const initialLabel = SCOPE_LABELS[initialScope];
   const orderedOptions = [initialLabel, ...scopeOptions.filter((option) => option !== initialLabel)];
   const selectedScopeLabel = await ctx.ui.select("Choose scope", orderedOptions, { signal });
-  if (signal.aborted) return undefined;
+  if (signal.aborted || !isCurrent(ownership)) return undefined;
   if (!selectedScopeLabel || selectedScopeLabel === "Back") {
     return { kind: "back", scope: initialScope };
   }
@@ -451,7 +458,7 @@ async function chooseSavedInRpc(
       `${index + 1}. ${record.role} · ${new Date(record.source.messageTimestamp).toISOString()} · ${messagePreview(sanitizeTerminalText(record.text), 72)}`,
   );
   const choice = await ctx.ui.select("Choose saved message", [...labels, "Back"], { signal });
-  if (signal.aborted) return undefined;
+  if (signal.aborted || !isCurrent(ownership)) return undefined;
   if (!choice || choice === "Back") return { kind: "back", scope };
   const index = labels.indexOf(choice);
   const record = records[index];

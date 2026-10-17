@@ -26,8 +26,10 @@ replay.
 - Replays the newest compatible checkpoint while preserving later conversation and extension-added
   context.
 - Supports repeated compaction by carrying the previous opaque item into the next Remote V2 request.
-- Falls back to Pi's native plaintext compaction after authentication, transport, protocol, or
-  validation failure; user cancellation does not launch the fallback.
+- Requires informed authorization for persisted canonical history before credentials or transport.
+  Unconsented compaction cancels, including in headless/RPC modes; it does not launch native fallback.
+- After authorization, authentication, transport, protocol, or validation failures can use Pi's
+  native plaintext compaction. Session/branch divergence and user cancellation cancel instead.
 - Provides `/codex-compact` for manual compaction, effective-route visibility, and bounded settings.
 
 ## Install
@@ -52,14 +54,17 @@ pi -e ./packages/pi-codex-compact
 just try codex-compact
 ```
 
-Loading the package enables Remote V2 with safe defaults. Avoid loading a global npm installation
-and the local workspace at the same time.
+Loading the package enables the Remote V2 hook, but does **not** authorize sending canonical history.
+Avoid loading a global npm installation and the local workspace at the same time.
 
 ## Quick start
 
 1. Sign in through Pi's built-in OpenAI Codex OAuth provider.
 2. Select a model whose provider is `openai-codex` and API is `openai-codex-responses`.
-3. Work normally. Pi's automatic compaction and built-in `/compact` continue to operate.
+3. Work normally. In a UI-capable TUI, compaction asks permission to use canonical history **once**.
+   Declining, cancelling, timing out, or having no suitable UI cancels compaction, not just the remote
+   request. To authorize future requests explicitly, toggle **Allow canonical history** in this
+   extension's Settings menu. In headless/RPC modes that persistent opt-in is required.
 4. Run `/codex-compact` to inspect the effective route or choose **Compact now**.
 5. After compaction, continue the session normally; compatible requests replay the opaque checkpoint.
 
@@ -73,7 +78,8 @@ model is unsupported, compaction remains entirely Pi-native.
 ```
 
 In TUI mode, the root menu shows whether Remote V2 is enabled, the active model, and whether a
-manual compact will use **Codex Remote V2** or **Pi native**. It contains:
+manual compact will use **Codex Remote V2** (asking once unless canonical history is allowed) or
+**Pi native**. It contains:
 
 ```text
 Compact now
@@ -103,6 +109,7 @@ project-level override.
 ```json
 {
   "enabled": true,
+  "allowCanonicalHistory": false,
   "requestTimeoutMs": 300000,
   "maxRetries": 2,
   "replacementTokenBudget": 64000,
@@ -112,8 +119,9 @@ project-level override.
 
 | Setting | Default | Accepted values | Behavior | Recommendation |
 | --- | ---: | --- | --- | --- |
-| `enabled` | `true` | Boolean | Attempt Remote V2 for a compatible model. | Keep enabled unless diagnosing provider behavior. |
-| `requestTimeoutMs` | `300000` | Integer from 30,000 to 600,000 ms | Bound the entire extension-owned operation, including retries and response-body inspection. | Keep five minutes; increase only for a consistently slow connection. |
+| `enabled` | `true` | Boolean | Intercept compaction for a compatible model. Turning it off leaves Pi-native compaction outside this consent gate. | Keep enabled to enforce the gate. |
+| `allowCanonicalHistory` | `false` | Boolean | Explicit persistent authorization to send canonical history and permit native summary fallback without asking each time. | Leave off unless you understand the privacy boundary below; toggle in this extension's Settings menu to opt in. |
+| `requestTimeoutMs` | `300000` | Integer from 30,000 to 600,000 ms | Bound authentication, retries, and response-body inspection after authorization. | Keep five minutes; increase only for a consistently slow connection. |
 | `maxRetries` | `2` | Integer from 0 to 2 | Retry transient provider transport failures before Pi fallback. | Keep two; use zero when diagnosing the first failure. |
 | `replacementTokenBudget` | `64000` | Integer from 8,000 to 128,000 tokens | Bound approximate retained user-message text beside the opaque item. | Keep 64K; lower it to reduce session size or raise it only when recent user context is being lost. |
 | `notifyOnFallback` | `true` | Boolean | Warn when Remote V2 fails and Pi-native compaction takes over. | Keep enabled so silent fallback does not hide protocol or entitlement problems. |
@@ -147,16 +155,20 @@ This extension does **not** read `~/.codex/config.toml`.
 - API `openai-codex-responses` on the active model.
 - A working OpenAI Codex OAuth login and Remote V2 entitlement.
 
-OpenAI API-key, Azure, GitHub Copilot, proxies, and arbitrary Responses-compatible providers are not
-supported. Switching to another provider or model leaves Pi's visible fallback marker plus retained
-recent messages in context. Switching back to the checkpoint's original compatible model restores
-opaque replay.
+OpenAI API-key, Azure, GitHub Copilot, and arbitrary Responses-compatible providers are not
+supported. The built-in Codex provider's credential-resolved destination is honored together with
+its API key, headers, and environment; a configured destination must implement the same Codex wire
+contract. Compatibility with arbitrary proxies is not guaranteed. Switching to another provider or
+model leaves Pi's visible fallback marker plus retained recent messages in context. Switching back
+to the checkpoint's original compatible model restores opaque replay.
 
 ## How it works
 
 1. Pi prepares compaction and selects the recent message suffix it will retain.
-2. The extension projects an earlier compatible checkpoint, if present, into the current Responses
-   input.
+2. The extension captures session/branch ownership and requires canonical-history authorization,
+   before resolving credentials. TUI confirmation is cancellable, expires after five minutes, and
+   grants only this operation; persistent authorization is a separate explicit settings toggle.
+   It then projects an earlier compatible checkpoint, if present, into the canonical Responses input.
 3. It appends exactly one final `compaction_trigger` and sends a normal authenticated Codex Responses
    SSE request with cache retention disabled.
 4. It requires a completed response containing exactly one non-empty opaque `compaction` item.
@@ -181,10 +193,34 @@ can establish it again; prompt, tool, and schema changes remain guarded.
 
 ## Privacy, storage, and limits
 
-Remote compaction sends the active conversation context, system prompt, and active tool schemas to
-the same OpenAI Codex backend used by the selected model. The Pi session stores the encrypted
-compaction item and bounded recent user-role Responses items. It does not store OAuth tokens,
-authorization headers, or request headers in checkpoint details.
+Remote compaction sends Pi's **persisted canonical projection**, system instructions, and tool
+schemas to the selected model's credential-resolved Codex destination. It honors durable
+`context_edit` omissions/replacements; it does not send unprojected raw session entries.
+
+This is **not** a snapshot of the final context sent in an ordinary model request. Pi 1.0.4 exposes
+no such snapshot to extensions. Remote V2 does not invoke ordinary `context`,
+`context_with_system`, or `before_provider_request` handlers. Pi 1.0.4's native summary also bypasses
+ordinary context filters. Request-local privacy filters, hidden custom content, and historical
+persisted workflow arming can therefore differ from ordinary model context. No generic text stripping can establish equivalent privacy. New request-local guidance
+that is not persisted does not become canonical history, but existing persisted content remains.
+
+Default `allowCanonicalHistory: false` requires a clear, one-operation TUI confirmation. No UI,
+RPC, denial, cancellation, uncertain dialog result, or retired ownership returns cancellation:
+**no credentials, remote request, checkpoint, or native summary fallback**. Native fallback alone
+is not privacy-safe: Pi's native summary also consumes canonical history without these filters.
+After explicit authorization, remote failure may use that native summary. Consent is never reused
+for a changed session/branch. Disabling this extension's hook leaves native compaction outside this
+gate; this gate is not a universal privacy policy for unsupported models or other extensions.
+
+The session stores the opaque compaction item and bounded recent user-role Responses items,
+including canonical content you authorized even if ordinary filters hid it. Replay can restore that
+content after filters have run, including after reload. The authorization setting gates **new
+compactions**, not replay of an existing checkpoint (including one created by an earlier version).
+Opaque items cannot be inspected or selectively redacted. Authorization is not persisted in
+checkpoint details. OAuth tokens, headers, environment secrets, and destination URLs are not
+stored there. This extension's compaction-failure notifications use fixed messages without provider
+error details, including when native fallback fails. Pi core and other extensions own their own
+notifications and renderers; this package cannot sanitize those upstream messages.
 
 | Boundary | Limit |
 | --- | ---: |
@@ -217,8 +253,12 @@ ceilings are intentionally not configurable.
   prompt, tools, or context **after this handler returns** can invalidate an already prepared opaque
   checkpoint before Pi appends it. Load such handlers before this extension or disable Remote V2 in
   that combination; the extension cannot inspect later handlers' changes.
-- Remote failure falls back to Pi's plaintext summary, so a session can contain both remote opaque
-  and native compaction entries over time.
+- Only **authorized** remote failure falls back to Pi's plaintext summary, so a session can contain
+  both remote opaque and native entries over time. Both paths use canonical history, not a guaranteed
+  filter-safe current-model projection.
+- Request-local payload hooks such as priority service-tier selection are not dispatched for Remote
+  V2. Ordinary and replay requests still compose those hooks in registration order. Remote V2 uses
+  provider defaults, not necessarily an ordinary request's selected tier.
 - Settings concurrency is coordinated only within one Pi process; separate processes rely on the
   final conflict check.
 
@@ -227,6 +267,7 @@ ceilings are intentionally not configurable.
 ```text
 src/index.ts          Thin Pi entrypoint
 src/codex-compact.ts  Pi lifecycle, command, provider projection, and fallback
+src/authorization.ts Cancellable, operation-owned canonical-history consent
 src/tool-state.ts     Prepared/observed public tool surfaces and frozen wire evidence
 src/remote.ts         Provider stream invocation, auth payload, timeout, and retry controls
 src/protocol.ts       Bounded SSE parsing and Remote V2 payload/output validation

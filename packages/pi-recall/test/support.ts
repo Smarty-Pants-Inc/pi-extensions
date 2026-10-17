@@ -309,6 +309,7 @@ export function createMockContext(overrides: Record<string, unknown> = {}) {
     sessionManager: overrides.sessionManager ?? {
       getSessionId: () => "test-session",
       getSessionName: () => undefined,
+      getLeafId: () => null,
       getBranch: () => [],
       getEntries: () => [],
     },

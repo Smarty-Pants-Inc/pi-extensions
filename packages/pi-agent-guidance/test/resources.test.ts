@@ -32,9 +32,11 @@ test("deduplicates against actual host context selection, including override and
           else writeFileSync(join(cwd, name), content);
         }
         const contextFiles = options ?? loadProjectContextFiles({ cwd, agentDir });
-        const result = await handler({ systemPrompt: "base", systemPromptOptions: { contextFiles } }, { cwd, model: { provider } });
-        assert.equal(Boolean(result), expected, JSON.stringify(files));
-        return { cwd, result };
+        const event = { systemPrompt: "base", systemPromptOptions: { contextFiles, sections: {} } };
+        assert.equal(await handler(event, { cwd, model: { provider } }), undefined);
+        const section = event.systemPromptOptions.sections.provider_context;
+        assert.equal(Boolean(section), expected, JSON.stringify(files));
+        return { cwd, result: section ? { systemPrompt: section } : undefined };
       }
       const claude = await run({ "AGENTS.override.md": "override", "CLAUDE.md": "claude-only" }, "anthropic", true);
       assert.match(claude.result.systemPrompt, /claude-only/);

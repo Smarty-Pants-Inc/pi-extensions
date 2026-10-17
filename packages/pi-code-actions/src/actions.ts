@@ -6,6 +6,7 @@ import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { Container, matchesKey, Text, truncateToWidth } from "@earendil-works/pi-tui";
 
 import { type ActionOwnership, ownedCustom } from "./owned-custom.js";
+import { executeSnippet } from "./snippet-process.js";
 
 export type { ActionOwnership } from "./owned-custom.js";
 
@@ -101,17 +102,20 @@ function truncateLines(text: string, maxLines: number): string {
 }
 
 export async function runSnippet(
-  pi: ExtensionAPI,
+  _pi: ExtensionAPI,
   ctx: ExtensionCommandContext,
   snippet: string,
   ownership: ActionOwnership,
+  cwd?: string,
 ): Promise<void> {
+  if (!ownership.isCurrent() || ownership.signal.aborted) return;
+  const capturedCwd = cwd ?? ctx.cwd;
   const isWindows = process.platform === "win32";
   const command = isWindows ? "powershell" : "bash";
   const args = isWindows ? ["-NoProfile", "-Command", snippet] : ["-lc", snippet];
 
-  const result = await pi.exec(command, args, { cwd: ctx.cwd, signal: ownership.signal });
-  if (!ownership.isCurrent()) return;
+  const result = await executeSnippet(command, args, capturedCwd, ownership);
+  if (!ownership.isCurrent() || ownership.signal.aborted) return;
   const output = truncateLines(formatOutput(`${command} ${args.join(" ")}`, result), 200);
 
   if (ctx.mode !== "tui") {

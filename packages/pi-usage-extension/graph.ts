@@ -9,6 +9,7 @@
 
 // Explicit .ts extension so plain `node --test` (type stripping) can resolve
 // this module too; pi's extension loader accepts it as well.
+import { civilDayStart, nextCivilHourStart } from "./civil-time.ts";
 import type { HourlyCell, HourlyKey, PeriodBounds, TabName } from "./data.ts";
 import { splitHourlyKey } from "./data.ts";
 
@@ -146,12 +147,28 @@ export function buildGraphModel(hourly: Map<number, Map<HourlyKey, HourlyCell>>,
   const spanMs = Math.max(endMs - startMs, 1);
   const bucketMs = spanMs / HOUR_MS <= MAX_HOURLY_BUCKETS ? HOUR_MS : DAY_MS;
 
-  // Bucket starts aligned to the domain start so "day" buckets follow the
-  // local-midnight period boundaries computed by data.ts (DST shifts move a
-  // boundary by an hour, which is invisible at graph resolution).
-  const bucketCount = Math.max(1, Math.ceil(spanMs / bucketMs));
-  const bucketStarts: number[] = [];
-  for (let i = 0; i < bucketCount; i++) bucketStarts.push(startMs + i * bucketMs);
+  // Use the same civil-hour/offset-transition boundaries as collection. Some
+  // hours are partial (e.g. Lord Howe) and repeated hours remain distinct.
+  // Reconstruct every intended daily midnight from the original civil date:
+  // a skipped midnight must not carry its normalized 01:00 into following days.
+  const bucketStarts: number[] = [startMs];
+  while (true) {
+    const previous = bucketStarts[bucketStarts.length - 1] ?? startMs;
+    const next = bucketMs === DAY_MS ? civilDayStart(startMs, bucketStarts.length) : nextCivilHourStart(previous);
+    if (next >= endMs) break;
+    bucketStarts.push(next);
+  }
+  const bucketCount = bucketStarts.length;
+  const bucketIndex = (hour: number): number => {
+    let low = 0;
+    let high = bucketCount;
+    while (low + 1 < high) {
+      const mid = Math.floor((low + high) / 2);
+      if ((bucketStarts[mid] ?? endMs) <= hour) low = mid;
+      else high = mid;
+    }
+    return low;
+  };
 
   // Accumulate per-group bucket values.
   const groupValues = new Map<string, number[]>();
@@ -161,7 +178,7 @@ export function buildGraphModel(hourly: Map<number, Map<HourlyKey, HourlyCell>>,
 
   for (const [hour, bucket] of hourly) {
     if (hour < startMs || hour >= endMs) continue;
-    const idx = Math.min(bucketCount - 1, Math.floor((hour - startMs) / bucketMs));
+    const idx = bucketIndex(hour);
     for (const [key, cell] of bucket) {
       const value = metricOf(cell, options.metric);
       if (value === 0) continue;
