@@ -146,17 +146,29 @@ describe("native file-backed durability (no private SDK writes or rollback)", ()
     const open = reopened(f);
     expect(open.store.mutate(open.ctx, add).revision).toBe(1);
   });
-  it("detects a same-size file rewrite and never serves a cached authoritative record after storage becomes unreadable", () => {
+  it("verifies bytes despite unchanged metadata and fails closed on unreadable storage", () => {
     const f = fixture();
-    f.store.mutate(f.ctx, add);
+    const first = f.store.mutate(f.ctx, add);
     const contents = readFileSync(f.file, "utf8");
+    // Freeze the verified identity before changing bytes; no timestamp-resolution assumptions.
+    const verifiedStat = fs.statSync(f.file, { bigint: true });
+    const stat = vi.spyOn(fs, "statSync").mockReturnValue(verifiedStat);
+    const fstat = vi.spyOn(fs, "fstatSync").mockReturnValue(verifiedStat);
+    syncBuiltinESMExports();
+    expect(f.store.read(f.ctx)).toEqual(first); // Unchanged readable storage remains valid.
     const corrupted = contents.replace("Durable task", "Corrupt task");
+    expect(corrupted).not.toBe(contents);
     expect(Buffer.byteLength(corrupted)).toBe(Buffer.byteLength(contents));
     writeFileSync(f.file, corrupted);
     expect(() => f.store.read(f.ctx)).toThrow(/unavailable/);
+    expect(f.store.isUnavailable).toBe(true);
     writeFileSync(f.file, contents);
+    expect(() => f.store.read(f.ctx)).toThrow(/unavailable/); // Repair alone does not lift quarantine.
     f.store.reconcile(f.ctx);
-    expect(f.store.read(f.ctx).revision).toBe(1);
+    expect(f.store.read(f.ctx)).toEqual(first);
+    stat.mockRestore();
+    fstat.mockRestore();
+    syncBuiltinESMExports();
     renameSync(f.file, `${f.file}.saved`);
     mkdirSync(f.file);
     expect(() => f.store.read(f.ctx)).toThrow(/unavailable/);

@@ -37,18 +37,11 @@ function persistedConversation(manager: SessionReader, committed: ReadonlySet<st
 }
 
 /** Read-only verification of public JSONL records, never a transaction or native rollback.
- * Unchanged file identities reuse only the disk index, never trust new native memory.
+ * Every inspection scans the bytes: identical metadata cannot prove unchanged content.
  * Scans buffer bounded lines for parsed comparison. Huge records are stream-hashed
  * as native canonical JSON with optional terminal CR, not arbitrary JSON whitespace.
  */
 export class Persistence {
-  private cache?: {
-    manager: SessionReader;
-    path: string;
-    identity: string;
-    header: string;
-    result: Durability;
-  };
   inspect(manager: SessionReader): Durability {
     const path = manager.getSessionFile();
     if (!path) return { kind: "volatile", committed: new Set(), conversation: false, incomplete: false };
@@ -73,18 +66,6 @@ export class Persistence {
       if (!before.isFile()) throw new Error("Todo unavailable: session path is not a regular file.");
       const key = identity(before);
       const headerKey = fingerprint(header);
-      const cached = this.cache;
-      if (
-        cached &&
-        cached.manager === manager &&
-        cached.path === path &&
-        cached.identity === key &&
-        cached.header === headerKey
-      ) {
-        if (identity(statSync(path, { bigint: true })) !== key)
-          throw new Error("Todo unavailable: session file changed during verification.");
-        return { ...cached.result, conversation: persistedConversation(manager, cached.result.committed) };
-      }
       const committed = new Set<string>();
       let headerSeen = false;
       let lineBytes = 0;
@@ -155,7 +136,6 @@ export class Persistence {
         conversation: persistedConversation(manager, committed),
         incomplete: lineBytes > 0,
       };
-      this.cache = { manager, path, identity: key, header: headerKey, result };
       return result;
     } finally {
       closeSync(fd);
