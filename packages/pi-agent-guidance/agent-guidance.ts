@@ -27,20 +27,42 @@ interface Config {
   models?: Record<string, string[]>;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isFileMapping(value: unknown): value is Record<string, string[]> {
+  return (
+    isRecord(value) &&
+    Object.values(value).every((files) => Array.isArray(files) && files.every((file) => typeof file === "string"))
+  );
+}
+
 function loadConfig(agentDir: string): Config {
   const configPath = path.join(agentDir, "agent-guidance.json");
-  if (fs.existsSync(configPath)) {
-    try {
-      return JSON.parse(fs.readFileSync(configPath, "utf-8"));
-    } catch {
-      return {};
+  try {
+    const config: unknown = JSON.parse(fs.readFileSync(configPath, "utf-8").replace(/^\uFEFF/u, ""));
+    if (!isRecord(config)) throw new Error("expected an object");
+    for (const key of ["providers", "models"]) {
+      if (key in config && !isFileMapping(config[key])) throw new Error(`${key} must map names to string arrays`);
     }
+    return {
+      providers: isFileMapping(config.providers) ? config.providers : undefined,
+      models: isFileMapping(config.models) ? config.models : undefined,
+    };
+  } catch (error) {
+    if (isRecord(error) && error.code === "ENOENT") return {};
+    // Configuration is loaded once per extension instance, so invalid bytes
+    // produce one diagnostic, not one warning per model request.
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`agent-guidance: invalid ${configPath}: ${message}; using defaults`);
+    return {};
   }
-  return {};
 }
 
 function globMatch(pattern: string, value: string): boolean {
-  return new RegExp(`^${pattern.replace(/\*/g, ".*")}$`, "i").test(value);
+  const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`^${escaped.replace(/\*/g, ".*")}$`, "i").test(value);
 }
 
 function getCandidateFiles(modelId: string | undefined, provider: string, config: Config): string[] {
@@ -51,7 +73,8 @@ function getCandidateFiles(modelId: string | undefined, provider: string, config
     }
   }
   // Then provider config, then defaults
-  return config.providers?.[provider] ?? PROVIDER_FILES[provider] ?? [];
+  if (config.providers && Object.hasOwn(config.providers, provider)) return config.providers[provider];
+  return Object.hasOwn(PROVIDER_FILES, provider) ? PROVIDER_FILES[provider] : [];
 }
 
 interface ContextFile {
@@ -138,17 +161,30 @@ export default function agentGuidance(pi: ExtensionAPI) {
     for (const dir of directories) {
       for (const filename of candidates) {
         const file = readContextFile(path.join(dir, filename));
-        if (file && shouldLoad(file, contextFiles)) files.push(file);
+        if (file && shouldLoad(file, [...contextFiles, ...files])) files.push(file);
       }
     }
 
     if (files.length === 0) return;
 
-    let append = "\n\n# Provider-Specific Context\n\n";
-    for (const { path: p, content } of files) {
-      append += `## ${p}\n\n${content}\n\n`;
-    }
+    const options = event.systemPromptOptions;
+    const section = "provider_context";
+    const existing = options?.sections?.[section] ?? "";
+    const additions = files
+      .map(({ path: p, content }) => `## ${p}\n\n${content}\n\n`)
+      .filter((text) => !(options ? existing : event.systemPrompt).includes(text));
+    if (additions.length === 0) return;
+    const append = `${existing ? "" : "# Provider-Specific Context\n\n"}${additions.join("")}`;
 
-    return { systemPrompt: event.systemPrompt + append };
+    if (!options) return { systemPrompt: `${event.systemPrompt}\n\n${append}` };
+    // Mutate only our section. Rendering the whole prompt here would force an
+    // opaque replacement, hiding later policy, context, and tool mutations.
+    options.sections ??= {};
+    options.sections[section] = `${existing}${existing && !existing.endsWith("\n\n") ? "\n\n" : ""}${append}`;
+    // Respect a full replacement intentionally installed by an earlier handler.
+    // Structured hosts without a forced prompt remain entirely structured.
+    if (options.forceSystemPrompt !== undefined && !options.forceSystemPrompt.includes(append)) {
+      options.forceSystemPrompt += `\n\n${append}`;
+    }
   });
 }

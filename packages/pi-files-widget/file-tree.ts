@@ -131,13 +131,10 @@ export function buildFileTreeFromPaths(
   directoryMap.set("", root);
   const seenFiles = new Set<string>();
 
-  for (const rawPath of filePaths) {
-    let normalized = rawPath.trim();
+  for (const normalized of filePaths) {
+    // Git -z paths already use '/' on every platform. Backslash and whitespace
+    // are filename bytes, not separators or padding.
     if (!normalized) continue;
-    if (normalized.startsWith("./")) {
-      normalized = normalized.slice(2);
-    }
-    normalized = normalized.replace(/\\/g, "/");
 
     const parts = normalized.split("/").filter(Boolean);
     if (parts.length === 0) continue;

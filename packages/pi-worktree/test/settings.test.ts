@@ -185,6 +185,8 @@ test("runtime serializes saves in invocation order and remains usable after queu
     releaseFirst = resolve;
   });
   const writes: string[] = [];
+  const firstEntered = Promise.withResolvers<void>();
+  const pending: Promise<unknown>[] = [];
   const runtime = createWorktreeSettingsRuntime({
     path: settingsPath,
     home: "/home/alice",
@@ -192,15 +194,25 @@ test("runtime serializes saves in invocation order and remains usable after queu
     operations: {
       write: async (path, data) => {
         writes.push(data);
-        if (writes.length === 1) await firstMayFinish;
+        if (writes.length === 1) {
+          firstEntered.resolve();
+          await firstMayFinish;
+        }
         await writeFile(path, data, { flag: "wx" });
       },
     },
   });
   try {
     const first = runtime.save("/srv/first");
+    pending.push(first);
     const second = runtime.save("/srv/second");
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    pending.push(second);
+    await Promise.race([
+      firstEntered.promise,
+      first.then(() => {
+        throw new Error("First save completed without entering its write barrier");
+      }),
+    ]);
     assert.equal(writes.length, 1);
     releaseFirst();
     await Promise.all([first, second]);
@@ -211,6 +223,7 @@ test("runtime serializes saves in invocation order and remains usable after queu
     });
   } finally {
     releaseFirst();
+    await Promise.allSettled(pending);
     await rm(directory, { recursive: true, force: true });
   }
 });

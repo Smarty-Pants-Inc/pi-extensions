@@ -43,6 +43,7 @@ import {
   assertParentModelRuntimeAvailable,
   parentModelSessionOptions,
 } from "./model-runtime-bridge.js";
+import type { ParentQuestionHandler } from "./parent-questions.js";
 import { shutdownAndDisposeSession } from "./session-lifecycle.js";
 import type { TierThinking } from "./settings.js";
 import type {
@@ -55,7 +56,7 @@ import type {
   SubagentType,
   ThinkingLevel,
 } from "./types.js";
-import { addUsage } from "./usage.js";
+import { addUsage, type LifetimeUsage } from "./usage.js";
 import {
   cleanupWorktree,
   cleanupWorktreeAsync,
@@ -70,6 +71,13 @@ import {
 export type OnAgentComplete = (record: AgentRecord) => void;
 export type OnAgentCreated = (record: AgentRecord) => void;
 export type OnAgentStart = (record: AgentRecord) => void;
+export type OnAgentHandoff = (record: AgentRecord) => void;
+
+/** Optional UI identity captured before submitting asynchronous steering. */
+export interface SteeringIdentity {
+  session: AgentSession;
+  owner?: AgentOwner;
+}
 export type OnAgentCompact = (
   record: AgentRecord,
   info: CompactionInfo,
@@ -314,6 +322,7 @@ interface SpawnArgs {
   prompt: string;
   options: SpawnOptions;
   internalOverride?: InternalAgentConfigOverride;
+  parentQuestion?: ParentQuestionHandler;
 }
 
 export type ManagedSpawnRequest = ProtocolManagedSpawnRequest;
@@ -912,6 +921,8 @@ export interface SpawnOptions {
   /** Named sequential-thread hint for workflow orchestration. */
   thread?: string;
   isBackground?: boolean;
+  /** Explicit clarification routing. Parent mode requires a fresh root background spawn. */
+  supervisorQuestions?: boolean | "parent";
   /**
    * Skip the maxConcurrent queue check for this spawn — start immediately even
    * if the configured concurrency limit would otherwise queue it. Used by the
@@ -1000,6 +1011,20 @@ export type ManagedSpawnPolicy = Pick<
   policyFingerprint?: string;
 };
 
+export type ManagedSpawnCallbacks = Pick<
+  SpawnOptions,
+  | "onToolActivity"
+  | "onTextDelta"
+  | "onSessionCreated"
+  | "onTurnEnd"
+  | "onAssistantUsage"
+  | "onCompaction"
+  | "onSpawned"
+> & {
+  /** Reused thread's actual run boundary, before native steering or prompt. */
+  onResumeStarting?: (record: AgentRecord, startMessageIndex: number) => void;
+};
+
 interface ResumeTerminalSnapshot {
   status: AgentRecord["status"];
   startedAt: number;
@@ -1027,8 +1052,32 @@ export class AgentManager {
   private onCreated?: OnAgentCreated;
   private onStart?: OnAgentStart;
   private onCompact?: OnAgentCompact;
+  private onHandoff?: OnAgentHandoff;
+  /** Only public, fresh foreground waiters hold this one-way capability. */
+  private readonly foregroundWaiters = new Map<string, {
+    record: AgentRecord;
+    promise: Promise<string>;
+    resolve: () => void;
+  }>();
+  /** Native input handlers may await before writing to their session's queue. */
+  private readonly steeringOperations = new Map<AgentRecord, Set<Promise<void>>>();
+  /** Keep UI provenance without changing legacy/public pendingSteers strings. */
+  private readonly acceptedPendingSteers = new WeakMap<string[], Map<number, {
+    owner: AgentOwner | undefined;
+    controller: AbortController | undefined;
+  }>>();
+  private readonly steeringThreadPins = new Map<string, number>();
+  /** An accepted native queue must not leak into a replacement attempt. */
+  private readonly steeringQueuePins = new WeakMap<AgentRecord, AgentSession>();
+  private readonly steeringQueueObservers = new WeakMap<AgentRecord, () => void>();
   private managedSpawns = new Map<string, ManagedSpawnTombstone>();
   private managedKeysById = new Map<string, string>();
+  /** Runtime-only attempt baselines; session lifetime counters never reset. */
+  private readonly managedUsageBaselines = new Map<string, {
+    record: AgentRecord;
+    owner: AgentOwner;
+    usage: LifetimeUsage;
+  }>();
   /** Spawn keys found in unsupported/corrupt persisted tombstones. */
   private managedQuarantinedKeys = new Set<string>();
   /**
@@ -1074,6 +1123,13 @@ export class AgentManager {
   private rememberAgents = true;
   /** Whether spawned agents get `contact_supervisor` (settings). */
   private supervisorQuestions = true;
+  private parentQuestionFactory?: (record: AgentRecord, ctx: ExtensionContext) => ParentQuestionHandler;
+  private parentQuestionAgents = new WeakSet<AgentRecord>();
+
+  /** Package-local root capability; no managed RPC schema or global settings change. */
+  setParentQuestionFactory(factory: (record: AgentRecord, ctx: ExtensionContext) => ParentQuestionHandler): void {
+    this.parentQuestionFactory = factory;
+  }
   /**
    * Descendants spawned so far under each top-level agent, keyed by that
    * agent's id. Cumulative for the branch's lifetime — see the budget check in
@@ -1120,11 +1176,13 @@ export class AgentManager {
     onCompact?: OnAgentCompact,
     onCreated?: OnAgentCreated,
     managedPersistence?: ManagedSpawnPersistence,
+    onHandoff?: OnAgentHandoff,
   ) {
     this.onComplete = onComplete;
     this.onCreated = onCreated;
     this.onStart = onStart;
     this.onCompact = onCompact;
+    this.onHandoff = onHandoff;
     this.managedPersistence = managedPersistence;
     this.maxConcurrent = maxConcurrent;
     // Cleanup completed agents after 10 minutes (but keep sessions for resume)
@@ -1279,10 +1337,20 @@ export class AgentManager {
       !record.detached &&
       !this.removingRecords.has(record.id) &&
       !this.settlingRecords.has(record.id) &&
+      !this.providerPendingRecords.has(record.id) &&
+      !this.recordSessionTeardowns.has(record.id) &&
+      !this.hasPendingSteering(record) &&
       !this.deferredRecordRemovals.has(record.id) &&
       (record.parentAgentId === undefined ||
         this.nestedOwnerValidation(record.parentAgentId) === undefined)
     );
+  }
+
+  private canResumeRecord(record: AgentRecord): boolean {
+    return this.canResumeNested(record) &&
+      !this.resumeControls.has(record.id) &&
+      record.status !== "running" && record.status !== "queued" &&
+      record.session !== undefined;
   }
 
   private clearManagedPersistenceRetry(key: string): void {
@@ -1402,6 +1470,7 @@ export class AgentManager {
     const state: ManagedSpawnState =
       terminalStatus ?? (record.status === "queued" ? "queued" : "running");
     const compactionCount = Math.max(0, Math.floor(record.compactionCount));
+    const usage = this.getManagedUsage(record.id, tombstone.owner);
     const terminal = terminalStatus
       ? {
           status: terminalStatus,
@@ -1414,10 +1483,10 @@ export class AgentManager {
           ...(record.outputFile
             ? { outputFile: record.outputFile.slice(0, MANAGED_PATH_LIMIT) }
             : {}),
-          ...(record.lifetimeUsage.input + record.lifetimeUsage.output > 0
+          ...(usage
             ? {
                 tokenCount: Math.floor(
-                  record.lifetimeUsage.input + record.lifetimeUsage.output,
+                  usage.input + usage.output + usage.cacheWrite,
                 ),
               }
             : {}),
@@ -1584,6 +1653,23 @@ export class AgentManager {
     return recovered;
   }
 
+  /** Fresh per-attempt usage, available only for the current exact live owner. */
+  getManagedUsage(id: string, owner: AgentOwner): LifetimeUsage | undefined {
+    const baseline = this.managedUsageBaselines.get(id);
+    const record = this.agents.get(id);
+    if (!baseline || !record || record.detached || this.disposed ||
+        baseline.record !== record || baseline.owner !== record.owner ||
+        baseline.owner.extension !== owner.extension ||
+        baseline.owner.runId !== owner.runId ||
+        baseline.owner.nodeId !== owner.nodeId ||
+        baseline.owner.attemptId !== owner.attemptId) return undefined;
+    const delta = (component: keyof LifetimeUsage): number => {
+      const value = record.lifetimeUsage[component] - baseline.usage[component];
+      return Number.isFinite(value) ? Math.max(0, value) : 0;
+    };
+    return { input: delta("input"), output: delta("output"), cacheWrite: delta("cacheWrite") };
+  }
+
   getManagedSpawn(spawnKey: string): ManagedSpawnTombstone | undefined {
     const tombstone = this.managedSpawns.get(spawnKey.trim());
     return tombstone ? cloneManagedTombstone(tombstone) : undefined;
@@ -1663,6 +1749,14 @@ export class AgentManager {
     // Legacy in-process callers omitted description before it became required.
     // Normalize that shape to an inert string while rejecting reference values.
     options = { ...options, description: options.description ?? type };
+    if (options.supervisorQuestions !== undefined && typeof options.supervisorQuestions !== "boolean" && options.supervisorQuestions !== "parent") {
+      throw new Error('supervisorQuestions must be boolean or "parent".');
+    }
+    if (options.supervisorQuestions === "parent" &&
+        (options.isBackground !== true || options.parentAgentId !== undefined || options.resumeSessionFile ||
+          options.isolated || getAgentConfig(type)?.isolated || !this.supervisorQuestions || !this.parentQuestionFactory)) {
+      throw new Error('Parent clarification requires a fresh, non-isolated top-level background Agent with supervisor questions enabled. Set run_in_background: true; foreground calls cannot answer while blocked.');
+    }
     // Covers top-level, nested, managed, and queued spawns before allocating a
     // record, consuming a branch budget, or creating an isolation worktree.
     assertNoRawInheritance(
@@ -1791,6 +1885,10 @@ export class AgentManager {
       record.handle = options.reclaimHandle;
     }
     this.agents.set(id, record);
+    // Capture before observers or a synchronous runner can report early usage.
+    if (record.owner) this.managedUsageBaselines.set(id, {
+      record, owner: record.owner, usage: { ...record.lifetimeUsage },
+    });
     if (!record.detached) {
       try {
         this.onCreated?.(record);
@@ -1811,7 +1909,9 @@ export class AgentManager {
       prompt,
       options,
       internalOverride,
+      ...(options.supervisorQuestions === "parent" ? { parentQuestion: this.parentQuestionFactory!(record, ctx) } : {}),
     };
+    if (options.supervisorQuestions === "parent") this.parentQuestionAgents.add(record);
     // Lifecycle observers may synchronously stop or dispose a freshly allocated
     // record. Do not let the normal queue/start path resurrect that decision.
     if (
@@ -1897,16 +1997,7 @@ export class AgentManager {
     ctx: ExtensionContext,
     request: ManagedSpawnRequest,
     policy: ManagedSpawnPolicy,
-    callbacks?: Pick<
-      SpawnOptions,
-      | "onToolActivity"
-      | "onTextDelta"
-      | "onSessionCreated"
-      | "onTurnEnd"
-      | "onAssistantUsage"
-      | "onCompaction"
-      | "onSpawned"
-    >,
+    callbacks?: ManagedSpawnCallbacks,
   ): ManagedSpawnResult {
     if (this.disposed) throw new Error("AgentManager is disposed");
     const normalized = parseManagedSpawnRequest(request);
@@ -1993,6 +2084,9 @@ export class AgentManager {
     const threadKey = thread
       ? `${normalized.owner.runId}\u0000${thread}`
       : undefined;
+    if (threadKey && this.steeringThreadPins.has(threadKey)) {
+      throw new Error(`Managed workflow thread "${thread}" has pending UI steering; retry after it settles.`);
+    }
     if (threadKey && this.managedThreadReservations.has(threadKey)) {
       throw new Error(
         `Managed workflow thread "${thread}" is already running; calls must be sequential.`,
@@ -2009,21 +2103,34 @@ export class AgentManager {
         throw new Error(threadPolicyConflictMessage(thread, identityTier));
       }
       const record = this.agents.get(threadedId);
+      if (record && this.hasPendingSteering(record)) {
+        throw new Error(`Managed workflow thread "${thread}" has pending UI steering; retry after it settles.`);
+      }
       if (
         record?.session &&
         record.status !== "running" &&
         record.status !== "queued" &&
         !record.detached
       ) {
+        // Admission must precede every attempt identity and persistence mutation.
+        // A stopped status alone says nothing about provider/session quiescence.
+        if (!this.canResumeRecord(record)) {
+          throw new Error(`Managed workflow thread "${thread}" is still settling and is not resumable; retry after it settles.`);
+        }
         assertSafeChildSession(
           record.session,
           record.invocation?.inheritContext === true,
         );
         const previousOwner = record.owner;
+        const previousUsageBaseline = this.managedUsageBaselines.get(threadedId);
         const previousInvocation = record.invocation;
         const previousManagedKey = this.managedKeysById.get(threadedId);
         const resumedTier = identityTier ?? previousInvocation?.agentTier;
         record.owner = Object.freeze({ ...normalized.owner });
+        // Owner rotation, not resume start/settlement, is the attempt boundary.
+        this.managedUsageBaselines.set(threadedId, {
+          record, owner: record.owner, usage: { ...record.lifetimeUsage },
+        });
         record.invocation = {
           ...(policy.invocation ?? {}),
           ...(resumedTier === undefined ? {} : { agentTier: resumedTier }),
@@ -2062,11 +2169,16 @@ export class AgentManager {
             this.managedKeysById.delete(threadedId);
           else this.managedKeysById.set(threadedId, previousManagedKey);
           record.owner = previousOwner;
+          if (previousUsageBaseline) this.managedUsageBaselines.set(threadedId, previousUsageBaseline);
+          else this.managedUsageBaselines.delete(threadedId);
           record.invocation = previousInvocation;
           throw error;
         }
         void this.resume(threadedId, normalized.prompt, undefined, {
           isBackground: true,
+          onStarted: () => {
+            void Promise.resolve(callbacks?.onResumeStarting?.(record, record.session!.messages.length)).catch(() => {});
+          },
           onToolActivity: callbacks?.onToolActivity,
           onAssistantUsage: callbacks?.onAssistantUsage,
           onCompaction: callbacks?.onCompaction
@@ -2090,6 +2202,9 @@ export class AgentManager {
         throw new Error(
           `Managed workflow thread "${thread}" is already running; calls must be sequential.`,
         );
+      }
+      if (record && !this.isFullyCleaned(record)) {
+        throw new Error(`Managed workflow thread "${thread}" is still settling and is not resumable; retry after it settles.`);
       }
       if (!record || record.detached || !record.session) {
         this.managedThreads.delete(threadKey!);
@@ -2215,7 +2330,7 @@ export class AgentManager {
   private startAgent(
     id: string,
     record: AgentRecord,
-    { pi, ctx, type, prompt, options, internalOverride }: SpawnArgs,
+    { pi, ctx, type, prompt, options, internalOverride, parentQuestion }: SpawnArgs,
   ) {
     if (this.disposed || record.detached || this.agents.get(id) !== record)
       return;
@@ -2330,7 +2445,8 @@ export class AgentManager {
         // Top-level conversations persist by default so `@handle` has something
         // to reopen after the record is evicted; frontmatter still overrides.
         rememberAgents: this.rememberAgents,
-        supervisorQuestions: this.supervisorQuestions,
+        supervisorQuestions: options.supervisorQuestions ?? this.supervisorQuestions,
+        parentQuestion,
         resumeSessionFile: options.resumeSessionFile,
         toolset: options.toolset,
         excludeTools: options.excludeTools,
@@ -2394,11 +2510,8 @@ export class AgentManager {
             session.sessionManager?.getSessionFile?.() ??
             (session as { sessionFile?: string })?.sessionFile;
           // Flush any steers that arrived before the session was ready
-          if (record.pendingSteers?.length) {
-            for (const msg of record.pendingSteers) {
-              session.steer(msg).catch(() => {});
-            }
-            record.pendingSteers = undefined;
+          for (const pending of this.takePendingSteers(record)) {
+            void this.submitPendingSteer(record, session, pending).catch(() => {});
           }
           options.onSessionCreated?.(session);
         },
@@ -2474,7 +2587,7 @@ export class AgentManager {
           await this.awaitSessionTeardown(session);
           this.cleanupDetachedWorktree(record);
           if (record.session === session) record.session = undefined;
-          if (options.isBackground) {
+          if (record.isBackground) {
             this.releasePoolSlot(record.id);
             this.drainQueue();
           }
@@ -2499,7 +2612,7 @@ export class AgentManager {
           await this.awaitSessionTeardown(session);
           this.cleanupDetachedWorktree(record);
           if (record.session === session) record.session = undefined;
-          if (options.isBackground) {
+          if (record.isBackground) {
             this.releasePoolSlot(record.id);
             this.drainQueue();
           }
@@ -2534,7 +2647,7 @@ export class AgentManager {
 
         // Fire onComplete for foreground agents too — lifecycle symmetry.
         // Mark resultConsumed so the callback skips notifications (result returned inline).
-        if (!options.isBackground) {
+        if (!record.isBackground) {
           record.resultConsumed = true;
           this.notifyComplete(record);
         } else {
@@ -2580,7 +2693,7 @@ export class AgentManager {
         if (record.detached) {
           await this.awaitSessionTeardown(record.session);
           this.cleanupDetachedWorktree(record);
-          if (options.isBackground) {
+          if (record.isBackground) {
             this.releasePoolSlot(record.id);
             this.drainQueue();
           }
@@ -2598,7 +2711,7 @@ export class AgentManager {
         if (record.detached) {
           await this.awaitSessionTeardown(record.session);
           this.cleanupDetachedWorktree(record);
-          if (options.isBackground) {
+          if (record.isBackground) {
             this.releasePoolSlot(record.id);
             this.drainQueue();
           }
@@ -2608,7 +2721,7 @@ export class AgentManager {
 
         // Fire onComplete for foreground agents too — lifecycle symmetry.
         // Mark resultConsumed so the callback skips notifications (result returned inline).
-        if (!options.isBackground) {
+        if (!record.isBackground) {
           record.resultConsumed = true;
           this.notifyComplete(record);
         } else {
@@ -2772,7 +2885,7 @@ export class AgentManager {
     prompt: string,
     options: Omit<SpawnOptions, "isBackground">,
     onSpawned?: (id: string) => void,
-  ): Promise<{ id: string; record: AgentRecord }> {
+  ): Promise<{ id: string; record: AgentRecord; handedOff?: boolean }> {
     return this.spawnAndWaitCore(pi, ctx, type, prompt, options, onSpawned);
   }
 
@@ -2813,7 +2926,7 @@ export class AgentManager {
     options: Omit<SpawnOptions, "isBackground">,
     onSpawned?: (id: string) => void,
     internalOverride?: InternalAgentConfigOverride,
-  ): Promise<{ id: string; record: AgentRecord }> {
+  ): Promise<{ id: string; record: AgentRecord; handedOff?: boolean }> {
     // Temporarily register the onSpawned hook so startAgent can call it.
     const prevOnSpawned = this.onSpawned;
     this.onSpawned = onSpawned;
@@ -2836,8 +2949,69 @@ export class AgentManager {
       this.onSpawned = prevOnSpawned;
     }
     const record = this.agents.get(id)!;
-    await record.promise;
-    return { id, record };
+    if (internalOverride || options.resumeSessionFile || options.parentAgentId !== undefined || (options.depth ?? 1) !== 1 || !record.promise) {
+      await record.promise;
+      return { id, record };
+    }
+    let resolveHandoff!: () => void;
+    const handedOff = new Promise<true>((resolve) => {
+      resolveHandoff = () => resolve(true);
+    });
+    const waiter = { record, promise: record.promise, resolve: resolveHandoff };
+    this.foregroundWaiters.set(id, waiter);
+    try {
+      const transferred = await Promise.race([
+        record.promise.then(() => false),
+        handedOff,
+      ]);
+      return { id, record, ...(transferred ? { handedOff: true } : {}) };
+    } finally {
+      if (this.foregroundWaiters.get(id) === waiter) this.foregroundWaiters.delete(id);
+    }
+  }
+
+  /** A diagnostic suitable for the UI; undefined means transfer is available. */
+  handoffUnavailableReason(id: string): string | undefined {
+    const record = this.agents.get(id);
+    const waiter = this.foregroundWaiters.get(id);
+    if (this.disposed || !record || record.detached || record.status !== "running")
+      return "Agent is no longer running.";
+    if (!waiter || waiter.record !== record || waiter.promise !== record.promise ||
+        record.isBackground !== false || record.owner || record.parentAgentId !== undefined ||
+        (record.depth ?? 1) !== 1 || this.resumeControls.has(id))
+      return "Only a fresh top-level foreground Agent call can be handed off.";
+    if (!record.session || !this.providerPendingRecords.has(id) || record.abortController?.signal.aborted)
+      return "Agent is not ready for handoff or has already settled.";
+    if (this.runningBackground >= this.maxConcurrent)
+      return `Background pool is full (${this.runningBackground}/${this.maxConcurrent}); foreground Agent remains running.`;
+    return undefined;
+  }
+
+  canHandoff(id: string): boolean {
+    return this.handoffUnavailableReason(id) === undefined;
+  }
+
+  /** Transfer the live run, never its provider promise, session or worktree. */
+  handoff(id: string): boolean {
+    if (!this.canHandoff(id)) return false;
+    const waiter = this.foregroundWaiters.get(id)!;
+    const record = waiter.record;
+    // Cut parent cancellation BEFORE releasing its waiter. Explicit child stop
+    // and manager shutdown retain the child's own controller.
+    this.clearParentSignal(id);
+    this.heldPoolSlots.add(id);
+    this.runningBackground++;
+    record.isBackground = true;
+    record.invocation = { ...(record.invocation ?? {}), runInBackground: true };
+    record.resultConsumed = false;
+    this.foregroundWaiters.delete(id);
+    waiter.resolve();
+    try {
+      void Promise.resolve(this.onHandoff?.(record)).catch(() => {});
+    } catch {
+      // This callback observes a committed transfer, never controls it.
+    }
+    return true;
   }
 
   private resumeSnapshot(record: AgentRecord): ResumeTerminalSnapshot {
@@ -2939,15 +3113,12 @@ export class AgentManager {
     if (this.disposed) return undefined;
     const record = this.agents.get(id);
     if (!record) return undefined;
-    if (!this.canResumeNested(record)) return undefined;
+    if (!this.canResumeRecord(record)) return undefined;
     if (signal?.aborted) return record;
-    if (
-      this.resumeControls.has(id) ||
-      record.status === "running" ||
-      record.status === "queued"
-    )
-      return undefined;
     if (!record.session) return undefined;
+    if (this.parentQuestionAgents.has(record) && options?.isBackground !== true) {
+      throw new Error('This child uses parent clarification; resume it with run_in_background: true to avoid blocking the answering model.');
+    }
     assertSafeChildSession(
       record.session,
       record.invocation?.inheritContext === true,
@@ -3124,16 +3295,12 @@ export class AgentManager {
       // sent while it waits must be flushed here rather than through the
       // session's idle steering queue. Otherwise cancelling this queued run
       // would leave those messages behind for a later resume.
-      const pendingSteers = record.pendingSteers;
-      record.pendingSteers = undefined;
-      if (pendingSteers?.length) {
-        for (const message of pendingSteers) {
-          if (control.controller.signal.aborted) break;
-          try {
-            await record.session!.steer(message);
-          } catch {
-            // A malformed or stale queued message must not prevent the resume.
-          }
+      for (const pending of this.takePendingSteers(record)) {
+        if (control.controller.signal.aborted) break;
+        try {
+          await this.submitPendingSteer(record, record.session!, pending);
+        } catch {
+          // A malformed or stale queued message must not prevent the resume.
         }
       }
 
@@ -3221,9 +3388,137 @@ export class AgentManager {
       if (!record.pendingSteers) record.pendingSteers = [];
       record.pendingSteers.push(message);
     } else {
+      this.retireEmptySteeringQueue(record, record.session);
       record.session.steer(message).catch(() => {});
     }
     return true;
+  }
+
+  private takePendingSteers(record: AgentRecord) {
+    const messages = record.pendingSteers;
+    record.pendingSteers = undefined;
+    const accepted = messages ? this.acceptedPendingSteers.get(messages) : undefined;
+    return (messages ?? []).map((message, index) => ({ message, acceptance: accepted?.get(index) }));
+  }
+
+  private async submitPendingSteer(
+    record: AgentRecord,
+    session: AgentSession,
+    pending: ReturnType<AgentManager["takePendingSteers"]>[number],
+  ): Promise<void> {
+    const { message, acceptance } = pending;
+    if (!acceptance) {
+      // Preserve optimistic legacy boolean steering, including its queue lifetime.
+      this.retireEmptySteeringQueue(record, session);
+      await session.steer(message);
+      return;
+    }
+    if (this.disposed || record.detached || this.agents.get(record.id) !== record ||
+        record.status !== "running" || record.session !== session ||
+        record.owner !== acceptance.owner || record.abortController !== acceptance.controller ||
+        acceptance.controller?.signal.aborted) return;
+    await this.steerNativeAccepted(record, session, message);
+  }
+
+  /** Queue provenance ends at an observed empty queue, not at a record's lifetime. */
+  private retireEmptySteeringQueue(record: AgentRecord, session = record.session ?? this.steeringQueuePins.get(record)): void {
+    if (session?.getSteeringMessages?.().length !== 0) return;
+    this.steeringQueuePins.delete(record);
+    // An empty queue cannot release an input handler still awaiting acceptance.
+    // Its eventual native write will establish fresh queue provenance.
+    if (this.steeringOperations.has(record)) return;
+    const unsubscribe = this.steeringQueueObservers.get(record);
+    this.steeringQueueObservers.delete(record);
+    // SDK dispatch visits a live listener array. Retire ownership now, but
+    // defer removal even when a later subscriber reenters the manager.
+    // Capture the old observer so a replacement installed now stays intact.
+    if (unsubscribe) queueMicrotask(unsubscribe);
+  }
+
+  private hasPendingSteering(record: AgentRecord): boolean {
+    this.retireEmptySteeringQueue(record);
+    return this.steeringOperations.has(record) ||
+      (this.steeringQueuePins.get(record)?.getSteeringMessages?.().length ?? 0) > 0;
+  }
+
+  /**
+   * Truthful UI submission. False means stale/inactive identity; native input
+   * rejection propagates to the caller. Queued messages remain manager-owned.
+   * Native steer awaits input handlers BEFORE enqueueing, even if its run ends
+   * meanwhile. Pin both record and managed thread until that await settles;
+   * an accepted queue also pins reuse until the SDK consumes it. Never rewrite
+   * private native queues or clear unrelated legacy callers' messages.
+   */
+  async steerAccepted(id: string, message: string, expected?: SteeringIdentity): Promise<boolean> {
+    const record = this.agents.get(id);
+    if (this.disposed || !record || record.detached ||
+        (record.status !== "running" && record.status !== "queued")) return false;
+    const session = record.session;
+    const owner = record.owner;
+    if ((expected !== undefined && expected.session !== session) ||
+        (expected?.owner !== undefined && (!owner ||
+          expected.owner.extension !== owner.extension || expected.owner.runId !== owner.runId ||
+          expected.owner.nodeId !== owner.nodeId || expected.owner.attemptId !== owner.attemptId))) return false;
+    if (record.status === "queued" || !session) {
+      record.pendingSteers ??= [];
+      let accepted = this.acceptedPendingSteers.get(record.pendingSteers);
+      if (!accepted) {
+        accepted = new Map();
+        this.acceptedPendingSteers.set(record.pendingSteers, accepted);
+      }
+      accepted.set(record.pendingSteers.length, { owner, controller: record.abortController });
+      record.pendingSteers.push(message);
+      return true;
+    }
+    return this.steerNativeAccepted(record, session, message);
+  }
+
+  /** Every accepted native submission, including both queued flushes, owns its await. */
+  private async steerNativeAccepted(record: AgentRecord, session: AgentSession, message: string): Promise<boolean> {
+    this.retireEmptySteeringQueue(record, session);
+    const id = record.id;
+    const owner = record.owner;
+    const promise = record.promise;
+    const controller = record.abortController;
+    const thread = this.managedSpawns.get(this.managedKeyForId(id) ?? "")?.thread;
+    const threadKey = owner && thread ? `${owner.runId}\u0000${thread}` : undefined;
+    let settle!: () => void;
+    const settled = new Promise<void>(resolve => { settle = resolve; });
+    let operations = this.steeringOperations.get(record);
+    if (!operations) {
+      operations = new Set();
+      this.steeringOperations.set(record, operations);
+    }
+    operations.add(settled);
+    if (threadKey) this.steeringThreadPins.set(threadKey, (this.steeringThreadPins.get(threadKey) ?? 0) + 1);
+    try {
+      if (!this.steeringQueueObservers.has(record) && session.subscribe) {
+        this.steeringQueueObservers.set(record, session.subscribe(event => {
+          if (event.type !== "queue_update" || event.steering.length !== 0) return;
+          this.retireEmptySteeringQueue(record, session);
+        }));
+      }
+      const disposition = await session.steer(message);
+      // Handled input writes nothing: a nonempty queue can belong entirely to
+      // legacy steering. Keep existing accepted pins without acquiring one.
+      if (disposition === "queued" && (session.getSteeringMessages?.().length ?? 0) > 0)
+        this.steeringQueuePins.set(record, session);
+      return !this.disposed && !record.detached && this.agents.get(id) === record &&
+        record.session === session && record.owner === owner && record.promise === promise &&
+        record.abortController === controller && record.status === "running";
+    } finally {
+      operations.delete(settled);
+      if (operations.size === 0) this.steeringOperations.delete(record);
+      this.retireEmptySteeringQueue(record, session);
+      if (threadKey) {
+        const pendingThread = this.steeringThreadPins.get(threadKey)! - 1;
+        if (pendingThread > 0) this.steeringThreadPins.set(threadKey, pendingThread);
+        else this.steeringThreadPins.delete(threadKey);
+      }
+      settle();
+      this.retryPinnedWorktreeCleanup();
+      this.retryDeferredRecordRemovals();
+    }
   }
 
   /**
@@ -3398,6 +3693,7 @@ export class AgentManager {
       record.status !== "running" &&
       !this.settlingRecords.has(record.id) &&
       !this.providerPendingRecords.has(record.id) &&
+      !this.hasPendingSteering(record) &&
       !this.recordSessionTeardowns.has(record.id) &&
       record.worktree === undefined &&
       record.outputCleanup === undefined
@@ -3518,6 +3814,7 @@ export class AgentManager {
         this.managedThreadReservations.delete(thread);
       }
       this.agents.delete(id);
+      this.managedUsageBaselines.delete(id);
       return true;
     } finally {
       // The map deletion is the point at which a later continuation becomes an
@@ -3843,6 +4140,14 @@ export class AgentManager {
     const worktree = record.worktree;
     if (!worktree) return undefined;
 
+    // Queue pins guard reuse/eviction, not cwd lifetime. Only native handlers
+    // still executing can touch the checkout after the provider has ended.
+    if (this.steeringOperations.has(record)) {
+      return this.blockedWorktreeCleanup(
+        record,
+        `Worktree cleanup is pinned because native input handling for ${record.id} is still pending`,
+      );
+    }
     if (this.providerPendingRecords.has(record.id)) {
       return this.blockedWorktreeCleanup(
         record,
@@ -3891,6 +4196,12 @@ export class AgentManager {
     const worktree = record.worktree;
     if (!worktree) return undefined;
 
+    if (this.steeringOperations.has(record)) {
+      return this.blockedWorktreeCleanup(
+        record,
+        `Worktree cleanup is pinned because native input handling for ${record.id} is still pending`,
+      );
+    }
     if (this.providerPendingRecords.has(record.id)) {
       return this.blockedWorktreeCleanup(
         record,
@@ -3996,19 +4307,35 @@ export class AgentManager {
       if (this.isFullyCleaned(record)) pendingIds.delete(record.id);
     };
     const deadline = Date.now() + Math.max(0, timeoutMs);
-    const pendingPromises = records
-      .map((record) => record.promise?.then(() => recheck(record)))
-      .filter((promise): promise is Promise<void> => promise !== undefined);
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const allSettled = Promise.allSettled(pendingPromises).then(() => true);
-    const timedOut = new Promise<boolean>((resolve) => {
-      timer = setTimeout(
-        () => resolve(false),
-        Math.max(0, deadline - Date.now()),
-      );
-    });
-    const completed = await Promise.race([allSettled, timedOut]);
-    if (timer) clearTimeout(timer);
+    const observed = new Set<Promise<unknown>>();
+    let completed = true;
+    while (pendingIds.size > 0) {
+      // These exact records own native input awaits independently of their
+      // already-settled provider promises. Recollect after settlement to cover
+      // queued flushes admitted during the wait, using one shared deadline.
+      const pendingPromises: Promise<unknown>[] = [];
+      for (const record of records) {
+        if (!pendingIds.has(record.id)) continue;
+        for (const promise of [record.promise, ...(this.steeringOperations.get(record) ?? [])]) {
+          if (!promise || observed.has(promise)) continue;
+          observed.add(promise);
+          pendingPromises.push(promise);
+        }
+      }
+      if (pendingPromises.length === 0) break;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const allSettled = Promise.allSettled(pendingPromises).then(() => true);
+      const timedOut = new Promise<boolean>((resolve) => {
+        timer = setTimeout(
+          () => resolve(false),
+          Math.max(0, deadline - Date.now()),
+        );
+      });
+      completed = await Promise.race([allSettled, timedOut]);
+      if (timer) clearTimeout(timer);
+      for (const record of records) recheck(record);
+      if (!completed) break;
+    }
 
     let pending = [...pendingIds];
     if (!completed || pending.length > 0) {
@@ -4142,6 +4469,7 @@ export class AgentManager {
     this.clearManagedPersistenceRetries();
     if (this.disposePromise) return this.disposePromise;
     this.disposed = true;
+    this.managedUsageBaselines.clear();
     clearInterval(this.cleanupInterval);
 
     const records = [...this.agents.values()];
@@ -4226,7 +4554,8 @@ export class AgentManager {
     const providerPromises = records
       .map((record) => record.promise)
       .filter((promise): promise is Promise<string> => promise !== undefined);
-    if (providerPromises.length > 0) {
+    const steeringPromises = records.flatMap(record => [...(this.steeringOperations.get(record) ?? [])]);
+    if (providerPromises.length > 0 || steeringPromises.length > 0) {
       let providerTimer: ReturnType<typeof setTimeout> | undefined;
       const providerTimeout = new Promise<void>((resolve) => {
         providerTimer = setTimeout(
@@ -4235,7 +4564,7 @@ export class AgentManager {
         );
       });
       await Promise.race([
-        Promise.allSettled(providerPromises).then(() => undefined),
+        Promise.allSettled([...providerPromises, ...steeringPromises]).then(() => undefined),
         providerTimeout,
       ]);
       if (providerTimer) clearTimeout(providerTimer);
@@ -4332,12 +4661,12 @@ export class AgentManager {
       );
     }
 
-    if (!teardownsSettled && failures.length > 0) {
+    if ((!teardownsSettled || steeringPromises.length > 0) && failures.length > 0) {
       // Do not make host shutdown wait forever for an extension-owned child
       // session. Keep worktrees attached until *both* child teardown and all
-      // providers settle; only then retry cleanup, deepest first. Detached
-      // records cannot publish into a replacement session while this waits.
-      const pending = [...this.sessionTeardowns, ...providerPromises];
+      // providers and native input handlers settle; only then retry cleanup,
+      // deepest first. Detached records cannot publish into a replacement session.
+      const pending = [...this.sessionTeardowns, ...providerPromises, ...steeringPromises];
       void Promise.allSettled(pending)
         .then(async (outcomes) => {
           if (outcomes.some((outcome) => outcome.status === "rejected")) return;

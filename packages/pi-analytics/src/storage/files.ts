@@ -1,6 +1,19 @@
 import { randomUUID } from "node:crypto";
 import { createReadStream, type Dirent } from "node:fs";
-import { chmod, lstat, mkdir, open, readdir, readFile, rename, rm, rmdir, unlink, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  link,
+  lstat,
+  mkdir,
+  open,
+  readdir,
+  readFile,
+  rename,
+  rm,
+  rmdir,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import path from "node:path";
 import type { SettledRun } from "../types.js";
 import { AnalyticsStorageFormatError, decodeStoredRun, encodeStoredRun, MAX_STORED_RUN_BYTES } from "./format.js";
@@ -26,6 +39,7 @@ export class AnalyticsRunFiles {
   private readonly beforeAppend?: (generation: string, signal: AbortSignal) => Promise<void>;
   private readonly beforeCleanupEntry?: (signal?: AbortSignal) => Promise<void>;
   private readonly beforeReadFile?: (signal?: AbortSignal) => Promise<void>;
+  private readonly beforeInitialMarkerWrite?: (signal?: AbortSignal) => Promise<void>;
   private writerId: string;
   private mutationTail: Promise<void> = Promise.resolve();
   private readonly lifecycle = new AbortController();
@@ -39,6 +53,7 @@ export class AnalyticsRunFiles {
       beforeAppend?: (generation: string, signal: AbortSignal) => Promise<void>;
       beforeCleanupEntry?: (signal?: AbortSignal) => Promise<void>;
       beforeReadFile?: (signal?: AbortSignal) => Promise<void>;
+      beforeInitialMarkerWrite?: (signal?: AbortSignal) => Promise<void>;
     } = {},
   ) {
     this.createId = options.createId ?? randomUUID;
@@ -46,6 +61,7 @@ export class AnalyticsRunFiles {
     this.beforeAppend = options.beforeAppend;
     this.beforeCleanupEntry = options.beforeCleanupEntry;
     this.beforeReadFile = options.beforeReadFile;
+    this.beforeInitialMarkerWrite = options.beforeInitialMarkerWrite;
     this.writerId = validCreatedId(this.createId());
   }
 
@@ -180,10 +196,7 @@ export class AnalyticsRunFiles {
         if (!isNodeError(error) || error.code !== "ENOENT") throw error;
         generation = validCreatedId(this.createId());
         throwIfAborted(signal);
-        try {
-          await createPrivateFile(markerPath, `${generation}\n`);
-        } catch (createError) {
-          if (!isNodeError(createError) || createError.code !== "EEXIST") throw createError;
+        if (!(await this.publishInitialGeneration(generation, signal))) {
           generation = await readGenerationMarker(markerPath, signal);
         }
       }
@@ -192,6 +205,26 @@ export class AnalyticsRunFiles {
       if (current === generation) return generation;
     }
     throw new AnalyticsGenerationChangedError();
+  }
+
+  private async publishInitialGeneration(generation: string, signal?: AbortSignal): Promise<boolean> {
+    const temporaryPath = path.join(this.path, `.current.${randomUUID()}.tmp`);
+    await createPrivateFile(temporaryPath, `${generation}\n`, async () => {
+      await this.beforeInitialMarkerWrite?.(signal);
+      throwIfAborted(signal);
+    });
+    try {
+      throwIfAborted(signal);
+      // link is atomic and cannot replace an existing marker. Readers see either
+      // no marker or the complete, synced private file, never an empty UUID.
+      await link(temporaryPath, path.join(this.path, "current"));
+      return true;
+    } catch (error) {
+      if (isNodeError(error) && error.code === "EEXIST") return false;
+      throw error;
+    } finally {
+      await unlink(temporaryPath);
+    }
   }
 
   private async publishGeneration(generation: string): Promise<void> {
@@ -305,13 +338,19 @@ async function assertPrivateRegularFile(filePath: string): Promise<void> {
   if (process.platform !== "win32") await chmod(filePath, 0o600);
 }
 
-async function createPrivateFile(filePath: string, content: string): Promise<void> {
+async function createPrivateFile(filePath: string, content: string, beforeWrite?: () => Promise<void>): Promise<void> {
   const handle = await open(filePath, "wx", 0o600);
   try {
-    await handle.writeFile(content, "utf8");
-    await handle.sync();
-  } finally {
-    await handle.close();
+    try {
+      await beforeWrite?.();
+      await handle.writeFile(content, "utf8");
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+  } catch (error) {
+    await unlink(filePath).catch(() => undefined);
+    throw error;
   }
 }
 

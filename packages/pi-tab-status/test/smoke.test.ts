@@ -11,6 +11,8 @@ test("registers the tab status lifecycle hooks", () => {
     "agent_start",
     "turn_start",
     "tool_call",
+    "tool_execution_start",
+    "tool_execution_end",
     "tool_result",
     "message_update",
     "tool_execution_update",

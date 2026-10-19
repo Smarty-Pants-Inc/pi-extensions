@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { EventEmitter } from "node:events";
+import * as fs from "node:fs";
+import { type FSWatcher, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExecResult } from "@earendil-works/pi-coding-agent";
@@ -13,6 +15,13 @@ import githubPr, {
   runGhPrView,
 } from "../src/github-pr.js";
 import { createMockContext, createMockPi } from "./support.js";
+
+// Keep the OS watcher as the default. Deterministic timer/ownership tests
+// substitute their owned event source; real HEAD smoke tests still use fs.watch.
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return { ...actual, watch: vi.fn(actual.watch) };
+});
 
 type ExecOptions = { cwd?: string; signal?: AbortSignal; timeout?: number };
 type ExecCall = { command: string; args: string[]; options?: ExecOptions };
@@ -459,7 +468,26 @@ test("a one-shot startup status-clear failure still discovers Git, refreshes, an
 });
 
 test("a turn abort during Git discovery still installs the branch watcher and refreshes", async () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
   const { root, headPath } = createGitHeadFixture();
+  const close = vi.fn();
+  const watcher: FSWatcher = Object.assign(new EventEmitter(), {
+    close,
+    ref() {
+      return this;
+    },
+    unref() {
+      return this;
+    },
+  });
+  const installed = deferred<fs.WatchListener<string> | undefined>();
+  const watch = vi
+    .mocked(fs.watch)
+    .mockClear()
+    .mockImplementationOnce((_path, _options, listener) => {
+      installed.resolve(listener);
+      return watcher;
+    });
 
   const mock = createMockPi();
   const gitResult = deferred<ExecResult>();
@@ -497,12 +525,25 @@ test("a turn abort during Git discovery still installs the branch watcher and re
     await waitForMicrotasks(() => prViews === 1, "initial PR refresh after cancelled discovery");
     await waitForMicrotasks(() => (context.statuses.get("github-pr") ?? "").includes("#123"), "initial status");
 
+    // Test session/turn ownership at the installed callback boundary. An initial
+    // status is not a barrier for platform-specific OS notification delivery.
+    const onHeadChange = await installed.promise;
+    assert.ok(onHeadChange);
+    assert.equal(watch.mock.calls.length, 1);
+    assert.equal(watch.mock.calls[0]?.[0], join(root, ".git"));
+    assert.deepEqual(watch.mock.calls[0]?.[1], { persistent: false });
+    assert.equal(watch.mock.results[0]?.value, watcher);
     writeFileSync(headPath, "ref: refs/heads/main\n");
-    await waitFor(() => prViews >= 2, "branch watcher refreshes after turn abort");
-    await waitFor(() => (context.statuses.get("github-pr") ?? "").includes("#456"), "new branch status");
+    onHeadChange("change", "HEAD");
+    assert.equal(context.statuses.get("github-pr"), undefined, "the branch event clears stale status");
+    vi.advanceTimersByTime(100);
+    await waitForMicrotasks(() => prViews === 2, "branch watcher refreshes after turn abort");
+    await waitForMicrotasks(() => (context.statuses.get("github-pr") ?? "").includes("#456"), "new branch status");
   } finally {
     gitResult.resolve(textResult(".git/HEAD\n"));
     await sessionShutdown({}, context.ctx);
+    watch.mockClear();
+    assert.equal(close.mock.calls.length, 1);
   }
 });
 
@@ -1130,7 +1171,7 @@ test("watch installation resolves a nested worktree gitdir when its HEAD changes
   }
 });
 
-test("a headless no-PR request for HEAD A is replaced when HEAD B arrives before discovery", async () => {
+test("headless lifecycle never discovers Git, refreshes PRs, writes status, or arms polling", async () => {
   vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
   const { root, headPath } = createGitHeadFixture();
   const mock = createMockPi();
@@ -1153,16 +1194,17 @@ test("a headless no-PR request for HEAD A is replaced when HEAD B arrives before
   try {
     sessionStart({}, context.ctx);
     await agentEnd({}, context.ctx);
-    assert.equal(prCalls().length, 1);
-    assert.equal(context.statuses.get("github-pr"), undefined);
-    assert.equal(vi.getTimerCount(), 1);
+    assert.equal(prCalls().length, 0);
+    assert.equal(context.statuses.size, 0);
+    assert.equal(vi.getTimerCount(), 0);
     writeFileSync(headPath, "ref: refs/heads/main\n");
     gitResult.resolve(textResult(".git/HEAD\n"));
-    await waitForMicrotasks(() => prCalls().length === 2, "HEAD B no-PR request");
-    await waitForMicrotasks(() => vi.getTimerCount() === 1, "HEAD B poll replaces HEAD A poll");
-    assert.equal(context.statuses.get("github-pr"), undefined);
+    await drainMicrotasks();
     vi.advanceTimersByTime(10_000);
-    await waitForMicrotasks(() => prCalls().length === 3, "headless no-PR polling continues");
+    await agentEnd({}, context.ctx);
+    assert.equal(calls.length, 0);
+    assert.equal(context.statuses.size, 0);
+    assert.equal(vi.getTimerCount(), 0);
   } finally {
     gitResult.resolve(textResult(".git/HEAD\n"));
     await shutdown({}, context.ctx);
@@ -1170,9 +1212,26 @@ test("a headless no-PR request for HEAD A is replaced when HEAD B arrives before
 });
 
 test("agent-end refresh of a pending branch change cancels its debounce without a duplicate gh request", async () => {
-  const realSetTimeout = globalThis.setTimeout;
   vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
   const { root, headPath } = createGitHeadFixture();
+  const close = vi.fn();
+  const watcher: FSWatcher = Object.assign(new EventEmitter(), {
+    close,
+    ref() {
+      return this;
+    },
+    unref() {
+      return this;
+    },
+  });
+  const installed = deferred<fs.WatchListener<string> | undefined>();
+  const watch = vi
+    .mocked(fs.watch)
+    .mockClear()
+    .mockImplementationOnce((_path, _options, listener) => {
+      installed.resolve(listener);
+      return watcher;
+    });
   const mock = createMockPi();
   const calls = installExec(mock, async (command, args) => {
     if (command === "git") return textResult(".git/HEAD\n");
@@ -1196,11 +1255,16 @@ test("agent-end refresh of a pending branch change cancels its debounce without 
     sessionStart({}, context.ctx);
     await waitForMicrotasks(() => (context.statuses.get("github-pr") ?? "").includes("#1"), "initial PR status");
     await waitForMicrotasks(() => vi.getTimerCount() === 1, "initial poll");
+    // Capture the owned listener at installation; rendering/polling alone is not
+    // an OS event-delivery barrier. Real fs.watch is covered by the HEAD smoke test.
+    assert.equal(watch.mock.calls.length, 1);
+    assert.equal(watch.mock.calls[0]?.[0], join(root, ".git"), "the watcher belongs to this session's HEAD");
+    assert.deepEqual(watch.mock.calls[0]?.[1], { persistent: false });
+    assert.equal(watch.mock.results[0]?.value, watcher);
+    const onHeadChange = await installed.promise;
+    assert.ok(onHeadChange);
     writeFileSync(headPath, "ref: refs/heads/main\n");
-    // fs.watch is delivered by the OS rather than by fake JS timers.
-    for (let index = 0; index < 100 && context.statuses.get("github-pr") !== undefined; index += 1) {
-      await new Promise<void>((resolve) => realSetTimeout(resolve, 10));
-    }
+    onHeadChange("change", "HEAD");
     assert.equal(context.statuses.get("github-pr"), undefined, "branch event clears old PR");
     assert.equal(vi.getTimerCount(), 1, "debounced branch refresh replaced the old poll");
     await agentEnd({}, context.ctx);
@@ -1213,8 +1277,12 @@ test("agent-end refresh of a pending branch change cancels its debounce without 
     vi.advanceTimersByTime(9_900);
     await waitForMicrotasks(() => prCalls().length === 3, "poll remains armed");
     await waitForMicrotasks(() => vi.getTimerCount() === 1, "next poll is rescheduled once");
+    assert.equal(prCalls().length, 3, "only one next poll issued a PR request");
+    assert.equal(calls.filter((call) => call.args[0] === "api").length, 3);
   } finally {
     await shutdown({}, context.ctx);
+    watch.mockClear();
+    assert.equal(close.mock.calls.length, 1);
   }
 });
 

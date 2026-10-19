@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.9.0
+### Minor Changes
+
+- 2c7f8f1: Add live, keyboard-controllable workflow inspection with stable run selection, phase and call drill-down, bounded result views, and state-aware pause/resume/stop controls. Retain authoritative observed progress separately from durable journal facts, and preserve named nested-workflow resolution when resuming from controls or provider recovery.
+
+### Patch Changes
+
+- Updated dependencies [2c7f8f1]
+  - @signalridge/pi-subagents-protocol@1.6.0
+
+## 1.8.0
+### Minor Changes
+
+- c2fd867: Buffer and coalesce completed workflow notifications until an owned session is safely idle. Persist context-only results and confirm them on the active branch before acknowledging pending markers, then wake through the ordinary user-message preparation hooks. Fence delivery and admission synchronously at bus-first shutdown and cancel stale handoffs on committed navigation. Validate private, bounded one-use wake admissions at input consumption to reject retired notifications held by earlier async input hooks, with internal command/template expansion disabled.
+  
+  Move keyword arming and standing effort guidance into hidden, turn-local model messages without appending raw reminders to native user text. Preserve queued follow-up and steering guidance through a bounded public context overlay, without changing native persistence, fork selection or editor history. Distinguish standing effort permission from an explicit keyword instead of inventing a user trigger. Preserve images and unrelated reminders, exclude synthetic input, and deny ambiguous or stale preparation admissions. Add real SDK/faux-provider and native user-component regressions for clean rendering, provider guidance, queued and consumed input, overlapping prompts, navigation and reload. The fix applies after updating/reloading the extension; previously persisted tagged user history is not rewritten. Idle and queued arming now use request-local overlays only, preserve repeated literal directive strings verbatim, and remove only legacy extension-owned hidden guidance from public summarization/compaction preparation.
+  
+  Move workflow-authored JavaScript and VM-created callbacks into an owned, plain-JavaScript Node helper while retaining runtime policy, dispatch, state, scheduling, journals, and managed cleanup in the parent. Bound initial evaluation and asynchronous/callback CPU stalls with a local heartbeat, startup deadline, memory/IPC/log limits, and actual-handle TERM/KILL/close ownership. Legitimate agent awaits continue heartbeats; Bun/compiled hosts require Node on PATH and debugger flags remain inherited. Preserve callback error classification, intermediate JS values, synchronous phase/log, shared budgets, replay and one-level nested execution; final results return their validated JSON projection. Drain all accepted native RPC operations and nested frames before helper/frame success, separating callback response settlement from reference-counted execution-context lifetime through accepted RPC descendant chains and cancelling/confirming owned work on failure. Track actual unresolved local promise lifetimes while the root is running, including descendants whose first native call follows a locally suspended promise and a later root-native await. Release completed contexts event-by-event after promise settlement and native response publication, retaining the original parent async-local budget/control attribution without reopening root admission or accepting retired/foreign identities. At root result retire local-only continuations before publication; only accepted native work and its unsettled callbacks retain descendant authority, so ignored pure-JavaScript awaits do not hang successful teardown. Bound live contexts and tracked promises separately from pending callbacks, recycle sequential contexts, and clean them at frame teardown. Add exact delayed-first-RPC, nested private-budget/control, local-only post-root rejection, retained-context capacity, ignored-promise success, and cancellation/native-cleanup/helper-close regressions. Observe ignored native RPC rejections without replacing author promises. Reconstruct intermediate snapshots with workflow-realm built-ins and standard error subclasses, retaining original callback closures. Grant parent-lag watchdog grace only after actual heartbeat progress, with one bounded I/O turn. Keep transient journal retries in accepted-fact order and drain them before terminal success so restored calls cannot regress to running. Add disposable strict-Node regressions for forgotten nested/control helpers, infinite-await cancellation, realm identity, ignored rejections and repeated parent stalls, plus terminal checkpoint/timeout and smoke-equivalent journal recovery. This is not an OS sandbox or a protocol change.
+  
+  Apply journaled terminal recovery before accepted failed-run resume, give checkpoints local attempt identity, record timeout terminal failure after exact-owner quiescence, and union run/per-call tool denials. Rearm owned delivery for every background resume, record per-run batch membership across partial ACK failures, and clear retired provider errors on restart. Sanitize display copies through pi-ui and bound detail viewports while keeping controls reachable. Add disposable-process external-deadline regressions for CPU loops, replay/schema/nesting/cancel/long-await, Node/Bun startup and debugger pause, alongside real SDK summary/compaction and viewport tests.
+
+### Patch Changes
+
+- Updated dependencies [c2fd867]
+  - @signalridge/pi-ui@1.4.0
+
 ## 1.7.5
 ### Patch Changes
 

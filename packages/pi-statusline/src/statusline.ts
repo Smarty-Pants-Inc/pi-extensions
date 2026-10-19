@@ -68,14 +68,21 @@ export default function statusline(pi: ExtensionAPI) {
   let sessionGeneration = 0;
   let menuController = new AbortController();
   let gitStatusRequestId = 0;
-  let activeGitStatusTarget: { cwd: string; generation: number } | undefined;
+  let activeGitStatusTarget: { cwd: string; generation: number; ctx: ExtensionContext } | undefined;
+  let activeFooterRetire: (() => void) | undefined;
   let gitStatusRefreshInFlight = false;
   let gitStatusAbortController: AbortController | undefined;
   let gitStatusDebounceTimer: ReturnType<typeof setTimeout> | undefined;
   let pendingGitStatusRefresh: { cwd: string; generation: number; requestId: number } | undefined;
 
   const refresh = () => runtime.requestRender?.();
-  const ownsRuntime = (ctx: ExtensionContext) => ctx.sessionManager === activeSessionManager;
+  const ownsRuntime = (ctx: ExtensionContext) => {
+    try {
+      return ctx.sessionManager === activeSessionManager;
+    } catch {
+      return false;
+    }
+  };
 
   const updateFooterTurnUsage = (
     message: Parameters<FooterUsageAccumulator["updateMessage"]>[0],
@@ -101,10 +108,46 @@ export default function statusline(pi: ExtensionAPI) {
     gitStatusAbortController?.abort(new DOMException(reason, "AbortError"));
   };
 
-  const isActiveGitStatusTarget = (cwd: string, generation: number) =>
-    activeGitStatusTarget?.cwd === cwd &&
-    activeGitStatusTarget.generation === generation &&
-    generation === sessionGeneration;
+  const retireRuntime = (generation: number) => {
+    if (generation !== sessionGeneration) return;
+    // Invalidate before cleanup: an abort or unsubscribe may synchronously call back.
+    activeGitStatusTarget = undefined;
+    activeSessionManager = undefined;
+    gitStatusRequestId += 1;
+    pendingGitStatusRefresh = undefined;
+    runtime.requestRender = undefined;
+    runtime.gitStatus = undefined;
+    runtime.duplicateExtensions = [];
+    runtime.extensionStatusIconAliases = EMPTY_EXTENSION_STATUS_ICON_ALIASES;
+    for (const cleanup of [
+      clearGitStatusDebounce,
+      () => abortGitStatusRefresh("Statusline owner retired"),
+      () => menuController.abort(new DOMException("Statusline owner retired", "AbortError")),
+    ]) {
+      try {
+        cleanup();
+      } catch {
+        /* independent cleanup must still run */
+      }
+    }
+  };
+
+  const isActiveGitStatusTarget = (cwd: string, generation: number) => {
+    const target = activeGitStatusTarget;
+    if (!target || target.cwd !== cwd || target.generation !== generation || generation !== sessionGeneration)
+      return false;
+    try {
+      if (target.ctx.mode === "tui" && target.ctx.hasUI && target.ctx.sessionManager === activeSessionManager)
+        return true;
+    } catch {
+      // SDK dispose invalidates getters without delivering session_shutdown.
+    }
+    // A live SDK mode rebind precedes our lifecycle handler. Retire only the
+    // captured generation, never a replacement footer or UI.
+    activeFooterRetire?.();
+    retireRuntime(generation);
+    return false;
+  };
 
   const isCurrentGitStatusRequest = (cwd: string, generation: number, requestId: number) =>
     isActiveGitStatusTarget(cwd, generation) && requestId === gitStatusRequestId;
@@ -156,17 +199,22 @@ export default function statusline(pi: ExtensionAPI) {
   };
 
   const installFooter = (ctx: ExtensionContext) => {
+    activeFooterRetire?.();
+    retireRuntime(sessionGeneration);
     const generation = ++sessionGeneration;
     menuController.abort(new DOMException("Statusline session context replaced", "AbortError"));
     menuController = new AbortController();
-    const cwd = ctx.cwd;
+    // Manual commands retain session identity in all modes, without allocating
+    // a terminal owner or performing ambient UI effects for print/RPC.
     activeSessionManager = ctx.sessionManager;
+    if (ctx.mode !== "tui" || !ctx.hasUI) return;
+    const cwd = ctx.cwd;
     rebuildFooterUsage(ctx);
     runtime.homeDir = homedir();
     previewPalettePreset = undefined;
     abortGitStatusRefresh("Statusline session context replaced");
     clearGitStatusDebounce();
-    activeGitStatusTarget = ctx.mode === "tui" ? { cwd, generation } : undefined;
+    activeGitStatusTarget = { cwd, generation, ctx };
     runtime.gitStatus = undefined;
     runtime.duplicateExtensions = [];
     runtime.extensionStatusIconAliases = EMPTY_EXTENSION_STATUS_ICON_ALIASES;
@@ -176,11 +224,17 @@ export default function statusline(pi: ExtensionAPI) {
     runtime.duplicateExtensions = findDuplicateExtensions(installedPackages);
     runtime.extensionStatusIconAliases = buildExtensionStatusIconAliases(installedPackages);
     ctx.ui.setFooter((tui, theme, footerData) => {
+      if (!isActiveGitStatusTarget(cwd, generation)) return { dispose() {}, invalidate() {}, render: () => [] };
       activeTerminal = terminalLifetime(tui);
-      runtime.requestRender = () => tui.requestRender();
+      runtime.requestRender = () => {
+        if (isActiveGitStatusTarget(cwd, generation)) tui.requestRender();
+      };
 
+      let retired = false;
+      const isCurrent = () => !retired && isActiveGitStatusTarget(cwd, generation);
       const refreshFooterGitStatus = () => refreshGitStatus(cwd, generation);
       const branchUnsubscribe = footerData.onBranchChange(() => {
+        if (!isCurrent()) return;
         runtime.gitStatus = undefined;
         abortGitStatusRefresh("Statusline Git branch changed");
         clearGitStatusDebounce();
@@ -188,6 +242,7 @@ export default function statusline(pi: ExtensionAPI) {
         tui.requestRender();
       });
       const clock = setInterval(() => {
+        if (!isCurrent()) return;
         clearGitStatusDebounce();
         refreshFooterGitStatus();
         tui.requestRender();
@@ -195,29 +250,39 @@ export default function statusline(pi: ExtensionAPI) {
       // Pi persists standalone usage without a corresponding extension event.
       // Its append-only leaf is a cheap change signal; getEntries() copies the entire history.
       const usageClock = setInterval(() => {
-        if (!isActiveGitStatusTarget(cwd, generation) || !ownsRuntime(ctx) || !showsUsage()) return;
-        if (refreshStandaloneUsage(ctx)) tui.requestRender();
+        if (!isCurrent() || !showsUsage()) return;
+        try {
+          if (refreshStandaloneUsage(ctx)) tui.requestRender();
+        } catch {
+          retire();
+        }
       }, USAGE_REFRESH_INTERVAL_MS);
 
-      return {
-        dispose() {
-          branchUnsubscribe();
-          clearInterval(clock);
-          clearInterval(usageClock);
-          if (isActiveGitStatusTarget(cwd, generation)) {
-            activeGitStatusTarget = undefined;
-            abortGitStatusRefresh("Statusline footer disposed");
-            clearGitStatusDebounce();
-            pendingGitStatusRefresh = undefined;
-            runtime.gitStatus = undefined;
-            runtime.duplicateExtensions = [];
-            runtime.extensionStatusIconAliases = EMPTY_EXTENSION_STATUS_ICON_ALIASES;
-            runtime.requestRender = undefined;
+      const retire = () => {
+        if (retired) return;
+        retired = true;
+        // Every resource is attempted even if one cleanup operation throws.
+        for (const cleanup of [
+          () => retireRuntime(generation),
+          () => clearInterval(clock),
+          () => clearInterval(usageClock),
+          branchUnsubscribe,
+        ]) {
+          try {
+            cleanup();
+          } catch {
+            /* retirement cannot escape an async callback */
           }
-        },
+        }
+        if (activeFooterRetire === retire) activeFooterRetire = undefined;
+      };
+      activeFooterRetire = retire;
+
+      return {
+        dispose: retire,
         invalidate() {},
         render(width: number): string[] {
-          if (!loaded) return [];
+          if (!isCurrent() || !loaded) return [];
           const config = previewPalettePreset
             ? { ...loaded.config, palettePreset: previewPalettePreset }
             : loaded.config;
@@ -264,14 +329,16 @@ export default function statusline(pi: ExtensionAPI) {
   registerStatuslineCommand(pi, commandOptions);
 
   pi.on("session_start", (_event, ctx) => {
+    activeFooterRetire?.();
+    retireRuntime(sessionGeneration);
     runtime.turnCount = 0;
     runtime.activeTools.clear();
     runtime.isStreaming = false;
     loaded = loadStatuslineSettingsForAgent(agentDir);
     const settingsNotice = consumeStatuslineSettingsNotice();
-    if (settingsNotice) ctx.ui.notify(settingsNotice, "warning");
-    if (loaded.diagnostics.length > 0) {
-      ctx.ui.notify(formatSettingsDiagnostics(loaded), "warning");
+    if (ctx.mode === "tui" && ctx.hasUI) {
+      if (settingsNotice) ctx.ui.notify(settingsNotice, "warning");
+      if (loaded.diagnostics.length > 0) ctx.ui.notify(formatSettingsDiagnostics(loaded), "warning");
     }
     runtime.thinkingLevel = pi.getThinkingLevel();
     installFooter(ctx);
@@ -302,6 +369,7 @@ export default function statusline(pi: ExtensionAPI) {
     // Only quit ends the terminal lifetime; new/resume/fork/reload retire just
     // this session's commands. Mark quit before aborting any pending dialog.
     if (event.reason === "quit" && activeTerminal) activeTerminal.active = false;
+    activeFooterRetire?.();
     sessionGeneration += 1;
     menuController.abort(new DOMException("Statusline session shut down", "AbortError"));
     activeSessionManager = undefined;
@@ -317,8 +385,10 @@ export default function statusline(pi: ExtensionAPI) {
     runtime.extensionStatusIconAliases = EMPTY_EXTENSION_STATUS_ICON_ALIASES;
     footerUsage.reset([]);
     runtime.footerUsage = footerUsage.snapshot();
-    ctx.ui.setFooter(undefined);
-    ctx.ui.setStatus(STATUSLINE_KEY, undefined);
+    if (ctx.mode === "tui" && ctx.hasUI) {
+      ctx.ui.setFooter(undefined);
+      ctx.ui.setStatus(STATUSLINE_KEY, undefined);
+    }
     runtime.requestRender = undefined;
   });
 

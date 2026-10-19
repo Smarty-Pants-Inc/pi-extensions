@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
+import { sanitizeDisplayText } from "@signalridge/pi-ui";
 
 import {
   DEFAULT_BROWSER_HEIGHT,
@@ -249,14 +250,15 @@ function withSymlinkMarker(label: string, node: FileNode, theme: Theme): string 
 }
 
 function formatNodeName(node: FileNode, theme: Theme): string {
-  if (isIgnoredStatus(node.gitStatus)) return withSymlinkMarker(theme.fg("dim", node.name), node, theme);
+  const name = sanitizeDisplayText(node.name);
+  if (isIgnoredStatus(node.gitStatus)) return withSymlinkMarker(theme.fg("dim", name), node, theme);
   if (node.isDirectory) {
-    const label = node.hasChangedChildren ? theme.fg("warning", node.name) : theme.fg("accent", node.name);
+    const label = node.hasChangedChildren ? theme.fg("warning", name) : theme.fg("accent", name);
     const rendered = withSymlinkMarker(label, node, theme);
     return node.loading ? `${rendered}${theme.fg("dim", " ⏳")}` : rendered;
   }
-  if (node.gitStatus) return withSymlinkMarker(theme.fg("warning", node.name), node, theme);
-  return withSymlinkMarker(node.name, node, theme);
+  if (node.gitStatus) return withSymlinkMarker(theme.fg("warning", name), node, theme);
+  return withSymlinkMarker(name, node, theme);
 }
 
 function collapseAllExcept(node: FileNode, keep: Set<FileNode>): void {
@@ -279,6 +281,7 @@ export function createFileBrowser(
   requestRender: () => void,
   projectCwd: string = initialPath,
   observedChangedFiles: ReadonlySet<string> = new Set(),
+  ownerIsCurrent: () => boolean = () => true,
 ): BrowserController {
   const ignored = getIgnoredNames();
 
@@ -288,6 +291,7 @@ export function createFileBrowser(
   let gitStatus = new Map<string, string>();
   let diffStats = new Map<string, DiffStats>();
   let gitBranch = "";
+  let gitFiles: string[] = [];
 
   const viewer = createViewer({ getRoot: () => rootPath, projectCwd }, theme, requestComment);
   const textInput = createTextInputBuffer();
@@ -329,6 +333,13 @@ export function createFileBrowser(
   let rootGeneration = 0;
   let disposed = false;
 
+  function isCurrent(generation = rootGeneration): boolean {
+    if (disposed || generation !== rootGeneration) return false;
+    if (ownerIsCurrent()) return true;
+    dispose();
+    return false;
+  }
+
   const normalizeGitPath = (path: string): string => path.split(sep).join("/");
 
   function refreshLists(): void {
@@ -337,7 +348,7 @@ export function createFileBrowser(
   }
 
   function queueLineCount(node: FileNode, force = false): void {
-    if (disposed || node.isDirectory) return;
+    if (!isCurrent() || node.isDirectory) return;
     if (!force && node.lineCount !== undefined) return;
     if (lineCountPending.has(node.path)) return;
     lineCountPending.add(node.path);
@@ -368,7 +379,7 @@ export function createFileBrowser(
   async function updateLineCount(node: FileNode, generation: number): Promise<void> {
     try {
       const fileStat = await stat(node.path);
-      if (generation !== rootGeneration) return;
+      if (!isCurrent(generation)) return;
       if (fileStat.size > MAX_LINE_COUNT_BYTES) {
         node.lineCount = undefined;
         return;
@@ -379,31 +390,32 @@ export function createFileBrowser(
         return;
       }
       const content = await readFile(node.path, "utf-8");
-      if (generation !== rootGeneration) return;
+      if (!isCurrent(generation)) return;
       const count = content.split("\n").length;
       node.lineCount = count;
       lineCountCache.set(node.path, { size: fileStat.size, mtimeMs: fileStat.mtimeMs, count });
     } catch {
-      if (generation === rootGeneration) node.lineCount = undefined;
+      if (isCurrent(generation)) node.lineCount = undefined;
     }
   }
 
   async function processLineCountBatch(): Promise<void> {
     lineCountTimer = null;
-    if (disposed || !browser.root) return;
+    if (!isCurrent() || !browser.root) return;
     const generation = rootGeneration;
     const batch = lineCountQueue.splice(0, LINE_COUNT_BATCH_SIZE);
     if (batch.length === 0) return;
 
     await Promise.all(
       batch.map(async (node) => {
+        if (!isCurrent(generation)) return;
         await updateLineCount(node, generation);
-        if (generation === rootGeneration) {
+        if (isCurrent(generation)) {
           lineCountPending.delete(node.path);
         }
       }),
     );
-    if (generation !== rootGeneration) return;
+    if (!isCurrent(generation)) return;
 
     updateTreeStats(browser.root);
     browser.stats = getTreeStats(browser.root);
@@ -450,7 +462,7 @@ export function createFileBrowser(
   }
 
   function enqueueScan(node: FileNode, depth: number, force = false): void {
-    if (disposed || depth > MAX_TREE_DEPTH) return;
+    if (!isCurrent() || depth > MAX_TREE_DEPTH) return;
     if (!force && browser.scanState.mode === "safe" && depth > 0) return;
     if ((node.children !== undefined && !incompleteDirectories.has(node)) || node.loading) return;
     if (scanQueued.has(node.path)) return;
@@ -469,7 +481,7 @@ export function createFileBrowser(
   async function scanDirectory(node: FileNode, depth: number, generation: number): Promise<void> {
     try {
       const entries = await readdir(node.path, { withFileTypes: true });
-      if (generation !== rootGeneration) return;
+      if (!isCurrent(generation)) return;
       const sorted = [...entries].sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
 
       if (node.path === rootPath && browser.scanState.mode === "full" && sorted.length >= SAFE_MODE_ENTRY_THRESHOLD) {
@@ -496,7 +508,7 @@ export function createFileBrowser(
 
         if (entry.isDirectory()) {
           const dirRealPath = await realpath(fullPath).catch(() => resolve(fullPath));
-          if (generation !== rootGeneration) return;
+          if (!isCurrent(generation)) return;
           const dirNode: FileNode = browser.nodeByPath.get(fullPath) ?? {
             name: entry.name,
             path: fullPath,
@@ -516,8 +528,8 @@ export function createFileBrowser(
         }
 
         if (entry.isSymbolicLink()) {
-          const pathInfo = await getPathInfo(fullPath, true, () => generation === rootGeneration);
-          if (generation !== rootGeneration) return;
+          const pathInfo = await getPathInfo(fullPath, true, () => isCurrent(generation));
+          if (!isCurrent(generation)) return;
           if (pathInfo.isDirectory) {
             const isCycle = pathInfo.realPath ? hasAncestorRealPath(node, pathInfo.realPath) : false;
             const dirNode: FileNode = browser.nodeByPath.get(fullPath) ?? {
@@ -574,11 +586,11 @@ export function createFileBrowser(
       sortChildren(node);
       incompleteDirectories.delete(node);
     } catch {
-      if (generation === rootGeneration) {
+      if (isCurrent(generation)) {
         node.children ??= [];
       }
     } finally {
-      if (generation === rootGeneration) {
+      if (isCurrent(generation)) {
         node.loading = false;
         scanQueued.delete(node.path);
       }
@@ -587,7 +599,7 @@ export function createFileBrowser(
 
   async function processScanBatch(): Promise<void> {
     scanTimer = null;
-    if (disposed || !browser.root) return;
+    if (!isCurrent() || !browser.root) return;
     const generation = rootGeneration;
     const batch = scanQueue.splice(0, getScanBatchSize());
     if (batch.length === 0) {
@@ -597,8 +609,9 @@ export function createFileBrowser(
     }
 
     for (const item of batch) {
+      if (!isCurrent(generation)) return;
       await scanDirectory(item.node, item.depth, generation);
-      if (generation !== rootGeneration) return;
+      if (!isCurrent(generation)) return;
     }
 
     browser.scanState.pending = scanQueue.length;
@@ -658,12 +671,8 @@ export function createFileBrowser(
 
   function ensureNode(relPath: string, filesystem = false): FileNode | null {
     if (!browser.root) return null;
-    let normalized = filesystem ? relPath : relPath.trim();
+    const normalized = relPath;
     if (!normalized) return null;
-    if (!filesystem && normalized.startsWith("./")) {
-      normalized = normalized.slice(2);
-    }
-    if (!filesystem) normalized = normalizeGitPath(normalized);
     const parts = normalized.split(filesystem ? sep : "/").filter(Boolean);
     if (parts.length === 0) return null;
     if (parts.length - 1 > MAX_TREE_DEPTH) return null;
@@ -759,17 +768,57 @@ export function createFileBrowser(
   }
 
   function refreshMetadata(): void {
-    if (!browser.root) return;
+    if (!isCurrent() || !browser.root) return;
     const previousDisplayList = getDisplayList();
     const currentPath = previousDisplayList[browser.selectedIndex]?.node.path;
     const viewingFile = viewer.getFile();
-    const viewingFilePath = viewingFile?.path;
+    let viewingFilePath = viewingFile?.path;
 
     if (repo) {
       gitStatus = getGitStatus(rootPath);
       diffStats = getGitDiffStats(rootPath);
-      applyGitUpdates();
-      addUntrackedNodes();
+      const nextBranch = getGitBranch(rootPath);
+      const nextFiles = getGitFileList(rootPath);
+      if (nextBranch !== gitBranch || JSON.stringify(nextFiles) !== JSON.stringify(gitFiles)) {
+        if (nextBranch !== gitBranch) {
+          // A source-selection snapshot from another branch cannot submit a
+          // comment against the replacement branch, even at the same path.
+          viewer.close();
+          viewingFilePath = undefined;
+        }
+        // Retire scan/count work before replacing nodes, even at the same root.
+        rootGeneration += 1;
+        stopBackgroundTasks();
+        scanQueue.length = 0;
+        scanQueued.clear();
+        lineCountQueue.length = 0;
+        lineCountPending.clear();
+        browser.scanState.isScanning = false;
+        browser.scanState.pending = 0;
+        const previousNodes = new Map(browser.nodeByPath);
+        browser.root = buildFileTreeFromPaths(
+          rootPath,
+          nextFiles,
+          gitStatus,
+          diffStats,
+          ignored,
+          agentModifiedFiles,
+          observedChangedFiles,
+        );
+        indexNodes(browser.root, browser.nodeByPath);
+        for (const node of browser.nodeByPath.values()) {
+          if (node.isDirectory) {
+            node.expanded = previousNodes.get(node.path)?.expanded ?? node.expanded;
+            if (node.expanded && node.children === undefined) enqueueScan(node, getNodeDepth(node, rootPath), true);
+          }
+        }
+        queueLineCountsForTree(browser.root);
+      } else {
+        applyGitUpdates();
+        addUntrackedNodes();
+      }
+      gitBranch = nextBranch;
+      gitFiles = nextFiles;
     }
 
     // Session-observed writes can create files after a non-Git scan finished.
@@ -801,11 +850,14 @@ export function createFileBrowser(
           newNode.lineCount = viewingFile.lineCount;
         }
         viewer.updateFileRef(newNode);
+      } else {
+        viewer.close();
       }
     }
   }
 
   function loadRoot(newRoot: string): void {
+    if (!isCurrent()) return;
     rootGeneration += 1;
     rootPath = resolve(newRoot);
 
@@ -813,11 +865,12 @@ export function createFileBrowser(
     gitStatus = repo ? getGitStatus(rootPath) : new Map<string, string>();
     diffStats = repo ? getGitDiffStats(rootPath) : new Map<string, DiffStats>();
     gitBranch = repo ? getGitBranch(rootPath) : "";
+    gitFiles = repo ? getGitFileList(rootPath) : [];
 
     const newRootNode: FileNode = repo
       ? buildFileTreeFromPaths(
           rootPath,
-          getGitFileList(rootPath),
+          gitFiles,
           gitStatus,
           diffStats,
           ignored,
@@ -953,8 +1006,8 @@ export function createFileBrowser(
 
   function renderBrowser(width: number): string[] {
     const lines: string[] = [];
-    const pathDisplay = formatRootPath(rootPath);
-    const branchDisplay = gitBranch ? theme.fg("accent", ` (${gitBranch})`) : "";
+    const pathDisplay = sanitizeDisplayText(formatRootPath(rootPath));
+    const branchDisplay = gitBranch ? theme.fg("accent", ` (${sanitizeDisplayText(gitBranch)})`) : "";
     const stats = browser.stats;
 
     let statsDisplay = "";
@@ -1191,7 +1244,7 @@ export function createFileBrowser(
 
   return {
     render(width: number): string[] {
-      if (disposed) return [];
+      if (!isCurrent()) return [];
       width = Math.max(1, width);
       const now = Date.now();
       if (now - browser.lastPollTime > POLL_INTERVAL_MS) {
@@ -1207,7 +1260,7 @@ export function createFileBrowser(
     },
 
     handleInput(data: string): void {
-      if (disposed) return;
+      if (!isCurrent()) return;
       if (viewer.isOpen()) {
         handleViewerInput(data);
       } else {

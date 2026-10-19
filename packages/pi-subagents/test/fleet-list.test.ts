@@ -1,5 +1,5 @@
 import { Editor, visibleWidth } from "@earendil-works/pi-tui";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentManager } from "../src/agent-manager.js";
 import type { AgentRecord } from "../src/types.js";
 import { getDisplayName } from "../src/ui/agent-display.js";
@@ -40,7 +40,10 @@ function fakeManager(agents: AgentRecord[]): AgentManager {
   return {
     listAgentsMutable: () => agents,
     abort: () => true,
-    steer: vi.fn(() => true),
+    steerAccepted: vi.fn(async () => true),
+    canHandoff: vi.fn(() => false),
+    handoff: vi.fn(() => true),
+    handoffUnavailableReason: vi.fn(() => "Background pool is full"),
   } as unknown as AgentManager;
 }
 
@@ -49,7 +52,7 @@ interface Harness {
   ui: FleetUICtx;
   manager: AgentManager;
   /** The overlay component (a real ConversationViewer) once one is opened. */
-  overlayComponent: () => { handleInput(data: string): void } | undefined;
+  overlayComponent: () => { handleInput(data: string): void; render(width: number): string[] } | undefined;
   /** Feed a key to the registered input handler; returns the consume result. */
   press: (data: string) => { consume?: boolean } | undefined;
   /** Render the currently-registered below-editor widget at the given width. */
@@ -61,9 +64,12 @@ interface Harness {
   overlayClosed: () => boolean;
   /** Simulate the viewer closing itself (Esc → done); flushes the close microtask. */
   closeOverlay: () => Promise<void>;
-  /** The fake `tui` handed to the widget factory; tests set `focusedComponent` on it. */
-  widgetTui: { requestRender(): void; focusedComponent?: unknown };
+  setFocus(component: unknown): void;
+  invalidate(): void;
 }
+
+const fleets: FleetList[] = [];
+afterEach(() => { for (const fleet of fleets.splice(0)) fleet.dispose(); });
 
 function harness(agents: AgentRecord[]): Harness {
   let inputHandler: ((data: string) => { consume?: boolean } | undefined) | undefined;
@@ -72,11 +78,13 @@ function harness(agents: AgentRecord[]): Harness {
   let opened = false;
   let closed = false;
   let overlayDone: ((r: undefined) => void) | undefined;
-  let overlayComponent: { handleInput(data: string): void } | undefined;
-  const fakeTui = { requestRender: () => {}, terminal: { columns: 120, rows: 40 } };
+  let overlayComponent: { handleInput(data: string): void; render(width: number): string[] } | undefined;
+  let focused: unknown;
+  const fakeTui = { requestRender: () => {}, terminal: { columns: 120, rows: 40 }, getFocusedComponent: () => focused };
+  let mounted: { render(w: number): string[]; invalidate(): void } | undefined;
 
   const ui: FleetUICtx = {
-    setWidget: (_key, content) => { widgetFactory = content as any; },
+    setWidget: (_key, content) => { widgetFactory = content as any; mounted = undefined; },
     onTerminalInput: (h) => { inputHandler = h; return () => { inputHandler = undefined; }; },
     getEditorText: () => editorText,
     notify: () => {},
@@ -94,6 +102,7 @@ function harness(agents: AgentRecord[]): Harness {
 
   const manager = fakeManager(agents);
   const fleet = new FleetList(manager, new Map());
+  fleets.push(fleet);
   fleet.setUICtx(ui);
   fleet.update();
 
@@ -103,12 +112,16 @@ function harness(agents: AgentRecord[]): Harness {
     manager,
     overlayComponent: () => overlayComponent,
     press: (data) => inputHandler?.(data),
-    render: (width = 120) => (widgetFactory ? widgetFactory(fakeTui, theme).render(width) : []),
+    render: (width = 120) => {
+      mounted ??= widgetFactory?.(fakeTui, theme) as typeof mounted;
+      return mounted?.render(width) ?? [];
+    },
     setEditorText: (t) => { editorText = t; },
     overlayOpened: () => opened,
     overlayClosed: () => closed,
     closeOverlay: async () => { overlayDone?.(undefined); await Promise.resolve(); },
-    widgetTui: fakeTui,
+    setFocus: component => { focused = component; },
+    invalidate: () => mounted?.invalidate(),
   };
 }
 
@@ -267,7 +280,7 @@ describe("FleetList vs other focused components (#123)", () => {
 
   /** Hand the fleet list its `tui` (happens on first widget render in pi) with the given focus. */
   function focusInHarness(h: Harness, focused: unknown): void {
-    h.widgetTui.focusedComponent = focused;
+    h.setFocus(focused);
     h.render();
   }
 
@@ -289,16 +302,76 @@ describe("FleetList vs other focused components (#123)", () => {
     expect(h.render().some(l => l.includes("← agents"))).toBe(true);
   });
 
+  it("keeps selectors in ownership across mounted widget invalidation without waiting for a tick", () => {
+    const h = harness([makeRecord()]);
+    focusInHarness(h, realEditor());
+    h.press(DOWN);
+    h.setFocus({ render: () => [] });
+    h.invalidate();
+    for (const key of [DOWN, UP, LEFT, ENTER, ESC]) expect(h.press(key)).toBeUndefined();
+  });
+
   it("still activates when the prompt editor has focus", () => {
     const h = harness([makeRecord()]);
     focusInHarness(h, realEditor());
     expect(h.press(DOWN)).toEqual({ consume: true });
   });
 
+  it.each([DOWN, LEFT])("activates and navigates under a non-inheriting custom editor (#374): %j", (activator) => {
+    const h = harness([makeRecord({ description: "one" }), makeRecord({ id: "a2", description: "two" })]);
+    const customEditor = {
+      render: () => [], invalidate: () => {}, handleInput: () => {},
+      getText: () => "", setText: () => {},
+    };
+    expect(customEditor).not.toBeInstanceOf(Editor);
+    focusInHarness(h, customEditor);
+    expect(h.press(activator)).toEqual({ consume: true });
+    expect(h.press(DOWN)).toEqual({ consume: true });
+    expect(h.render().find(l => l.includes("one"))).toContain("<accent>");
+    h.press(DOWN);
+    expect(h.render().find(l => l.includes("two"))).toContain("<accent>");
+    expect(h.press(UP)).toEqual({ consume: true });
+    expect(h.press(ENTER)).toEqual({ consume: true });
+    expect(h.overlayOpened()).toBe(true);
+    h.fleet.dispose();
+  });
+
+  it("preserves typing with a non-empty custom editor", () => {
+    const h = harness([makeRecord()]);
+    focusInHarness(h, { getText: () => "typed", setText: () => {} });
+    h.setEditorText("typed");
+    expect(h.press(DOWN)).toBeUndefined();
+    expect(h.press(LEFT)).toBeUndefined();
+    h.fleet.dispose();
+  });
+
+  it.each([
+    { render: () => [], invalidate: () => {}, handleInput: () => {} },
+    { getText: () => "" },
+    { setText: () => {} },
+    { getText: "", setText: () => {} },
+    { getText: () => "", setText: "" },
+  ])("does not steal keys from selectors or incomplete editor contracts (#374): %j", (component) => {
+    const h = harness([makeRecord()]);
+    focusInHarness(h, { getText: () => "", setText: () => {} });
+    expect(h.press(DOWN)).toEqual({ consume: true });
+    focusInHarness(h, component);
+    for (const key of [DOWN, LEFT, UP, ENTER, ESC]) expect(h.press(key)).toBeUndefined();
+    expect(h.render().some(l => l.includes("← agents"))).toBe(true);
+    h.fleet.dispose();
+  });
+
   it("assumes the editor when focus is unknowable (no tui yet / nothing focused)", () => {
     const h = harness([makeRecord()]);
     // No render yet → the list has never seen a tui: activation must still work.
     expect(h.press(DOWN)).toEqual({ consume: true });
+    h.press(ESC);
+    for (const focused of [undefined, null]) {
+      focusInHarness(h, focused);
+      expect(h.press(DOWN)).toEqual({ consume: true });
+      h.press(ESC);
+    }
+    h.fleet.dispose();
   });
 });
 
@@ -410,7 +483,40 @@ describe("FleetList overlay lifecycle", () => {
     expect(h.render().find(l => l.includes("three"))).not.toContain("<accent>");
   });
 
-  it("wires the viewer's steer composer to manager.steer with the agent id", () => {
+  it("opens the selected identity when an earlier linger expires just before Enter", () => {
+    const now = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    const agents = [
+      makeRecord({ id: "old", startedAt: 1, status: "completed", completedAt: now - 3999 }),
+      makeRecord({ id: "wanted", startedAt: 2 }),
+      makeRecord({ id: "wrong", startedAt: 3 }),
+    ];
+    const h = harness(agents);
+    h.press(DOWN); h.press(DOWN); h.press(DOWN);
+    vi.mocked(Date.now).mockReturnValue(now + 2);
+    h.press(ENTER);
+    h.overlayComponent()!.handleInput(ENTER);
+    for (const ch of "draft") h.overlayComponent()!.handleInput(ch);
+    h.overlayComponent()!.handleInput(ENTER);
+    expect(h.manager.steerAccepted).toHaveBeenCalledWith("wanted", "draft", { session: agents[0].session, owner: undefined });
+    vi.restoreAllMocks();
+  });
+
+  it("recovers after a synchronous opener error and does not remount after disposal", async () => {
+    const h = harness([makeRecord()]);
+    const original = h.ui.custom;
+    h.ui.custom = () => { throw new Error("open failed"); };
+    h.press(DOWN); h.press(DOWN); h.press(ENTER);
+    expect(h.press(DOWN)).toEqual({ consume: true });
+    h.ui.custom = original;
+    h.press(ENTER);
+    expect(h.overlayOpened()).toBe(true);
+    h.fleet.dispose();
+    await Promise.resolve();
+    expect(h.render()).toEqual([]);
+  });
+
+  it("wires the viewer's steer composer to accepted steering with the captured session", () => {
     const agents = [makeRecord({ id: "live", description: "the one" })];
     const h = harness(agents);
     h.press(DOWN);  // activate (main)
@@ -423,7 +529,7 @@ describe("FleetList overlay lifecycle", () => {
     for (const ch of "go left") viewer!.handleInput(ch);
     viewer!.handleInput("\r");                       // Enter → send
 
-    expect(h.manager.steer).toHaveBeenCalledWith("live", "go left");
+    expect(h.manager.steerAccepted).toHaveBeenCalledWith("live", "go left", { session: agents[0].session, owner: undefined });
   });
 
   it("does NOT auto-close when the viewed agent finishes (final output stays readable)", () => {
@@ -438,6 +544,17 @@ describe("FleetList overlay lifecycle", () => {
     h.fleet.onAgentFinished("live");
     expect(h.overlayClosed()).toBe(false);                          // viewer stays open
     expect(h.render().some(l => l.includes("the one"))).toBe(true); // and stays listed while viewed
+  });
+
+  it("retains the known completed outcome when the manager evicts its record while viewing", () => {
+    const agents = [makeRecord({ id: "final" })];
+    const h = harness(agents);
+    h.press(DOWN); h.press(DOWN); h.press(ENTER);
+    agents[0].status = "completed";
+    agents[0].completedAt = Date.now();
+    expect(h.overlayComponent()!.render(200).join("\n")).toContain("completed");
+    agents.splice(0);
+    expect(h.overlayComponent()!.render(200).join("\n")).toContain("completed");
   });
 
   it("lingers a finished agent in the list, then drops it after the window", () => {

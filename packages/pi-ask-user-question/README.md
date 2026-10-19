@@ -39,6 +39,8 @@ In TUI mode the tool opens a centered overlay with a visible top and bottom Pi b
 
 RPC mode uses Pi's abortable sequential `select` and `input` requests instead of `custom`, including multi-select and Back where the RPC UI supports repeated selections. Other answers use single-line input in RPC; TUI keeps its multiline editor. Print mode and contexts without UI return a structured cancellation without opening a dialog.
 
+Other answers are stored without display sanitization: multiline text, leading/trailing spaces, and emoji joiners are retained. Responses over 4,000 UTF-16 code units are explicitly rejected for correction, never silently clipped. TUI stores the public editor's expanded draft; Pi's editor itself normalizes tabs to spaces and CR/CRLF to LF before exposing that draft. RPC stores the returned input string unchanged. Labels and question text are sanitized only as display copies. UI failures return `ui_error` with completed partial answers; cancellation and abort remain distinct.
+
 The tool is registered with `executionMode: "sequential"`, so two question dialogs cannot overlap.
 
 ## Development

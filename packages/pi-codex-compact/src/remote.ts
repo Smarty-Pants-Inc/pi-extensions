@@ -23,6 +23,7 @@ export interface RemoteCompactionRequest {
   signal: AbortSignal;
   priorCheckpoint?: PriorCheckpointPayload;
   validatePayload?: (payload: unknown) => boolean;
+  isCurrent?: () => boolean;
   requestTimeoutMs?: number;
   maxRetries?: number;
   fetch?: typeof globalThis.fetch;
@@ -103,6 +104,7 @@ async function performRemoteCompaction(request: RemoteCompactionRequest): Promis
   const inspections: Promise<{ ok: true; value: CollectedCompaction } | { ok: false; error: unknown }>[] = [];
   const baseFetch = request.fetch ?? globalThis.fetch;
   const inspectedFetch: typeof globalThis.fetch = async (input, init) => {
+    if (request.signal.aborted || request.isCurrent?.() === false) throw abortError();
     const signal = init?.signal ? AbortSignal.any([request.signal, init.signal]) : request.signal;
     const response = await baseFetch(input, { ...init, signal });
     if (signal.aborted) {
@@ -145,6 +147,7 @@ async function performRemoteCompaction(request: RemoteCompactionRequest): Promis
       maxRetries: request.maxRetries ?? 2,
       fetch: inspectedFetch,
       onPayload: (payload) => {
+        if (request.signal.aborted || request.isCurrent?.() === false) throw abortError();
         if (request.validatePayload && !request.validatePayload(payload)) {
           throw new CodexCompactionProtocolError("Compaction tool declarations differ from the observed request");
         }

@@ -10,8 +10,8 @@
  * npm keeps serving the old code while the repository looks current. That gap
  * is invisible until someone installs the package. This closes it.
  *
- * "Published files" means what the manifest's `files` array actually ships,
- * which is the only definition that matters to an installer. Tests, tsconfig,
+ * "Published files" includes the manifest's `files` array and npm's implicit
+ * manifest/readme/license/main/bin entries. Tests, tsconfig,
  * and CI edits change the repository without changing the artifact, so they are
  * deliberately not a reason to demand a version.
  *
@@ -31,6 +31,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import semver from "semver";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const packagesRoot = resolve(root, "packages");
@@ -88,15 +89,37 @@ function resolveBase() {
  * matches once the directory form ends in a separator.
  */
 function publishedPrefixes(directory, manifest) {
-  const entries = (Array.isArray(manifest.files) && manifest.files.length > 0 ? manifest.files : ["."]).filter(
+  const entries = (Array.isArray(manifest.files) ? manifest.files : ["."]).filter(
     (entry) => !RELEASE_GENERATED.has(entry.replace(/^\.\//u, "")),
   );
-  return entries.map((entry) => {
+  const implicit = [
+    "package.json",
+    ...new Set(
+      [
+        ...readdirSync(resolve(packagesRoot, directory)),
+        ...changedFiles
+          .filter((file) => file.startsWith(`packages/${directory}/`))
+          .map((file) => file.slice(`packages/${directory}/`.length))
+          .filter((file) => !file.includes("/")),
+      ].filter((name) => /^(?:readme|licen[cs]e|copying)(?:\..*)?$/iu.test(name)),
+    ),
+  ];
+  for (const entry of [
+    manifest.main,
+    ...(typeof manifest.bin === "string" ? [manifest.bin] : Object.values(manifest.bin ?? {})),
+  ]) {
+    if (typeof entry === "string" && !entry.startsWith("../") && !entry.startsWith("/")) implicit.push(entry);
+  }
+  return [...new Set([...entries, ...implicit])].map((entry) => {
     const normalized = entry.replace(/^\.\//, "").replace(/\/+$/, "");
-    const full = `packages/${directory}/${normalized}`;
+    const packagePrefix = `packages/${directory}/`;
+    if (normalized === "" || normalized === ".") return packagePrefix;
+    const full = `${packagePrefix}${normalized}`;
     const onDisk = resolve(root, full);
-    const isDirectory = existsSync(onDisk) && statSync(onDisk).isDirectory();
-    return isDirectory || normalized === "" ? `${full}/` : full;
+    const isDirectory =
+      (existsSync(onDisk) && statSync(onDisk).isDirectory()) ||
+      tryGit(["cat-file", "-t", `${mergeBase}:${full}`]) === "tree";
+    return isDirectory ? `${full}/` : full;
   });
 }
 
@@ -131,7 +154,7 @@ const mergeBase = tryGit(["merge-base", base, "HEAD"]) ?? base;
 // a changeset has not reached a commit yet, and that is exactly when saying so
 // is useful. On CI the tree is clean, so this is the commit diff.
 const changedFiles = [
-  ...git(["diff", "--name-only", mergeBase]).split("\n"),
+  ...git(["diff", "--no-renames", "--name-only", mergeBase]).split("\n"),
   ...git(["ls-files", "--others", "--exclude-standard"]).split("\n"),
 ].filter((line) => line.length > 0);
 
@@ -142,6 +165,138 @@ if (changedFiles.length === 0) {
 
 const released = releasedPackages();
 const missing = [];
+const consumedChangesets = git([
+  "diff",
+  "--no-renames",
+  "--name-only",
+  "--diff-filter=D",
+  mergeBase,
+  "--",
+  ".changeset",
+])
+  .split("\n")
+  .filter((file) => /^\.changeset\/[^/]+\.md$/u.test(file) && !file.endsWith("/README.md"));
+const consumedPackages = new Set(
+  consumedChangesets.flatMap((file) => {
+    const text = tryGit(["show", `${mergeBase}:${file}`]) ?? "";
+    const frontmatter = /^---\r?\n([\s\S]*?)\r?\n---/u.exec(text)?.[1] ?? "";
+    return [...frontmatter.matchAll(/^\s*["']?(@?[^"':\s]+)["']?\s*:\s*(?:major|minor|patch)\s*$/gmu)].map(
+      (match) => match[1],
+    );
+  }),
+);
+
+function stableJson(value) {
+  if (Array.isArray(value)) return value.map(stableJson);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([key, entry]) => [key, stableJson(entry)]),
+    );
+  }
+  return value;
+}
+
+const releaseCandidates = new Map();
+
+/** Validate local edits before proving the consumed-release dependency graph. */
+function releaseCandidate(file, directory, after) {
+  if (releaseCandidates.has(after.name)) return releaseCandidates.get(after.name);
+  releaseCandidates.set(after.name, undefined);
+  const source = tryGit(["show", `${mergeBase}:${file}`]);
+  if (source === undefined) return undefined;
+  let before;
+  try {
+    before = JSON.parse(source);
+  } catch {
+    return undefined;
+  }
+  const old = structuredClone(before);
+  const next = structuredClone(after);
+  let generated = false;
+  const dependencies = new Map();
+  if (old.version !== next.version) {
+    const changelog = `packages/${directory}/CHANGELOG.md`;
+    if (
+      !semver.valid(old.version) ||
+      !semver.valid(next.version) ||
+      !semver.gt(next.version, old.version) ||
+      !changedFiles.includes(changelog) ||
+      !existsSync(resolve(root, changelog))
+    )
+      return undefined;
+    if (!readFileSync(resolve(root, changelog), "utf8").split(/\r?\n/u).includes(`## ${next.version}`))
+      return undefined;
+    next.version = old.version;
+    generated = true;
+  }
+  for (const section of ["dependencies", "optionalDependencies", "peerDependencies", "devDependencies"]) {
+    for (const [name, range] of Object.entries(next[section] ?? {})) {
+      const previous = old[section]?.[name];
+      if (range === previous) continue;
+      const target = readdirSync(packagesRoot).find((candidate) => {
+        const path = resolve(packagesRoot, candidate, "package.json");
+        return existsSync(path) && JSON.parse(readFileSync(path, "utf8")).name === name;
+      });
+      if (!target || typeof range !== "string" || typeof previous !== "string") return undefined;
+      const targetFile = `packages/${target}/package.json`;
+      const targetBefore = tryGit(["show", `${mergeBase}:${targetFile}`]);
+      if (!targetBefore) return undefined;
+      const oldTarget = JSON.parse(targetBefore);
+      const newTarget = JSON.parse(readFileSync(resolve(root, targetFile), "utf8"));
+      const workspace = previous.startsWith("workspace:") ? "workspace:" : "";
+      const previousRange = previous.slice(workspace.length);
+      const match = /^([~^]?)(.+)$/u.exec(previousRange);
+      if (
+        !match ||
+        !semver.valid(match[2]) ||
+        !semver.valid(oldTarget.version) ||
+        !semver.valid(newTarget.version) ||
+        !semver.gt(newTarget.version, oldTarget.version) ||
+        !semver.lte(match[2], oldTarget.version) ||
+        range !== `${workspace}${match[1]}${newTarget.version}`
+      )
+        return undefined;
+      next[section][name] = previous;
+      dependencies.set(name, { file: targetFile, directory: target, after: newTarget });
+      generated = true;
+    }
+  }
+  if (!generated || JSON.stringify(stableJson(old)) !== JSON.stringify(stableJson(next))) return undefined;
+  const candidate = { name: after.name, anchored: consumedPackages.has(after.name), dependencies };
+  releaseCandidates.set(after.name, candidate);
+  return candidate;
+}
+
+/** Every reachable candidate, including cyclic components, must reach a consumed anchor. */
+function isReleaseManifestChange(file, directory, after) {
+  if (consumedPackages.size === 0) return false;
+  const pending = [{ file, directory, after }];
+  const candidates = new Map();
+  while (pending.length) {
+    const item = pending.pop();
+    if (candidates.has(item.after.name)) continue;
+    const candidate = releaseCandidate(item.file, item.directory, item.after);
+    if (!candidate) return false;
+    candidates.set(candidate.name, candidate);
+    pending.push(...candidate.dependencies.values());
+  }
+  const proven = new Set(
+    [...candidates.values()].filter((candidate) => candidate.anchored).map((candidate) => candidate.name),
+  );
+  let changed;
+  do {
+    changed = false;
+    for (const candidate of candidates.values()) {
+      if (!proven.has(candidate.name) && [...candidate.dependencies.keys()].some((name) => proven.has(name))) {
+        proven.add(candidate.name);
+        changed = true;
+      }
+    }
+  } while (changed);
+  return proven.size === candidates.size;
+}
 
 for (const directory of readdirSync(packagesRoot).sort()) {
   const packageRoot = resolve(packagesRoot, directory);
@@ -157,6 +312,7 @@ for (const directory of readdirSync(packagesRoot).sort()) {
   const touched = changedFiles.filter((file) => {
     const relative = file.startsWith(packagePrefix) ? file.slice(packagePrefix.length) : undefined;
     if (relative !== undefined && RELEASE_GENERATED.has(relative)) return false;
+    if (relative === "package.json" && isReleaseManifestChange(file, directory, manifest)) return false;
     if (relative !== undefined && isReleaseVersionOnlySkillChange(file, relative, mergeBase)) return false;
     return prefixes.some((prefix) => (prefix.endsWith("/") ? file.startsWith(prefix) : file === prefix));
   });

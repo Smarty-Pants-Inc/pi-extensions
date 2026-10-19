@@ -3,6 +3,7 @@ import { test } from "vitest";
 import { PLAN_MODE_MAX_CHARS } from "../src/completion-tool.js";
 import planMode from "../src/plan-mode.js";
 import { type ActiveImplementationPlan, restorePlanModeState } from "../src/state.js";
+import { nativeInput } from "./native-input.js";
 import { createCustomSelectorHarness, createMockContext, createMockPi } from "./support.js";
 
 const PLAN = `# Compaction-safe implementation
@@ -115,6 +116,7 @@ test("legacy plans obey the completion size bound before restore or readiness", 
   planMode(mock.pi);
   const context = createMockContext();
   await mock.commands.get("plan")?.handler("start", context.ctx);
+  await nativeInput(mock, context.ctx);
   await mock.events.get("agent_end")?.[0]?.(
     {
       messages: [
@@ -311,7 +313,7 @@ test("active context avoids exact handoff duplication and replaces stale injecte
   const contextHook = mock.events.get("context")?.[0];
   assert.ok(contextHook);
 
-  const handoff = { role: "user", content: mock.sentUserMessages.at(-1)?.text };
+  const handoff = await nativeInput(mock, context.ctx, mock.sentUserMessages.at(-1)?.text ?? "", "extension");
   const withHandoff = (await contextHook(
     { messages: [{ role: "user", content: "plan it" }, handoff] },
     context.ctx,
@@ -320,7 +322,8 @@ test("active context avoids exact handoff duplication and replaces stale injecte
     withHandoff.messages.filter((message) => message.customType === "plan-mode-implementation-context").length,
     0,
   );
-  assert.deepEqual(withHandoff.messages, [{ role: "user", content: "plan it" }, handoff]);
+  assert.deepEqual(withHandoff.messages[0], { role: "user", content: "plan it" });
+  assert.equal(withHandoff.messages[1]?.customType, "plan-mode-implementation-handoff");
 
   const staleHandoff = {
     role: "user",
@@ -329,7 +332,7 @@ test("active context avoids exact handoff duplication and replaces stale injecte
   const withStaleHandoff = (await contextHook({ messages: [staleHandoff, handoff, handoff] }, context.ctx)) as {
     messages: Array<Record<string, unknown>>;
   };
-  assert.deepEqual(withStaleHandoff.messages, [handoff]);
+  assert.deepEqual(withStaleHandoff.messages, [staleHandoff, withHandoff.messages[1]]);
 
   const toolCall = {
     role: "assistant",
@@ -377,6 +380,7 @@ test("active plans can be shown and cleared through existing direct routes", asy
   assert.ok(complete);
   await complete("complete", { plan: PLAN }, undefined, undefined, context.ctx);
   await mock.commands.get("plan")?.handler("implement", context.ctx);
+  const deliveredHandoff = await nativeInput(mock, context.ctx, mock.sentUserMessages.at(-1)?.text ?? "", "extension");
 
   await mock.commands.get("plan")?.handler("show", context.ctx);
   assert.match(
@@ -392,10 +396,7 @@ test("active plans can be shown and cleared through existing direct routes", asy
   assert.ok(contextHook);
   const transformed = (await contextHook(
     {
-      messages: [
-        { role: "compactionSummary", summary: "lossy" },
-        { role: "user", content: mock.sentUserMessages.at(-1)?.text },
-      ],
+      messages: [{ role: "compactionSummary", summary: "lossy" }, deliveredHandoff],
     },
     context.ctx,
   )) as { messages: Array<Record<string, unknown>> };
@@ -609,7 +610,7 @@ test("starting a new Plan-mode workflow supersedes the active implementation", a
   assert.ok(complete);
   await complete("complete", { plan: PLAN }, undefined, undefined, context.ctx);
   await mock.commands.get("plan")?.handler("implement", context.ctx);
-  const oldHandoff = { role: "user", content: mock.sentUserMessages.at(-1)?.text };
+  const oldHandoff = await nativeInput(mock, context.ctx, mock.sentUserMessages.at(-1)?.text ?? "", "extension");
 
   await mock.commands.get("plan")?.handler("design a replacement", context.ctx);
   assert.equal(context.statuses.get("plan-mode"), "plan active");

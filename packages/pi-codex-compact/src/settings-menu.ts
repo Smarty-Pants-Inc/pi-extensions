@@ -4,7 +4,14 @@ import { withBorderedCustomUi } from "@signalridge/pi-ui";
 import type { CodexCompactSettings, CodexCompactSettingsRuntime, CodexCompactSettingsState } from "./settings.js";
 
 type Screen = "main" | "settings" | "invalid";
-type Action = "compact-now" | "set-enabled" | "set-timeout" | "set-retries" | "set-retention" | "set-notify";
+type Action =
+  | "compact-now"
+  | "set-enabled"
+  | "set-canonical"
+  | "set-timeout"
+  | "set-retries"
+  | "set-retention"
+  | "set-notify";
 
 export interface SettingsMenuOwner {
   signal: AbortSignal;
@@ -99,6 +106,15 @@ export function createCodexCompactMenu(
             action: "set-enabled",
           },
           {
+            id: "allowCanonicalHistory",
+            label: "Allow canonical history",
+            description:
+              "Persisted history includes custom content hidden by request-local filters. Allow future remote requests and native fallback summaries without asking.",
+            currentValue: state.settings.allowCanonicalHistory ? "On" : "Off",
+            values: ["On", "Off"],
+            action: "set-canonical",
+          },
+          {
             id: "requestTimeoutMs",
             label: "Request timeout",
             description: "Maximum time for the extension-owned remote compaction request.",
@@ -149,6 +165,8 @@ export function createCodexCompactMenu(
         return { kind: "close" };
       },
       "set-enabled": ({ ctx, value, signal }) => update(runtime, ctx, { enabled: value === "On" }, signal),
+      "set-canonical": ({ ctx, value, signal }) =>
+        update(runtime, ctx, { allowCanonicalHistory: value === "On" }, signal),
       "set-timeout": ({ ctx, value, signal }) =>
         update(runtime, ctx, { requestTimeoutMs: Number.parseInt(value ?? "5", 10) * 60_000 }, signal),
       "set-retries": ({ ctx, value, signal }) =>
@@ -165,7 +183,7 @@ export async function showCodexCompactMenu(
   ctx: ExtensionCommandContext,
   owner: SettingsMenuOwner,
 ): Promise<void> {
-  if (ctx.mode !== "tui") {
+  if (ctx.mode !== "tui" || !ctx.hasUI) {
     ctx.ui.notify(`Edit Codex compaction settings at ${safeText(runtime.get().path)}.`, "info");
     return;
   }
@@ -188,9 +206,10 @@ export async function showCodexCompactMenu(
   );
   if (!compactRequested || owner.signal.aborted || !owner.isCurrent()) return;
   ctx.compact({
-    onError: (error) => {
+    onError: () => {
       if (!owner.signal.aborted && owner.isCurrent()) {
-        ctx.ui.notify(`Compaction failed: ${safeText(error.message)}`, "error");
+        // Native provider errors can echo credentials and destinations.
+        ctx.ui.notify("Compaction failed.", "error");
       }
     },
   });
@@ -206,5 +225,9 @@ function compactMenuStatus(ctx: ExtensionCommandContext): CompactMenuStatus {
 
 function compactRoute(state: Readonly<CodexCompactSettingsState>, status: CompactMenuStatus | undefined): string {
   if (!state.settings.enabled) return "Pi native (Remote V2 off)";
-  return status?.remoteCompatible ? "Codex Remote V2" : "Pi native (model not compatible)";
+  return status?.remoteCompatible
+    ? state.settings.allowCanonicalHistory
+      ? "Codex Remote V2 (canonical history allowed)"
+      : "Codex Remote V2 (asks once; denial cancels)"
+    : "Pi native (model not compatible)";
 }

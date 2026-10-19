@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.3.5
+### Patch Changes
+
+- c2fd867: Keep Other answers and option payloads separate from sanitized display copies while respecting native editor submit transformations. Reject oversized responses explicitly, and settle host-completion and overflow-notification failures as structured UI errors while retaining collected answers and distinguishing cancellation/abort.
+
 ## 1.3.4
 ### Patch Changes
 

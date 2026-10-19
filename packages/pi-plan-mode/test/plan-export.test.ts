@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { test } from "vitest";
 import planMode, { completePlanArguments } from "../src/plan-mode.js";
+import { nativeInput } from "./native-input.js";
 import { createCustomSelectorHarness, createMockContext, createMockPi } from "./support.js";
 
 const PLAN = "# Exported plan\n\n1. Keep the exact plan.\n2. Make it readable to the agent.";
@@ -127,6 +128,8 @@ test("relative configured defaults resolve against the command context cwd", asy
     await completePlan(mock, planningContext.ctx);
 
     const exportContext = createMockContext({ cwd: exportDirectory, hasUI: true });
+    // A changed command cwd does not replace the live session or branch.
+    exportContext.ctx.sessionManager = planningContext.ctx.sessionManager;
     await mock.commands.get("plan")?.handler("export", exportContext.ctx);
     assert.equal(await readFile(join(exportDirectory, "plans", "default.md"), "utf8"), `${PLAN}\n`);
     await assert.rejects(readFile(join(planningDirectory, "plans", "default.md"), "utf8"));
@@ -272,6 +275,7 @@ test("queued export stops when the ready plan is superseded", async () => {
     await completePlan(mock, context.ctx);
     const pendingExport = mock.commands.get("plan")?.handler("export", context.ctx);
     await Promise.resolve();
+    await nativeInput(mock, context.ctx);
     await mock.events.get("before_agent_start")?.[0]?.({ systemPrompt: "base" }, context.ctx);
     releaseMutation();
     await blocker;

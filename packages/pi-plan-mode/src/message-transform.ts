@@ -4,6 +4,7 @@ import type { ActiveImplementationPlan } from "./state.js";
 const PLAN_CONTEXT_MESSAGE_TYPE = "plan-mode-context";
 export const PLAN_IMPLEMENTATION_CONTEXT_MESSAGE_TYPE = "plan-mode-implementation-context";
 const PROPOSED_PLAN_MESSAGE_TYPE = "proposed-plan";
+export const PLAN_IMPLEMENTATION_HANDOFF_MESSAGE_TYPE = "plan-mode-implementation-handoff";
 const PLAN_IMPLEMENTATION_HANDOFF_PREFIX =
   "Plan mode is now disabled. Full tool access is restored. Implement this proposed plan now:";
 const PROPOSED_PLAN_PATTERN = /^<proposed_plan>[\t ]*\r?\n([\s\S]*?)\r?\n<\/proposed_plan>[\t ]*$/gm;
@@ -80,7 +81,10 @@ export function injectActiveImplementationContext(messages: unknown[], activeImp
   const messagesWithoutStaleContext = messages.filter((message) => {
     if (messageContainsPlanModeImplementationContextArtifact(message)) return false;
     if (!messageContainsPlanModeImplementationHandoff(message)) return true;
-    if (!foundCurrentHandoff && messageContainsExactPlanModeImplementationHandoff(message, activeImplementation.plan)) {
+    if (
+      !foundCurrentHandoff &&
+      messageContainsExactPlanModeImplementationHandoff(message, activeImplementation.plan, activeImplementation.id)
+    ) {
       foundCurrentHandoff = true;
       return true;
     }
@@ -115,15 +119,25 @@ export function messageContainsInactivePlanModeArtifact(message: unknown) {
 export function messageContainsPlanModeImplementationHandoff(message: unknown) {
   const candidate = unwrapSessionMessage(message);
   return (
-    candidate.role === "user" &&
-    contentText(candidate.content).trimStart().startsWith(PLAN_IMPLEMENTATION_HANDOFF_PREFIX)
+    candidate.role === "custom" &&
+    candidate.customType === PLAN_IMPLEMENTATION_HANDOFF_MESSAGE_TYPE &&
+    typeof candidate.details?.implementationId === "string" &&
+    typeof candidate.details?.plan === "string"
   );
 }
 
-export function messageContainsExactPlanModeImplementationHandoff(message: unknown, plan: string) {
+export function messageContainsExactPlanModeImplementationHandoff(
+  message: unknown,
+  plan: string,
+  implementationId?: string,
+) {
   const candidate = unwrapSessionMessage(message);
-  if (candidate.role !== "user") return false;
-  return contentText(candidate.content).trim() === `${PLAN_IMPLEMENTATION_HANDOFF_PREFIX}\n\n${plan}`.trim();
+  if (!messageContainsPlanModeImplementationHandoff(message)) return false;
+  return (
+    (!implementationId || candidate.details?.implementationId === implementationId) &&
+    candidate.details?.plan === plan &&
+    contentText(candidate.content).trim() === `${PLAN_IMPLEMENTATION_HANDOFF_PREFIX}\n\n${plan}`.trim()
+  );
 }
 
 function isSummaryMessage(message: unknown) {
@@ -171,6 +185,7 @@ function unwrapSessionMessage(message: unknown) {
     customType?: string;
     toolName?: string;
     content?: unknown;
+    details?: { implementationId?: unknown; plan?: unknown };
   };
 }
 

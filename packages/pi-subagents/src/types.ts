@@ -180,8 +180,9 @@ export interface AgentRecord {
   /** Number of times this agent's session has compacted. Initialized to 0 at spawn. */
   compactionCount: number;
   /**
-   * Whether this agent was spawned to run in the background. Tri-state, set at
-   * spawn from `SpawnOptions.isBackground`: `true` = background, `false` =
+   * Whether this agent currently runs in the background. Tri-state, initially
+   * set from `SpawnOptions.isBackground`; a foreground handoff sets it to true.
+   * `true` = background, `false` =
    * foreground (has an inline Agent tool-result surface), `undefined` = the
    * caller never declared it (e.g. a cross-extension RPC spawn, which is detached
    * and has no inline surface). The widget's background-only filter keys off this
@@ -190,7 +191,7 @@ export interface AgentRecord {
    * which only the Agent-tool path populates.
    */
   isBackground?: boolean;
-  /** Resolved spawn params, captured for UI display. Fixed at spawn time. */
+  /** Resolved spawn params for UI display; handoff updates runInBackground. */
   invocation?: AgentInvocation;
   /** Nesting depth: top-level subagent = 1. */
   depth?: number;

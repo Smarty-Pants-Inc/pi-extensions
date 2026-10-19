@@ -17,6 +17,8 @@ import type {
   SessionShutdownEvent,
   SessionStartEvent,
   ToolCallEvent,
+  ToolExecutionEndEvent,
+  ToolExecutionStartEvent,
   ToolResultEvent,
   TurnStartEvent,
 } from "@earendil-works/pi-coding-agent";
@@ -116,6 +118,11 @@ export default function (pi: ExtensionAPI) {
   let finalStopReason: StopReason | undefined;
   let settlementTimer: ReturnType<typeof setTimeout> | undefined;
   let generation = 0;
+  // A tool that is still executing is work in progress even when it emits no
+  // intermediate events, which is the normal shape of a long shell command.
+  // Pi tracks in-flight executions as a set of tool call ids, so the absence of
+  // activity is only real inactivity once this set is empty.
+  const activeToolCallIds = new Set<string>();
   const cancelSettlement = () => {
     generation++;
     if (settlementTimer !== undefined) clearTimeout(settlementTimer);
@@ -126,6 +133,7 @@ export default function (pi: ExtensionAPI) {
   const retire = (): void => {
     cancelSettlement();
     clearTabTimeout();
+    activeToolCallIds.clear();
     status.running = false;
     status.sawCommit = false;
     finalStopReason = undefined;
@@ -164,7 +172,10 @@ export default function (pi: ExtensionAPI) {
     const timer = setTimeout(() => {
       if (timeoutId !== timer) return;
       timeoutId = undefined;
-      if (status.running && status.state === "running") {
+      // Silence from an in-flight tool is not inactivity: a long command may run
+      // for minutes without emitting any event, and it must not be reported as
+      // blocked while it still holds the run open.
+      if (status.running && status.state === "running" && activeToolCallIds.size === 0) {
         setTitle(ctx, "timeout");
       }
     }, INACTIVE_TIMEOUT_MS);
@@ -182,6 +193,7 @@ export default function (pi: ExtensionAPI) {
 
   const resetState = (ctx: ExtensionContext, next: StatusState): void => {
     cancelSettlement();
+    activeToolCallIds.clear();
     status.running = false;
     finalStopReason = undefined;
     status.sawCommit = false;
@@ -225,6 +237,14 @@ export default function (pi: ExtensionAPI) {
   pi.on("tool_call", async (_event: ToolCallEvent, ctx) => {
     markActivity(ctx);
   });
+  pi.on("tool_execution_start", async (event: ToolExecutionStartEvent, ctx) => {
+    activeToolCallIds.add(event.toolCallId);
+    markActivity(ctx);
+  });
+  pi.on("tool_execution_end", async (event: ToolExecutionEndEvent, ctx) => {
+    activeToolCallIds.delete(event.toolCallId);
+    markActivity(ctx);
+  });
   pi.on("tool_result", async (event: ToolResultEvent, ctx) => {
     // Later tool_call hooks may rewrite the command. Only the executed input
     // and its successful result can establish that this run committed.
@@ -240,6 +260,12 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_info_changed", async (_event, ctx) => setTitle(ctx, status.state));
   pi.on("agent_end", async (event: AgentEndEvent) => {
     finalStopReason = getStopReason(event.messages);
+    // No tool can still be executing here: the agent finishes its tool batch
+    // before it reports the run's end, and a failed or aborted run reports that
+    // end without the in-flight tool's own end event. Such an id can therefore
+    // never be cleared later, and a retry reusing this tracker would stay
+    // running forever.
+    activeToolCallIds.clear();
   });
   const settle = (ctx: ExtensionContext, owner: number): void => {
     if (owner !== generation) return;
@@ -260,6 +286,9 @@ export default function (pi: ExtensionAPI) {
     settlementTimer = undefined;
     status.running = false;
     clearTabTimeout();
+    // The run is fully settled, so nothing can still be in flight; clearing here
+    // keeps a tool that never reported its end from suppressing later timeouts.
+    activeToolCallIds.clear();
     if (finalStopReason === "error") {
       setTitle(ctx, "timeout");
       return;
@@ -272,6 +301,7 @@ export default function (pi: ExtensionAPI) {
   });
   pi.on("session_shutdown", async (_event: SessionShutdownEvent, ctx) => {
     cancelSettlement();
+    activeToolCallIds.clear();
     status.running = false;
     status.sawCommit = false;
     finalStopReason = undefined;

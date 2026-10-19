@@ -106,6 +106,8 @@ export interface CompleteSideThreadTurnOptions {
   completeSimple: CompleteSimpleFunction;
   /** Called immediately before the provider request; false cancels a stale session. */
   prepareContext?: () => string | false;
+  /** Revalidate after provider settlement without rereading parent history. */
+  isCurrent?: () => boolean;
 }
 
 export type CompleteSideThreadTurnResult =
@@ -122,8 +124,9 @@ export async function completeSideThreadTurn({
   signal,
   completeSimple,
   prepareContext,
+  isCurrent = () => true,
 }: CompleteSideThreadTurnOptions): Promise<CompleteSideThreadTurnResult> {
-  if (signal?.aborted) return { kind: "aborted" };
+  if (signal?.aborted || !isCurrent()) return { kind: "aborted" };
   try {
     const requestModel = withResolvedBaseUrl(model, auth);
     if (!canSendSideThreadToModel(thread, requestModel)) {
@@ -137,7 +140,7 @@ export async function completeSideThreadTurn({
       { systemPrompt: SYSTEM_PROMPT, messages: buildSideThreadMessages(thread, question, parentContext) },
       buildStreamOptions(auth, thinkingLevel, signal),
     );
-    if (signal?.aborted || response?.stopReason === "aborted") return { kind: "aborted" };
+    if (signal?.aborted || !isCurrent() || response?.stopReason === "aborted") return { kind: "aborted" };
     if (!isAssistantMessage(response)) {
       return { kind: "error", message: "The side model returned a malformed response." };
     }
@@ -152,7 +155,7 @@ export async function completeSideThreadTurn({
     thread.turns.push({ kind: "answered", question, answer, response });
     return { kind: "answered", response, answer };
   } catch (error: unknown) {
-    if (signal?.aborted) return { kind: "aborted" };
+    if (signal?.aborted || !isCurrent()) return { kind: "aborted" };
     return { kind: "error", message: formatError(error) };
   }
 }

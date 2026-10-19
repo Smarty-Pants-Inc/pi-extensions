@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.6
+### Patch Changes
+
+- c2fd867: Retire outgoing PR monitoring before replacement and keep ambient Git/GitHub discovery, watchers, polling and status writes out of print and RPC modes. Manual PR queries remain callable.
+
 ## 1.2.5
 ### Patch Changes
 

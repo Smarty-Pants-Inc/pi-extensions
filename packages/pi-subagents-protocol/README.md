@@ -10,6 +10,10 @@ remains `pi-subagents`; workflow state and journal ownership remain in
 
 The protocol-v4 contract validates managed spawn requests, exact workflow owners, bounded terminal snapshots, owned quiescence responses, capabilities, and RPC envelopes.
 
+A separate optional **UI version 1** contract exports `WORKFLOW_UI_CHANNELS`, workflow snapshot/query/open parsers, and the exact-attempt owned-conversation open parser. Snapshots carry at most 256 runs and bounded original names/identifiers, safe-integer counts, finite elapsed time and authoritative workflow statuses. Parsers return detached data; display consumers sanitize text before styling. They never infer run completion from child counts.
+
+UI query/open requests use the existing request-correlated reply idiom. A conversation request must include a complete managed owner with `attemptId`; session, branch, current attempt and TUI availability are still enforced by the runtime owner. Admission is not dialog completion, agent dispatch or a permission grant. These channels add no required v4 capability or unsolicited ping fields. This package remains side-effect-free and owns no UI, state, listeners or timers.
+
 A managed request names an Agent `tier` — a key in the host's own tier catalogue, not a separate workflow vocabulary — and carries no per-call model or thinking: a tier is the only model policy a caller can express, so there is no second selector that could silently win or be silently ignored. Optional hints can carry a named toolset, tool denylist, thread name, or worktree intent; `pi-subagents` remains the final resolver and enforces model scope, tool policy, concurrency, retries, skills, cwd, and isolation.
 
 Every v4 capability is required — there is no partial peer to negotiate with — and every ping carries the host's Agent-tier catalogue plus a canonical SHA-256 fingerprint. `agentTierPolicyIdentity()` narrows that catalogue to the part that decides how one named tier resolves, so a caller's replay cache can key each call on its own tier: defining or editing an unrelated tier then invalidates nothing.

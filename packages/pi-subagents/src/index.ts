@@ -37,6 +37,7 @@ import {
   Spacer,
   Text,
 } from "@earendil-works/pi-tui";
+import { parseOwnedConversationOpenRequest, replyChannel, WORKFLOW_UI_CHANNELS } from "@signalridge/pi-subagents-protocol";
 import { wrapCustomUi } from "@signalridge/pi-ui";
 import { Type } from "@sinclair/typebox";
 import { abortable } from "./abortable.js";
@@ -57,6 +58,7 @@ import {
 import {
   AgentManager,
   MANAGED_SPAWN_ENTRY_TYPE,
+  type ManagedSpawnCallbacks,
   type ManagedSpawnEntryLike,
   type ManagedSpawnPolicy,
   type ManagedSpawnRequest,
@@ -165,7 +167,9 @@ import {
   streamToOutputFile,
   writeInitialEntry,
 } from "./output-file.js";
+import { registerParentQuestions } from "./parent-questions.js";
 import { captureProjectTrust, isProjectResource } from "./project-trust.js";
+import { captureQuestionOrigin } from "./question-origin.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import {
@@ -211,11 +215,8 @@ import {
   type Theme,
 } from "./ui/agent-display.js";
 import { createMentionProvider, mentionRoster } from "./ui/agent-mention.js";
-import {
-  ConversationViewer,
-  VIEWPORT_HEIGHT_PCT,
-} from "./ui/conversation-viewer.js";
-import { FleetList, type FleetUICtx } from "./ui/fleet-list.js";
+import { getConversationOverlayOptions } from "./ui/conversation-viewer.js";
+import { type AgentSelection, captureAgentSelection, FleetList, type FleetUICtx } from "./ui/fleet-list.js";
 import {
   safeTerminalText,
   sanitizeDisplayText,
@@ -228,6 +229,7 @@ import {
   getAgentStatusLabel,
   getAgentStatusMark,
 } from "./ui/status-label.js";
+import { WorkflowUiClient } from "./ui/workflow-ui-client.js";
 import {
   addUsage,
   getLifetimeTotal,
@@ -809,6 +811,12 @@ function activateRootRuntime(
     // tokens is omitted when nothing was ever produced (e.g. agent errored before
     // any message_end fired), preserving prior payload shape.
     const u = record.lifetimeUsage;
+    const managedUsage = record.owner ? manager.getManagedUsage(record.id, record.owner) : undefined;
+    const managedTokens = managedUsage ? {
+      input: managedUsage.input,
+      output: managedUsage.output,
+      total: getLifetimeTotal(managedUsage),
+    } : undefined;
     const total = getLifetimeTotal(u);
     const tokens =
       total > 0 ? { input: u.input, output: u.output, total } : undefined;
@@ -822,6 +830,7 @@ function activateRootRuntime(
       toolUses: record.toolUses,
       durationMs,
       tokens,
+      ...(managedTokens ? { managedTokens: { ...managedTokens } } : {}),
       ...(record.outputFile ? { outputFile: record.outputFile } : {}),
       ...(record.invocation?.agentTier === undefined
         ? {}
@@ -917,13 +926,25 @@ function activateRootRuntime(
     string,
     { runs: number; usage: LifetimeUsage }
   >();
+  const accountedUsage = new WeakMap<AgentRecord, { usage: LifetimeUsage; completion: string; promise: AgentRecord["promise"] }>();
   function recordSessionUsage(record: AgentRecord): void {
+    const previous = accountedUsage.get(record);
+    const completion = JSON.stringify([record.owner, record.startedAt, record.completedAt]);
+    if (previous?.completion === completion && previous.promise === record.promise) return;
+    const usage = {
+      input: Math.max(0, record.lifetimeUsage.input - (previous?.usage.input ?? 0)),
+      output: Math.max(0, record.lifetimeUsage.output - (previous?.usage.output ?? 0)),
+      cacheWrite: Math.max(0, record.lifetimeUsage.cacheWrite - (previous?.usage.cacheWrite ?? 0)),
+    };
+    // Records survive native resumes; lifetime totals must be credited only once.
+    // Weak ownership releases bookkeeping when the manager evicts the record.
+    accountedUsage.set(record, { usage: { ...record.lifetimeUsage }, completion, promise: record.promise });
     const entry = sessionUsageByType.get(record.type) ?? {
       runs: 0,
       usage: { input: 0, output: 0, cacheWrite: 0 },
     };
     entry.runs++;
-    addUsage(entry.usage, record.lifetimeUsage);
+    addUsage(entry.usage, usage);
     sessionUsageByType.set(record.type, entry);
   }
 
@@ -933,6 +954,14 @@ function activateRootRuntime(
       // Nested children report only through their owning parent's scoped tools.
       // Keep them out of top-level lifecycle, transcript, notification, and UI channels.
       if (record.parentAgentId || record.detached) return;
+      // Native thread resumes do not pass the fresh-spawn stream finalizer.
+      // Flush and retire this owned attempt's UI subscription before publishing
+      // its terminal payload; the next admission installs a new anchored stream.
+      if (record.owner) {
+        const cleanup = record.outputCleanup;
+        record.outputCleanup = undefined;
+        cleanup?.();
+      }
 
       // Emit lifecycle event based on terminal status
       const isError =
@@ -1055,6 +1084,10 @@ function activateRootRuntime(
     {
       append: (tombstone) =>
         pi.appendEntry(MANAGED_SPAWN_ENTRY_TYPE, tombstone),
+    },
+    (record) => {
+      record.joinMode = "async";
+      refreshAgentSurfaces();
     },
   );
 
@@ -1194,6 +1227,28 @@ function activateRootRuntime(
   // same session. Invalidate pending off-screen mention turns only when the
   // replacement commits: before-switch/tree handlers can still cancel it.
   let sessionGeneration = 0;
+  const parentQuestions = registerParentQuestions(pi, () => currentCtx);
+  manager.setParentQuestionFactory((record, ctx) => {
+    const generation = sessionGeneration;
+    const sessionId = ctx.sessionManager.getSessionId();
+    const originCurrent = captureQuestionOrigin(ctx);
+    return (question, choices, signal) => {
+      // A retained channel can resume after ordinary native appends. Each
+      // question also owns the LIVE complete prefix at its own invocation.
+      const questionOriginCurrent = currentCtx ? captureQuestionOrigin(currentCtx) : () => false;
+      const controller = record.abortController;
+      const owner = JSON.stringify(record.owner);
+      const isCurrent = () => currentCtx !== undefined &&
+        sessionGeneration === generation && boundSessionId === sessionId &&
+        originCurrent(currentCtx) && questionOriginCurrent(currentCtx) &&
+        manager.getRecordMutable(record.id) === record && !record.detached &&
+        record.isBackground === true && record.status === "running" &&
+        record.abortController === controller && !controller?.signal.aborted &&
+        JSON.stringify(record.owner) === owner;
+      return parentQuestions.broker.request({ agentId: record.id, isCurrent }, question, choices,
+        controller ? AbortSignal.any([controller.signal, ...(signal ? [signal] : [])]) : signal);
+    };
+  });
   // Public synchronous bus preflight works in either extension load order. A
   // filtered-out activation has no bound context and must not veto navigation.
   pi.events.on("pi:navigation-preflight", (raw: unknown) => {
@@ -1259,11 +1314,13 @@ function activateRootRuntime(
   ): Promise<void> {
     // A successful session_start is the commit point for a reused runtime. A
     // cancelled session_before_switch leaves the old context and scheduler live.
+    retireFleetUi();
     if (currentCtx) {
       scheduler.stop();
       manager.detachForBranchChange();
       manager.resetManagedSpawns();
     }
+    parentQuestions.retire();
     sessionGeneration++;
     const replacingConfiguration = currentCtx !== undefined;
     configurationOwner = ctx;
@@ -1377,6 +1434,7 @@ function activateRootRuntime(
     }
     if (ownsRpcRegistry && isSchedulingEnabled() && !scheduler.isActive())
       startScheduler(ctx);
+    bindFleetUi();
   }
 
   // Both before-events are cancellable. A later handler may veto, and tree
@@ -1388,6 +1446,8 @@ function activateRootRuntime(
   const detachCommittedTree = (event: unknown): void => {
     if (!currentCtx || detachedTreeEvent === event) return;
     detachedTreeEvent = event;
+    retireFleetUi();
+    parentQuestions.retire();
     manager.detachForBranchChange();
   };
   // If workflows' committed-tree handler runs first, it must detach our old
@@ -1420,6 +1480,7 @@ function activateRootRuntime(
     manager.clearCompleted(true);
     for (const tombstone of recovered) persistRecoveredManaged(tombstone);
     if (isSchedulingEnabled() && !scheduler.isActive()) startScheduler(ctx);
+    bindFleetUi();
   });
 
   // Shutdown is idempotent and also serves same-session hot-reload handoff. The
@@ -1446,6 +1507,8 @@ function activateRootRuntime(
         },
       });
       scheduler.stop();
+      parentQuestions.retire();
+      retireFleetUi();
       currentCtx = undefined; // reject new spawns; owned cleanup RPC remains bound
       if (pending.length > 0) {
         let timer: ReturnType<typeof setTimeout> | undefined;
@@ -1522,6 +1585,60 @@ function activateRootRuntime(
   // used to carry the same rows, with the same summary repeated again in the
   // footer status; one surface, below the prompt, replaces all three.
   const fleet = new FleetList(manager, agentActivity);
+  let workflowUiClient: WorkflowUiClient | undefined;
+  let ownedConversationUnsubscribe: (() => void) | undefined;
+  const retiredWorkflowSurfaces = new Set<string>();
+
+  function rootUiFence(): () => boolean {
+    const root = currentCtx;
+    const generation = sessionGeneration;
+    const managerIdentity = root?.sessionManager;
+    const sessionId = boundSessionId;
+    return () => !!root && currentCtx === root && generation === sessionGeneration &&
+      currentCtx.sessionManager === managerIdentity && boundSessionId === sessionId &&
+      currentCtx.sessionManager.getSessionId() === sessionId;
+  }
+
+  function retireFleetUi(): void {
+    ownedConversationUnsubscribe?.();
+    ownedConversationUnsubscribe = undefined;
+    workflowUiClient?.dispose();
+    workflowUiClient = undefined;
+    fleet.dispose();
+  }
+
+  function bindFleetUi(): void {
+    if (!currentCtx || !ownsRpcRegistry) return;
+    const ctx = currentCtx;
+    const isCurrent = rootUiFence();
+    ownedConversationUnsubscribe = pi.events.on(WORKFLOW_UI_CHANNELS.openConversation, raw => {
+      let request: ReturnType<typeof parseOwnedConversationOpenRequest>;
+      try { request = parseOwnedConversationOpenRequest(raw); } catch { return; }
+      const channel = replyChannel(WORKFLOW_UI_CHANNELS.openConversation, request.requestId);
+      const retained = manager.getRecordMutable(request.agentId);
+      const selection = retained ? captureAgentSelection(manager, retained, isCurrent) : undefined;
+      const owner = selection?.owner;
+      if (!isCurrent() || ctx.mode !== "tui" || !ctx.hasUI || !selection?.session || !selection.current() ||
+        retained?.parentAgentId || owner?.extension !== request.owner.extension || owner.runId !== request.owner.runId ||
+        owner.nodeId !== request.owner.nodeId || owner.attemptId !== request.owner.attemptId || !fleet.canOpenConversation(selection)) {
+        pi.events.emit(channel, { success: false, error: "Exact retained agent conversation is not available in the active TUI." });
+        return;
+      }
+      // Reserve the exact selection before replying: reply listeners can issue
+      // another request or retire this root synchronously. Only construction yields.
+      if (!fleet.openConversation(selection, true)) {
+        pi.events.emit(channel, { success: false, error: "Exact retained agent conversation is already reserved or unavailable." });
+        return;
+      }
+      pi.events.emit(channel, { success: true, data: { accepted: true } });
+    });
+    if (ctx.mode !== "tui" || !ctx.hasUI) return;
+    fleet.setUICtx(ctx.ui as unknown as FleetUICtx);
+    workflowUiClient = new WorkflowUiClient(pi.events, () => isCurrent() && ctx.mode === "tui" && ctx.hasUI,
+      () => fleet.update(), retiredWorkflowSurfaces);
+    fleet.setWorkflowClient(workflowUiClient);
+  }
+
   let fleetViewEnabled = true;
   function isFleetViewEnabled(): boolean {
     return fleetViewEnabled;
@@ -1543,6 +1660,7 @@ function activateRootRuntime(
   function seatFleet(ctx: ExtensionContext): boolean {
     if (ctx.mode !== "tui" || !ctx.hasUI) return false;
     fleet.setUICtx(ctx.ui as unknown as FleetUICtx);
+    fleet.setWorkflowClient(workflowUiClient);
     return true;
   }
 
@@ -1559,6 +1677,7 @@ function activateRootRuntime(
     // session that has not run a tool yet. Re-seat from the live context so the
     // guard and the draw target agree; the setter is idempotent.
     fleet.setUICtx(currentCtx.ui as unknown as FleetUICtx);
+    fleet.setWorkflowClient(workflowUiClient);
     // Arm the tickers after the draw, not before: both tear their own timer down
     // when they find nothing to show, and the fleet finds nothing until the child
     // session lands a moment later. A spawn that entered through the manager has
@@ -1649,16 +1768,17 @@ function activateRootRuntime(
       },
     };
 
-    const { state, callbacks } = createActivityTracker(undefined, () => {
-      fleet.update();
-    });
+    // Allocate tracking only at a real fresh/reused-thread admission. An
+    // idempotent request replay must not create another tracker at all.
+    let tracker: ReturnType<typeof createActivityTracker> | undefined;
+    const tracking = () => tracker ??= createActivityTracker(undefined, () => fleet.update());
     const outputTranscript =
       getAgentConfig(dispatch.type)?.outputTranscript ??
       getOutputTranscriptDefault();
     let id = "";
     const initializeRecord = (spawnedId: string): void => {
       id = spawnedId;
-      agentActivity.set(id, state);
+      agentActivity.set(id, tracking().state);
       const record = manager.getRecordMutable(id);
       if (record && outputTranscript) {
         record.outputFile = createOutputFilePath(
@@ -1676,12 +1796,31 @@ function activateRootRuntime(
       fleet.ensureTimer();
       fleet.update();
     };
-    const onSessionCreated = callbacks.onSessionCreated;
-    const managedCallbacks = {
-      ...callbacks,
+    const managedCallbacks: ManagedSpawnCallbacks = {
+      onToolActivity: activity => tracker?.callbacks.onToolActivity(activity),
+      onTextDelta: (delta, text) => tracker?.callbacks.onTextDelta(delta, text),
+      onTurnEnd: count => tracker?.callbacks.onTurnEnd(count),
+      onAssistantUsage: usage => tracker?.callbacks.onAssistantUsage(usage),
       onSpawned: initializeRecord,
+      onResumeStarting: (record: AgentRecord, startMessageIndex: number) => {
+        id = record.id;
+        const { state } = tracking();
+        state.session = record.session;
+        state.toolUses = record.toolUses;
+        state.lifetimeUsage = { ...record.lifetimeUsage };
+        agentActivity.set(id, state);
+        record.outputCleanup?.();
+        record.outputCleanup = undefined;
+        if (outputTranscript && record.session) {
+          record.outputFile ??= createOutputFilePath(ctxRef.cwd, id, ctxRef.sessionManager.getSessionId());
+          ensureOutputFile(record.outputFile);
+          record.outputCleanup = streamToOutputFile(record.session, record.outputFile, id, ctxRef.cwd, startMessageIndex);
+        }
+        fleet.ensureTimer();
+        fleet.update();
+      },
       onSessionCreated: (session: AgentSession) => {
-        onSessionCreated(session);
+        tracking().callbacks.onSessionCreated(session);
         const record = manager.getRecordMutable(id);
         if (record?.outputFile) {
           record.outputCleanup = streamToOutputFile(
@@ -1707,11 +1846,9 @@ function activateRootRuntime(
     // transcript, timer, or callback chain. The original Agent record owns all
     // first-class UI and streaming state.
     if (!managedResult.created) return managedResult;
-    if (!id) {
-      const record = manager.getRecordMutable(managedResult.id);
-      if (record?.status === "queued" || record?.status === "running")
-        initializeRecord(managedResult.id);
-    }
+    // New records invoke onSpawned synchronously. Reused threads invoke only
+    // onResumeStarting at actual admission (possibly after waiting for capacity).
+    // Never fall through to the truncating new-record initializer on reentry.
     return managedResult;
   }
 
@@ -2050,7 +2187,7 @@ function activateRootRuntime(
    * prose working. A delivered mention costs no main-model turn; the answer
    * arrives through the ordinary completion notification either way.
    */
-  pi.on("input", async (event, ctx) => {
+  pi.on("input", parentQuestions.observeHandledInput(async (event, ctx) => {
     // Never hijack text the extension layer itself submitted (pi.sendMessage,
     // scheduled prompts) — only something a person typed can be a mention.
     if (event.source === "extension" || !isAgentMentionsEnabled())
@@ -2289,7 +2426,7 @@ function activateRootRuntime(
       );
     }
     return { action: "handled" };
-  });
+  }));
 
   // ---- Agent tool ----
 
@@ -2489,6 +2626,9 @@ Terse command-style prompts produce shallow, generic work.
             "Set to true to run in background. Returns agent ID immediately. You will be notified on completion.",
         }),
       ),
+      supervisor_questions: Type.Optional(Type.Union([Type.Literal("human"), Type.Literal("parent"), Type.Literal("off")], {
+        description: 'Explicit question routing, default human. "parent" is ordinary clarification only (never permission/approval), supported only for fresh non-isolated top-level background calls. No schedules or mode-changing resumes.',
+      })),
       resume: Type.Optional(
         Type.String({
           description:
@@ -2723,6 +2863,16 @@ Terse command-style prompts produce shallow, generic work.
         ...params,
         agentTiers: getAgentTiersSettings(),
       });
+      if (params.supervisor_questions === "parent" &&
+          (!resolvedConfig.runInBackground || resolvedConfig.isolated || params.schedule || params.resume || !isSupervisorQuestionsEnabled())) {
+        throw new Error('supervisor_questions: "parent" requires a fresh non-isolated background Agent. Set run_in_background: true, omit schedule/resume, and enable Supervisor questions. Foreground calls cannot answer while blocked.');
+      }
+      if (params.schedule && params.supervisor_questions !== undefined) {
+        throw new Error('Scheduled calls do not support per-call question routing; omit supervisor_questions.');
+      }
+      if (params.resume && params.supervisor_questions !== undefined) {
+        throw new Error('Resume preserves the child question mode; omit supervisor_questions and use run_in_background: true for a parent-mode child.');
+      }
       if (!params.resume && !params.schedule && resolvedConfig.inheritContext) {
         return textResult(INHERIT_CONTEXT_UNAVAILABLE);
       }
@@ -3041,6 +3191,7 @@ Terse command-style prompts produce shallow, generic work.
             : thinking,
           agentTier: resolvedConfig.requestedAgentTier,
           isBackground: true,
+          supervisorQuestions: params.supervisor_questions === "parent" ? "parent" : params.supervisor_questions === "off" ? false : undefined,
           isolation,
           invocation: agentInvocation,
           rootSessionId: ctx.sessionManager.getSessionId(),
@@ -3120,8 +3271,12 @@ Terse command-style prompts produce shallow, generic work.
       let spinnerFrame = 0;
       const startedAt = Date.now();
       let fgId: string | undefined;
+      let foregroundUpdates = true;
+      let handedOff = false;
 
       const streamUpdate = () => {
+        fleet.update();
+        if (!foregroundUpdates) return;
         const details: AgentDetails = {
           ...detailBase,
           toolUses: fgState.toolUses,
@@ -3198,6 +3353,7 @@ Terse command-style prompts produce shallow, generic work.
               : thinking,
             agentTier: resolvedConfig.requestedAgentTier,
             isolation,
+            supervisorQuestions: params.supervisor_questions === "off" ? false : undefined,
             invocation: agentInvocation,
             signal,
             rootSessionId: ctx.sessionManager.getSessionId(),
@@ -3206,19 +3362,28 @@ Terse command-style prompts produce shallow, generic work.
           (fgAgentId) => {
             // onSpawned: called synchronously after spawn, before onSessionCreated fires.
             // Set up the output file so streamToOutputFile can pick it up.
+            fgId = fgAgentId;
             const fgRec = manager.getRecordMutable(fgAgentId);
+            if (fgRec) fgRec.toolCallId = toolCallId;
             attachTranscript(fgRec, fgAgentId);
           },
         );
         record = fgResult.record;
+        handedOff = fgResult.handedOff === true;
       } finally {
-        // Always stop the spinner and drop the row, including startup errors
-        // that now propagate to pi as failed tool calls.
+        // A transfer ends this tool's spinner, not the child's activity or stream.
+        foregroundUpdates = false;
         clearInterval(spinnerInterval);
-        if (fgId) {
+        if (fgId && !handedOff) {
           agentActivity.delete(fgId);
           fleet.onAgentFinished(fgId);
         }
+      }
+
+      if (handedOff) {
+        return textResult(`${fallbackNote}Agent continues in background.\nAgent ID: ${record.id}\n` +
+          "You will be notified when it completes. Use get_subagent_result for results or steer_subagent to send messages.",
+          buildDetails(detailBase, record, fgState, { status: "background" }));
       }
 
       // Get final token count
@@ -3517,6 +3682,8 @@ Terse command-style prompts produce shallow, generic work.
   }
 
   async function showAgentsMenu(ctx: ExtensionCommandContext) {
+    const isCurrent = rootUiFence();
+    if (!isCurrent()) return;
     reloadCustomAgents();
     const allNames = getAllTypes();
 
@@ -3564,31 +3731,31 @@ Terse command-style prompts produce shallow, generic work.
     }
 
     const choice = await ctx.ui.select("Agents", options);
-    if (!choice) return;
+    if (!choice || !isCurrent()) return;
 
     if (choice.startsWith("Agent runs (")) {
       await showAgentRuns(ctx);
-      await showAgentsMenu(ctx);
+      if (isCurrent()) await showAgentsMenu(ctx);
     } else if (choice.startsWith("Agent types (")) {
       await showAllAgentsList(ctx);
-      await showAgentsMenu(ctx);
+      if (isCurrent()) await showAgentsMenu(ctx);
     } else if (choice.startsWith("Scheduled jobs (")) {
       await showSchedulesMenu(ctx, scheduler);
-      await showAgentsMenu(ctx);
+      if (isCurrent()) await showAgentsMenu(ctx);
     } else if (choice.startsWith("Model tiers (")) {
       await showModelTiersMenu(ctx);
-      await showAgentsMenu(ctx);
+      if (isCurrent()) await showAgentsMenu(ctx);
     } else if (choice === "Create new agent") {
       await showCreateWizard(ctx);
     } else if (choice === "Settings") {
       await showSettings(ctx);
-      await showAgentsMenu(ctx);
+      if (isCurrent()) await showAgentsMenu(ctx);
     } else if (choice.startsWith("Usage (")) {
       showSessionUsage(ctx);
-      await showAgentsMenu(ctx);
+      if (isCurrent()) await showAgentsMenu(ctx);
     } else if (choice === "Diagnostics") {
       await showDiagnostics(ctx);
-      await showAgentsMenu(ctx);
+      if (isCurrent()) await showAgentsMenu(ctx);
     }
   }
 
@@ -3712,29 +3879,33 @@ Terse command-style prompts produce shallow, generic work.
   }
 
   async function showAgentRuns(ctx: ExtensionCommandContext) {
-    const agents = manager.listAgentsMutable().filter((a) => !a.parentAgentId);
+    const isCurrent = rootUiFence();
+    const agents = manager.listAgentsMutable().filter((a) => !a.parentAgentId && !a.detached)
+      .map(record => captureAgentSelection(manager, record, isCurrent));
     if (agents.length === 0) {
       ctx.ui.notify("No agents.", "info");
       return;
     }
 
-    const record = await selectItem(ctx.ui, "Agent runs", agents, (agent) => {
+    const selection = await selectItem(ctx.ui, "Agent runs", agents, ({ snapshot: agent }) => {
       const dn = getDisplayName(agent.type);
       const dur = formatDuration(agent.startedAt, agent.completedAt);
       return `${dn} (${sanitizeDisplayText(agent.description)}) · ${agent.toolUses} tools · ${getAgentStatusLabel(agent.status)} · ${dur}`;
     });
-    if (!record) return;
+    if (!selection || !isCurrent() || !selection.current()) return;
 
-    await viewAgentConversation(ctx, record);
-    // Back-navigation: re-show the list
-    await showAgentRuns(ctx);
+    await viewAgentConversation(ctx, selection);
+    // Back-navigation stays on the same root/tree, never a replacement.
+    if (isCurrent()) await showAgentRuns(ctx);
   }
 
   async function viewAgentConversation(
     ctx: ExtensionCommandContext,
-    record: AgentRecord,
+    selection: AgentSelection,
   ) {
-    if (!record.session) {
+    const record = selection.snapshot;
+    if (!selection.current()) return;
+    if (!selection.session) {
       if (record.status === "queued") {
         const handleHint = record.handle
           ? ` Use @${record.handle} <message> to chat while it waits.`
@@ -3743,7 +3914,7 @@ Terse command-style prompts produce shallow, generic work.
           "Queued agent",
           `"${sanitizeDisplayText(record.description)}" has not started yet.${handleHint}\n\nStop this queued run?`,
         );
-        if (stop && manager.abort(record.id)) {
+        if (stop && selection.current() && manager.abort(record.id)) {
           ctx.ui.notify(
             `Stopped queued agent "${sanitizeDisplayText(record.description)}".`,
             "info",
@@ -3755,38 +3926,19 @@ Terse command-style prompts produce shallow, generic work.
       return;
     }
 
-    const session = record.session;
-    const activity = agentActivity.get(record.id);
-
-    await wrapCustomUi(ctx.ui).custom<undefined>(
+    seatFleet(ctx);
+    const mode = fleet.conversationMode();
+    // Fullscreen owns its entire native viewport; an extra shared border would
+    // clip its controls. Floating conversations retain the normal treatment.
+    const viewerUi = mode === "fullscreen" ? ctx.ui : wrapCustomUi(ctx.ui);
+    await viewerUi.custom<undefined>(
       (tui, theme, keybindings, done) => {
-        return new ConversationViewer(
-          tui,
-          session,
-          record,
-          activity,
-          theme,
-          done,
-          () => {
-            if (manager.abort(record.id)) {
-              ctx.ui.notify(
-                `Stopped "${sanitizeDisplayText(record.description)}".`,
-                "info",
-              );
-            }
-          },
-          keybindings,
-          (message: string) => manager.steer(record.id, message),
-          () => manager.getRecord(record.id),
-        );
+        if (!selection.current()) { done(undefined); return { render: () => [], invalidate: () => {} }; }
+        return fleet.conversation(selection, tui, theme, keybindings, done, message => ctx.ui.notify(message, "info"), mode);
       },
       {
         overlay: true,
-        overlayOptions: {
-          anchor: "center",
-          width: "90%",
-          maxHeight: `${VIEWPORT_HEIGHT_PCT}%`,
-        },
+        overlayOptions: getConversationOverlayOptions({ mode: mode === "fullscreen" ? "fullscreen" : undefined }),
       },
     );
   }

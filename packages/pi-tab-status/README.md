@@ -6,7 +6,7 @@ Adds a compact status to tab titles:
 
 - The optional `ridgeline` style uses `pi · project · working|done|review|blocked`.
 - The default `legacy` style keeps the original emoji indicators: ✅ committed, 🚧 review needed, 🛑 blocked/error, and `running...` while active.
-- `blocked` means no messages or tool calls for 180s while running, or an agent error.
+- `blocked` means no messages or tool calls for 180s while running, or an agent error. A tool that is still executing keeps the tab in `running...` even when it emits no intermediate events, so a long command is never reported as blocked.
 
 The more tabs you have open, the better it is. **Currently tracks one active session per tab.**
 

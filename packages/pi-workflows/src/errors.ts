@@ -67,6 +67,25 @@ export class WorkflowError extends Error {
   }
 }
 
+// Transported VM throws must not acquire provider/abort classification merely
+// because IPC reconstructed them in the host Error realm. Keep provenance and
+// helper-computed text outside user data (including non-Error object throws).
+const scriptThrows = new WeakMap<object, string>();
+
+export function markScriptThrow(value: unknown, text: string): void {
+  if ((typeof value === "object" && value !== null) || typeof value === "function") scriptThrows.set(value, text);
+}
+
+export function scriptThrowText(value: unknown): string | undefined {
+  return (typeof value === "object" && value !== null) || typeof value === "function"
+    ? scriptThrows.get(value)
+    : undefined;
+}
+
+export function describeWorkflowError(value: unknown): string {
+  return scriptThrowText(value) ?? (value instanceof Error ? value.message : String(value));
+}
+
 /** Narrow an unknown failure to WorkflowError. */
 export function isWorkflowError(error: unknown): error is WorkflowError {
   return error instanceof WorkflowError;
@@ -102,6 +121,13 @@ function providerResetHint(message: string): string | undefined {
  */
 export function wrapError(error: unknown, context?: { agentLabel?: string }): WorkflowError {
   if (isWorkflowError(error)) return error;
+  const scriptText = scriptThrowText(error);
+  if (scriptText !== undefined)
+    return new WorkflowError(scriptText, WorkflowErrorCode.AGENT_EXECUTION_ERROR, {
+      recoverable: true,
+      agentLabel: context?.agentLabel,
+      details: error,
+    });
 
   if (isAbortError(error)) {
     return new WorkflowError(

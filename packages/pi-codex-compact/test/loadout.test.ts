@@ -118,6 +118,8 @@ async function sdkFixture(mode: "on" | "only" = "on") {
         actual.streamSimple(requestModel, context, { ...options, transport: "sse", fetch: options?.fetch ?? fetch }),
     };
     modelRuntime.registerNativeProvider(provider);
+    const compactSettings = createCodexCompactSettingsRuntime(join(directory, "pi-codex-compact.json"));
+    await compactSettings.update({ allowCanonicalHistory: true });
     const open = async (manager: SessionManager) => {
       const settingsManager = SettingsManager.inMemory({
         defaultTools: ["read", "codemode", "inspect"],
@@ -138,7 +140,7 @@ async function sdkFixture(mode: "on" | "only" = "on") {
             pi.registerTool(editableTool);
           },
           createCodexCompactExtension({
-            settingsRuntime: createCodexCompactSettingsRuntime(join(directory, "pi-codex-compact.json")),
+            settingsRuntime: compactSettings,
             fetch,
           }),
         ],

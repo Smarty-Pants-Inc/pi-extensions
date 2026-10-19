@@ -199,6 +199,47 @@ test("an interrupted publication preserves the previous canonical bytes and clea
   );
 });
 
+test.each(["load", "save", "delete"] as const)(
+  "%s rejects invalid UTF-8 without repairing bytes or mode",
+  async (operation) => {
+    await withStore(async (store, filePath) => {
+      const saved = await store.save(candidate("original", "replace-me"));
+      const valid = await readFile(filePath);
+      const offset = valid.indexOf(Buffer.from("replace-me"));
+      assert.ok(offset >= 0);
+      const invalid = Buffer.from(valid);
+      invalid[offset] = 0xff; // Still JSON-shaped, but not valid UTF-8 in a string field.
+      await writeFile(filePath, invalid);
+      await chmod(filePath, 0o644);
+      const pending =
+        operation === "load"
+          ? store.load()
+          : operation === "save"
+            ? store.save(candidate("next"))
+            : store.delete(saved.id);
+      await assert.rejects(pending, (error) => error instanceof RecallStoreFormatError && /UTF-8/.test(error.message));
+      assert.deepEqual(await readFile(filePath), invalid);
+      assert.equal((await lstat(filePath)).mode & 0o777, 0o644);
+    });
+  },
+);
+
+test("valid replacement characters, CJK and emoji round-trip without lossy decoding", async () => {
+  await withStore(async (store, filePath) => {
+    const text = "genuine � 中文 日本語 😀 👩‍💻";
+    const saved = await store.save(candidate("unicode", text));
+    assert.equal((await store.load()).records[0]?.text, text);
+    const before = await readFile(filePath);
+    await store.save(candidate("other", "another valid record"));
+    assert.equal((await store.load()).records[0]?.text, text);
+    const other = (await store.load()).records[1];
+    assert.ok(other);
+    await store.delete(other.id);
+    assert.deepEqual(await readFile(filePath), before);
+    assert.equal(await store.delete(saved.id), true);
+  });
+});
+
 test("aborts a lock wait promptly and releases the winning lock", async () => {
   await withStore(async (store, filePath) => {
     await chmod(join(filePath, ".."), 0o700).catch(() => undefined);

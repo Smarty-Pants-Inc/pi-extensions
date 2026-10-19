@@ -88,7 +88,12 @@ FleetView, and scheduling. For the tested Pi **1.0.4** host baseline, package
 coverage, and current upstream references, see [the Pi 1.0 compatibility review](docs/pi-1.0-compatibility.md).
 The [0.99.1](docs/pi-0.99-compatibility.md) and [0.87.1](docs/pi-0.87-compatibility.md)
 reviews remain historical baselines. Host-provided peers use `"*"` for module
-ownership, not as a claim that every Pi version is supported.
+ownership, not as a claim that every Pi version is supported. See the
+[background ecosystem review](docs/background-ecosystem-review.md) for process
+ownership and notification boundaries, and the
+[whole-extension hardening review](docs/extension-hardening-review.md) for
+repository-wide remediation, independently adopted community patterns, and
+explicit deployment/qualification limits.
 
 ---
 
@@ -121,7 +126,7 @@ pi -ne -e ./packages/pi-subagents -e ./packages/pi-workflows
 
 | Package | What it does |
 | --- | --- |
-| `pi-subagents` | Managed subagent runtime — agent types, model tiers, FleetView, queueing, worktree isolation, scheduling, cross-extension RPC |
+| `pi-subagents` | Managed subagent runtime — tiers, workflow-owner Fleet groups, queueing, isolation, scheduling, RPC and opt-in background clarification to the main agent |
 | `pi-workflows` | JavaScript orchestration over those subagents — fan-out, phases, budgets, quality helpers, journal-backed resume |
 | `pi-goal` | Autonomous `/goal` completion, with opt-in experimental ordered queues |
 | `pi-ralph-wiggum` | Long-running agent loops for iterative development |
@@ -146,7 +151,7 @@ pi -ne -e ./packages/pi-subagents -e ./packages/pi-workflows
 | --- | --- |
 | `pi-statusline` | Theme-native statusline |
 | `pi-input-prefix` | Theme-aware rounded input editor and prompt token |
-| `pi-input-history` | Cross-session prompt history with an fzf/atuin-style `Ctrl+R` picker |
+| `pi-input-history` | Text-preserving prompt history with grapheme-safe search/highlights and an fzf/atuin-style `Ctrl+R` picker |
 | `pi-welcome` | Startup resource and repository summary card |
 | `pi-session-recap` | While-you-were-away recap above the editor; raw-history requests require explicit model and consent flags |
 | `pi-tab-status` | Terminal tab status indicators |
@@ -171,7 +176,15 @@ Publishable, but install them deliberately rather than as part of a default set.
 ### Experimental
 
 Marked `piExtension.lifecycle: experimental`, which keeps them out of a release
-unless a changeset names them: `pi-recall`, `pi-codex-compact`, `pi-analytics`.
+unless a changeset names them: `pi-recall`, `pi-codex-compact`, `pi-analytics`,
+[`pi-background`](packages/pi-background/README.md) (session-owned background
+shell jobs and event-driven log monitors; local macOS/Linux only), and
+[`pi-todo`](packages/pi-todo/README.md) (revisioned, branch-local checklists with
+explicit manual controls; not a project backlog or execution scheduler),
+[`pi-approvals`](packages/pi-approvals/README.md) (per-operation reviewed local
+writes/edits and commands; opt-in adapters, not an OS sandbox), and
+[`pi-sessions`](packages/pi-sessions/README.md) (human-owned history navigation
+and editable linked-session handoff; destination draft only, never auto-send).
 
 ### Libraries
 
@@ -181,7 +194,8 @@ as ordinary npm dependencies — never listed in Pi's extension package map.
 | Package | What it does |
 | --- | --- |
 | `pi-subagents-protocol` | Side-effect-free wire contracts for the managed subagent protocol |
-| `pi-ui` | Shared bordered custom-UI adapter used by extension-owned dialogs |
+| `pi-ui` | Side-effect-free bordered UI, inert display encoding and opt-in public custom-editor preservation adapters |
+| `pi-approval-core` | Side-effect-free local approval contracts, cooperative-adapter validation and reviewed native-tool factories; no Pi resources |
 
 ## Boundaries
 
@@ -232,3 +246,9 @@ packages are packed or published only when intentionally selected.
 
 See [`LEGAL-NOTICES.md`](LEGAL-NOTICES.md) for retained license handling, and
 [`AGENTS.md`](AGENTS.md) for the repository's authoring rules.
+
+## Reference reviews
+
+- [Community extension survey](docs/community-extension-survey.md): Todo/checklist alternatives, project task ledgers, and additive plugin patterns with primary-source links and compatibility caveats.
+- [Task and human-control acceptance ledger](docs/task-human-controls.md): implementation scope, verified evidence and remaining release gates; not a publication claim.
+- [Workflow and subagent UI synchronization](docs/workflow-ui-upstream-sync.md): selective upstream adoption, interactive ownership and verification boundaries.

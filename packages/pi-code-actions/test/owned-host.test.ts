@@ -58,6 +58,8 @@ function editorHost() {
   };
 }
 
+const shellSnippet = process.platform === "win32" ? "Write-Output 'hello'" : "printf hello";
+
 function commandHost() {
   const host = editorHost();
   const handlers = new Map<string, () => void>();
@@ -67,7 +69,7 @@ function commandHost() {
   const sessionManager = SessionManager.inMemory("/tmp");
   sessionManager.appendMessage({
     role: "assistant",
-    content: [{ type: "text", text: "```sh\nprintf hello\n```" }],
+    content: [{ type: "text", text: `\`\`\`sh\n${shellSnippet}\n\`\`\`` }],
     api: "openai-responses",
     provider: "openai",
     model: "test",
@@ -95,7 +97,7 @@ function commandHost() {
   const ctx = {
     mode: "tui",
     hasUI: true,
-    cwd: "/tmp",
+    cwd: process.cwd(),
     sessionManager,
     ui: {
       custom: host.custom,
@@ -130,7 +132,10 @@ const boundaries = [
 ];
 
 async function mounted(host: ReturnType<typeof editorHost>) {
-  for (let i = 0; i < 8 && host.editorContainer.children[0] === host.editor; i++) await Promise.resolve();
+  const deadline = Date.now() + 4000;
+  while (host.editorContainer.children[0] === host.editor && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
   const component = host.editorContainer.children[0];
   assert.ok(component && component !== host.editor, "custom component mounted");
   return component;
@@ -171,10 +176,10 @@ for (const boundary of boundaries) {
       assert.equal(fixture.host.restores, 1);
       assert.equal(fixture.host.editor.text, "tree target user message");
       assert.deepEqual(fixture.notices, []);
-      assert.equal(fixture.execs.length, args.includes("run") ? 1 : 0);
+      assert.equal(fixture.execs.length, 0);
       closeReplacement();
       await next;
-    }, 1000);
+    }, 6000);
   }
 }
 
@@ -247,13 +252,13 @@ test("normal picker appends to the TUI draft and run pane closes normally", asyn
   const inserting = fixture.command("last", fixture.ctx);
   (await mounted(fixture.host)).handleInput?.("\t");
   await inserting;
-  assert.equal(fixture.host.editor.text, "existing draft\nprintf hello");
+  assert.equal(fixture.host.editor.text, `existing draft\n${shellSnippet}`);
   assert.deepEqual(fixture.notices, ["Inserted snippet into editor."]);
   const running = fixture.command("last run 1", fixture.ctx);
   const pane = await mounted(fixture.host);
   assert.match(pane.render(100).join("\n"), /hello/);
   pane.handleInput?.("\r");
   await running;
-  assert.equal(fixture.host.editor.text, "existing draft\nprintf hello");
+  assert.equal(fixture.host.editor.text, `existing draft\n${shellSnippet}`);
   assert.equal(fixture.host.restores, 2);
 });

@@ -6,6 +6,7 @@ import { test } from "vitest";
 import planMode from "../src/plan-mode.js";
 import type { ImplementationPlanRetention } from "../src/settings.js";
 import { restorePlanModeState } from "../src/state.js";
+import { nativeInput } from "./native-input.js";
 import { createMockContext, createMockPi } from "./support.js";
 
 const PLAN = "# Retained plan\n\n1. Keep the complete handoff.";
@@ -16,7 +17,7 @@ function stateEntry(data: Record<string, unknown>) {
 }
 
 function latestState(mock: ReturnType<typeof createMockPi>) {
-  return mock.entries.at(-1)?.data as {
+  return mock.entries.filter((entry) => entry.customType === STATE_ENTRY_TYPE).at(-1)?.data as {
     activeImplementation?: {
       id: string;
       plan: string;
@@ -89,7 +90,7 @@ test("keep leaves the accepted plan active after context and settlement", async 
   const { mock, context, handoff } = await beginImplementation("keep");
   assert.equal(latestState(mock).activeImplementation?.retention, "keep");
   const transformed = (await mock.events.get("context")?.[0]?.(
-    { messages: [{ role: "user", content: handoff }] },
+    { messages: [await nativeInput(mock, context.ctx, handoff, "extension")] },
     context.ctx,
   )) as { messages: Array<{ content?: unknown }> };
   assert.match(JSON.stringify(transformed.messages), /Retained plan/);
@@ -106,15 +107,15 @@ test("handoff-only waits for the exact queued handoff, preserves its first conte
   await contextHook({ messages: [{ role: "user", content: "Older queued work" }] }, context.ctx);
   assert.equal(latestState(mock).activeImplementation?.retention, "clear-on-start");
 
-  const firstImplementationContext = (await contextHook(
-    { messages: [{ role: "user", content: handoff }] },
-    context.ctx,
-  )) as { messages: unknown[] };
+  const delivered = await nativeInput(mock, context.ctx, handoff, "extension");
+  const firstImplementationContext = (await contextHook({ messages: [delivered] }, context.ctx)) as {
+    messages: unknown[];
+  };
   assert.match(JSON.stringify(firstImplementationContext.messages), /Retained plan/);
   assert.equal(latestState(mock).activeImplementation, undefined);
   assert.equal(context.statuses.get("plan-mode"), undefined);
 
-  const later = (await contextHook({ messages: [{ role: "user", content: handoff }] }, context.ctx)) as {
+  const later = (await contextHook({ messages: [delivered] }, context.ctx)) as {
     messages: unknown[];
   };
   assert.doesNotMatch(JSON.stringify(later.messages), /Retained plan/);
@@ -130,7 +131,7 @@ test("first-run ignores older settlement and clears only after its handoff conte
   const contextHook = mock.events.get("context")?.[0];
   assert.ok(contextHook);
   const firstImplementationContext = (await contextHook(
-    { messages: [{ role: "user", content: handoff }] },
+    { messages: [await nativeInput(mock, context.ctx, handoff, "extension")] },
     context.ctx,
   )) as { messages: unknown[] };
   assert.match(JSON.stringify(firstImplementationContext.messages), /Retained plan/);
@@ -147,7 +148,7 @@ test("an armed older implementation cannot clear a superseding implementation", 
   const { mock, context, handoff } = await beginImplementation("clear-after-first-run");
   const contextHook = mock.events.get("context")?.[0];
   assert.ok(contextHook);
-  await contextHook({ messages: [{ role: "user", content: handoff }] }, context.ctx);
+  await contextHook({ messages: [await nativeInput(mock, context.ctx, handoff, "extension")] }, context.ctx);
   const firstId = latestState(mock).activeImplementation?.id;
 
   await mock.commands.get("plan")?.handler("start", context.ctx);
@@ -163,7 +164,7 @@ test("an armed older implementation cannot clear a superseding implementation", 
   await mock.events.get("agent_settled")?.[0]?.({}, context.ctx);
   assert.equal(latestState(mock).activeImplementation?.id, secondId);
   const secondHandoff = mock.sentUserMessages.at(-1)?.text ?? "";
-  await contextHook({ messages: [{ role: "user", content: secondHandoff }] }, context.ctx);
+  await contextHook({ messages: [await nativeInput(mock, context.ctx, secondHandoff, "extension")] }, context.ctx);
   await mock.events.get("agent_settled")?.[0]?.({}, context.ctx);
   assert.equal(latestState(mock).activeImplementation, undefined);
 });
@@ -286,7 +287,7 @@ test("restored cleanup policies re-arm safely in the replacement session", async
     });
     await mock.events.get("session_start")?.[0]?.({ reason: "resume" }, context.ctx);
     const transformed = (await mock.events.get("context")?.[0]?.(
-      { messages: [{ role: "user", content: "Continue after resume" }] },
+      { messages: [await nativeInput(mock, context.ctx, "Continue after resume")] },
       context.ctx,
     )) as { messages: unknown[] };
     assert.match(JSON.stringify(transformed.messages), /Retained plan/);

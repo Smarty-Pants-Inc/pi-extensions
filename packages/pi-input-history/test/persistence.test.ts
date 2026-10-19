@@ -160,6 +160,40 @@ for (const custom of [false, true]) {
   });
 }
 
+test("cross-session seeding keeps raw multipart text and whitespace-distinct prompts", async () => {
+  const session = SessionManager.create(directory, join(directory, "sessions"));
+  const path = join(session.getSessionDir(), "multipart.jsonl");
+  mkdirSync(session.getSessionDir(), { recursive: true });
+  writeFileSync(
+    path,
+    [
+      { type: "session", version: 3, id: "previous", timestamp: "2026-01-01T00:00:00Z", cwd: directory },
+      ...["  first\n\nsecond  ", "first\n\nsecond"].map((text, index) => ({
+        type: "message",
+        id: `message-${index}`,
+        parentId: null,
+        timestamp: "2026-01-01T00:01:00Z",
+        message: {
+          role: "user",
+          content: [
+            { type: "text", text: text.slice(0, 7) },
+            { type: "image", mimeType: "image/png", data: "image" },
+            { type: "text", text: text.slice(7) },
+          ],
+          timestamp: 1,
+        },
+      })),
+    ]
+      .map((entry) => JSON.stringify(entry))
+      .join("\n"),
+  );
+  const fixture = boot(session);
+  fixture.start();
+  const populate = vi.spyOn(fixture.getActive(), "addToHistory");
+  await vi.waitFor(() => assert.equal(populate.mock.calls.length, 2));
+  assert.deepEqual(populate.mock.calls, [["  first\n\nsecond  "], ["first\n\nsecond"]]);
+});
+
 for (const mode of ["print", "rpc"]) {
   test(`${mode} sessions never scan history or install an editor even with a UI bridge`, () => {
     const list = vi.spyOn(SessionManager, "list");

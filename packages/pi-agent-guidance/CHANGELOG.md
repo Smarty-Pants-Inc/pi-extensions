@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.6
+### Patch Changes
+
+- c2fd867: Validate guidance configuration, escape literal model-pattern characters, and compose provider context through mutable structured prompt sections without hiding later policy or tool changes.
+
 ## 1.2.5
 ### Patch Changes
 

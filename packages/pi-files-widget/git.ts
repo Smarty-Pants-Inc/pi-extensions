@@ -33,7 +33,7 @@ export function isGitRepo(cwd: string): boolean {
  */
 function getGitPathPrefix(cwd: string): string {
   try {
-    return runGit(cwd, ["rev-parse", "--show-prefix"], 2000).trim();
+    return runGit(cwd, ["rev-parse", "--show-prefix"], 2000).replace(/\n$/, "");
   } catch {
     return "";
   }
@@ -46,6 +46,20 @@ function stripPathPrefix(filePath: string, prefix: string): string | null {
   return null;
 }
 
+/** Porcelain v1 -z has target first, then a separate origin for R/C in either column. */
+export function parseGitStatusZ(output: string): Array<{ code: string; path: string }> {
+  const result: Array<{ code: string; path: string }> = [];
+  const entries = output.split("\0");
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    if (entry.length < 4 || entry[2] !== " ") continue;
+    const xy = entry.slice(0, 2);
+    result.push({ code: xy.trim() || "?", path: entry.slice(3) });
+    if (/[RC]/u.test(xy)) i += 1;
+  }
+  return result;
+}
+
 export function getGitStatus(cwd: string, options: { includeIgnored?: boolean } = {}): Map<string, string> {
   const status = new Map<string, string>();
   const prefix = getGitPathPrefix(cwd);
@@ -53,12 +67,10 @@ export function getGitStatus(cwd: string, options: { includeIgnored?: boolean } 
   const collect = (args: string[]): void => {
     try {
       const output = runGit(cwd, args, 5000);
-      for (const line of output.split("\n")) {
-        if (line.length < 3) continue;
-        const statusCode = line.slice(0, 2).trim() || "?";
-        const filePath = stripPathPrefix(line.slice(3), prefix);
+      for (const entry of parseGitStatusZ(output)) {
+        const filePath = stripPathPrefix(entry.path, prefix);
         if (filePath === null || !filePath) continue;
-        status.set(filePath, statusCode);
+        status.set(filePath, entry.code);
       }
     } catch {}
   };
@@ -66,13 +78,13 @@ export function getGitStatus(cwd: string, options: { includeIgnored?: boolean } 
   // `-uall` mirrors getGitFileList, so every untracked file the browser lists
   // also carries a badge — including files inside an untracked directory — and
   // neither helper is at the mercy of the user's `status.showUntrackedFiles`.
-  collect(["status", "--porcelain", "-uall"]);
+  collect(["--no-optional-locks", "status", "--porcelain", "-z", "-uall"]);
   if (options.includeIgnored !== false) {
     // Ignored paths need a second pass at the default `-unormal`: `--ignored`
     // together with `-uall` enumerates every file under an ignored directory
     // (tens of thousands of `node_modules` entries) instead of collapsing them
     // into a single `!! node_modules/` row.
-    collect(["status", "--porcelain", "--ignored"]);
+    collect(["--no-optional-locks", "status", "--porcelain", "-z", "--ignored"]);
   }
 
   return status;
@@ -89,22 +101,9 @@ export function getGitFileList(cwd: string): string[] {
 
   try {
     const prefix = getGitPathPrefix(cwd);
-    const statusOutput = runGit(cwd, ["status", "--porcelain", "-uall", "-z"], 5000);
-    const entries = statusOutput.split("\0");
-    for (let i = 0; i < entries.length; i++) {
-      const entry = entries[i];
-      if (!entry) continue;
-      const statusCode = entry.slice(0, 2).trim();
-      let filePath = entry.slice(3);
-      if ((statusCode.startsWith("R") || statusCode.startsWith("C")) && entries[i + 1]) {
-        // `-z` reverses rename/copy entries to `XY <new>\0<old>`, so the entry we
-        // already read is the surviving path. Consume the origin field anyway, or
-        // the next iteration would parse it as a status entry.
-        i += 1;
-      } else if (filePath.includes(" -> ")) {
-        filePath = filePath.split(" -> ").pop() || filePath;
-      }
-      const relPath = filePath ? stripPathPrefix(filePath, prefix) : null;
+    const statusOutput = runGit(cwd, ["--no-optional-locks", "status", "--porcelain", "-uall", "-z"], 5000);
+    for (const entry of parseGitStatusZ(statusOutput)) {
+      const relPath = stripPathPrefix(entry.path, prefix);
       if (relPath) {
         files.add(relPath);
       }
@@ -122,6 +121,23 @@ export function getGitBranch(cwd: string): string {
   }
 }
 
+function parseNumstatZ(output: string): Map<string, DiffStats> {
+  const stats = new Map<string, DiffStats>();
+  const entries = output.split("\0");
+  for (let i = 0; i < entries.length; i++) {
+    const match = /^([^\t]+)\t([^\t]+)\t([\s\S]*)$/u.exec(entries[i]);
+    if (!match) continue;
+    let path = match[3];
+    if (!path) {
+      // A rename has an empty path followed by origin and target NUL fields.
+      path = entries[i + 2];
+      i += 2;
+    }
+    if (path) stats.set(path, { additions: parseInt(match[1], 10) || 0, deletions: parseInt(match[2], 10) || 0 });
+  }
+  return stats;
+}
+
 export function getGitDiffStats(cwd: string): Map<string, DiffStats> {
   const stats = new Map<string, DiffStats>();
   try {
@@ -129,30 +145,14 @@ export function getGitDiffStats(cwd: string): Map<string, DiffStats> {
     // (and scoped to it) so they match the widget's cwd-relative node keys even
     // when cwd is a subdirectory of the repository. --no-ext-diff pins the
     // output format against a configured `diff.external`.
-    const output = runGit(cwd, ["diff", "--no-ext-diff", "--relative", "--numstat", "HEAD"], 5000);
-    for (const line of output.split("\n")) {
-      const parts = line.split("\t");
-      if (parts.length >= 3) {
-        const additions = parseInt(parts[0], 10) || 0;
-        const deletions = parseInt(parts[1], 10) || 0;
-        const filePath = parts[2];
-        stats.set(filePath, { additions, deletions });
-      }
-    }
+    const output = runGit(cwd, ["diff", "--no-ext-diff", "--relative", "--numstat", "-z", "HEAD"], 5000);
+    for (const [path, counts] of parseNumstatZ(output)) stats.set(path, counts);
     // `diff HEAD` already spans index + worktree, so the cached pass only fills
     // in paths it missed — a change that is staged and then reverted in the
     // worktree. Adding the two would count every staged line twice.
-    const stagedOutput = runGit(cwd, ["diff", "--no-ext-diff", "--relative", "--numstat", "--cached"], 5000);
-    for (const line of stagedOutput.split("\n")) {
-      const parts = line.split("\t");
-      if (parts.length >= 3) {
-        const additions = parseInt(parts[0], 10) || 0;
-        const deletions = parseInt(parts[1], 10) || 0;
-        const filePath = parts[2];
-        if (!stats.has(filePath)) {
-          stats.set(filePath, { additions, deletions });
-        }
-      }
+    const stagedOutput = runGit(cwd, ["diff", "--no-ext-diff", "--relative", "--numstat", "-z", "--cached"], 5000);
+    for (const [path, counts] of parseNumstatZ(stagedOutput)) {
+      if (!stats.has(path)) stats.set(path, counts);
     }
   } catch {}
   return stats;
