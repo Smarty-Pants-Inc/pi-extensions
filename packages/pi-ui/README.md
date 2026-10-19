@@ -4,7 +4,9 @@ Shared UI primitives for Signalridge Pi extensions.
 
 ## Untrusted terminal text
 
-Use `sanitizeTerminalText(content)` at a display boundary **before** wrapping the result in theme colours or other application-owned ANSI styling. It removes OSC (including OSC52 clipboard writes), CSI, other terminal escape/control sequences, DEL, and Unicode bidi controls. Tabs, LF newlines, printable Unicode and emoji are preserved. Unterminated control strings are discarded through the end of the input.
+Use `sanitizeTerminalText(content)` at a display boundary **before layout** and before theme colours or other application-owned ANSI styling. It removes OSC (including OSC52 clipboard writes), CSI, other terminal escape/control sequences, DEL, and Unicode format controls (category Cf, including bidi controls). ZWJ is retained only between extended pictographic emoji bases, allowing intervening variation selectors and skin-tone modifiers before the joiner. Variation selectors and valid family emoji are preserved; stray ZWJ is removed. Unpaired UTF-16 surrogates become U+FFFD.
+
+Tabs expand to three spaces, matching Pi TUI's fixed tab measurement. LF newlines are preserved; U+2028/U+2029 become LF. For single-line labels, replace LF with a space after sanitizing. Other printable Unicode is preserved. Unterminated control strings are discarded through the end of the input. The sanitizer uses linear passes over the input, including emoji context checks.
 
 ```ts
 import { sanitizeTerminalText } from "@signalridge/pi-ui";

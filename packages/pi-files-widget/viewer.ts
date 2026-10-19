@@ -278,7 +278,7 @@ export function createViewer(
     if (!state.file) return "";
     const isUntracked = isUntrackedStatus(state.file.gitStatus);
 
-    let header = theme.bold(state.file.name);
+    let header = theme.bold(sanitizeTerminalText(state.file.name).replace(/\n/g, " "));
     if (isUntracked) {
       header += theme.fg("dim", " [UNTRACKED]");
     } else if (state.diffMode) {
@@ -306,7 +306,7 @@ export function createViewer(
     }
 
     if (state.mode === "search") {
-      header += theme.fg("accent", `  /${state.searchQuery}█`);
+      header += theme.fg("accent", `  /${sanitizeTerminalText(state.searchQuery).replace(/\n/g, " ")}█`);
     } else if (state.searchQuery && state.searchMatches.length > 0) {
       header += theme.fg("dim", ` [${state.searchIndex + 1}/${state.searchMatches.length}]`);
     }
@@ -317,7 +317,7 @@ export function createViewer(
   function renderCommentEditor(width: number): string[] {
     const contentWidth = Math.max(1, width - 2);
     const wrappedLines: string[] = [];
-    const logicalLines = state.commentText.split("\n");
+    const logicalLines = sanitizeTerminalText(state.commentText).split("\n");
 
     for (const line of logicalLines) {
       if (line.length === 0) {
@@ -439,7 +439,7 @@ export function createViewer(
           const lineIdx = state.scroll + i;
           // Treat loaded/rendered file rows and raw selection snapshots as content,
           // not terminal instructions. Apply our own selection styling only afterward.
-          const content = sanitizeTerminalText(visible[i]);
+          const content = sanitizeTerminalText(visible[i]).replace(/\n/g, " ");
           const row = isSourceSelectionMode() ? `${String(lineIdx + 1).padStart(4)} │ ${content}` : content;
           let line = truncateToWidth(row || "", width);
           if (

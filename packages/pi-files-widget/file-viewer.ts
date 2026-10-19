@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { readFileSync, statSync } from "node:fs";
 import { visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { sanitizeTerminalText } from "@signalridge/pi-ui";
 
 import { isGitRepo } from "./git.js";
 import { hasCommand, isMarkdownPath, stripLeadingEmptyLines } from "./utils.js";
@@ -304,7 +305,7 @@ export function loadFileContent(
               stdio: ["pipe", "pipe", "pipe"],
             });
             return {
-              lines: wrapDeltaLines(stripLeadingEmptyLines(deltaOutput.split("\n")), termWidth),
+              lines: wrapDeltaLines(stripLeadingEmptyLines(sanitizeTerminalText(deltaOutput).split("\n")), termWidth),
               renderedMarkdown: false,
             };
           } catch {
@@ -313,12 +314,15 @@ export function loadFileContent(
         }
 
         return {
-          lines: wrapDiffLines(stripLeadingEmptyLines(diffOutput.split("\n")), termWidth),
+          lines: wrapDiffLines(stripLeadingEmptyLines(sanitizeTerminalText(diffOutput).split("\n")), termWidth),
           renderedMarkdown: false,
         };
       } catch (error: unknown) {
         const message = error instanceof Error ? error.message : String(error);
-        return { lines: [`Diff error: ${message}`], renderedMarkdown: false };
+        return {
+          lines: [`Diff error: ${sanitizeTerminalText(message).replace(/\n/g, " ")}`],
+          renderedMarkdown: false,
+        };
       }
     }
 
@@ -334,7 +338,7 @@ export function loadFileContent(
         });
         if (output.trim()) {
           return {
-            lines: stripLeadingEmptyLines(output.split("\n")),
+            lines: stripLeadingEmptyLines(sanitizeTerminalText(output).split("\n")),
             renderedMarkdown: true,
           };
         }
@@ -346,21 +350,25 @@ export function loadFileContent(
     if (hasCommand("bat")) {
       try {
         return {
-          lines: execFileSync("bat", batArgs(filePath, termWidth, true), {
-            encoding: "utf-8",
-            timeout: 10000,
-            stdio: ["ignore", "pipe", "pipe"],
-          }).split("\n"),
+          lines: sanitizeTerminalText(
+            execFileSync("bat", batArgs(filePath, termWidth, true), {
+              encoding: "utf-8",
+              timeout: 10000,
+              stdio: ["ignore", "pipe", "pipe"],
+            }),
+          ).split("\n"),
           renderedMarkdown: false,
         };
       } catch {
         try {
           return {
-            lines: execFileSync("bat", batArgs(filePath, termWidth, false), {
-              encoding: "utf-8",
-              timeout: 10000,
-              stdio: ["ignore", "pipe", "pipe"],
-            }).split("\n"),
+            lines: sanitizeTerminalText(
+              execFileSync("bat", batArgs(filePath, termWidth, false), {
+                encoding: "utf-8",
+                timeout: 10000,
+                stdio: ["ignore", "pipe", "pipe"],
+              }),
+            ).split("\n"),
             renderedMarkdown: false,
           };
         } catch {
@@ -371,13 +379,15 @@ export function loadFileContent(
 
     const raw = readFileSync(filePath, "utf-8");
     return {
-      lines: raw.split("\n").map((line, i) => `${String(i + 1).padStart(4)} │ ${line}`),
+      lines: raw
+        .split("\n")
+        .map((line, i) => `${String(i + 1).padStart(4)} │ ${sanitizeTerminalText(line).replace(/\n/g, " ")}`),
       renderedMarkdown: false,
     };
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
     return {
-      lines: [`Error loading file: ${message}`],
+      lines: [`Error loading file: ${sanitizeTerminalText(message).replace(/\n/g, " ")}`],
       renderedMarkdown: false,
     };
   }

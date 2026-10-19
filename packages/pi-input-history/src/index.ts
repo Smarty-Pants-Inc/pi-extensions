@@ -465,7 +465,11 @@ export class HistoryPopupComponent implements Component, Focusable {
 
     const before = this.input.getValue();
     this.input.handleInput(data);
-    const after = this.input.getValue();
+    // Input owns its styling/cursor, so normalize the editable filter before it
+    // renders (including bracketed paste and undo), never the stored prompts.
+    const value = this.input.getValue();
+    const after = sanitizeTerminalText(value).replace(/\n/g, " ");
+    if (after !== value) this.input.setValue(after);
 
     if (after !== before) {
       this.query = after;
@@ -543,7 +547,9 @@ export class HistoryPopupComponent implements Component, Focusable {
     // at render time, so Ctrl+D cannot know where the end is.
     this.previewOffset = Math.min(this.previewOffset, maxOffset);
 
-    const lines = wrapped.slice(this.previewOffset, this.previewOffset + height).map((line) => t.fg("text", line));
+    const lines = wrapped
+      .slice(this.previewOffset, this.previewOffset + height)
+      .map((line) => t.fg("text", truncateToWidth(line, width)));
 
     if (maxOffset > 0 && lines.length > 0) {
       // Spend the last row on a scroll indicator — without it, a truncated

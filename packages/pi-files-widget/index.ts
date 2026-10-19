@@ -7,6 +7,7 @@
 
 import { statSync } from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { sanitizeTerminalText } from "@signalridge/pi-ui";
 import { createFileBrowser } from "./browser.js";
 import { formatCommentMessage } from "./comment.js";
 import { POLL_INTERVAL_MS } from "./constants.js";
@@ -70,7 +71,7 @@ export default function editorExtension(pi: ExtensionAPI): void {
 
       const resolved = resolveInitialPath(args, cwd);
       if (resolved.error) {
-        ctx.ui.notify(resolved.error, "error");
+        ctx.ui.notify(sanitizeTerminalText(resolved.error).replace(/\n/g, " "), "error");
         return;
       }
       const initialPath = resolved.path;
@@ -100,12 +101,13 @@ export default function editorExtension(pi: ExtensionAPI): void {
         ) => {
           if (disposed) return;
           const message = formatCommentMessage(payload, comment);
+          const displayTarget = sanitizeTerminalText(`${payload.relPath} (${payload.lineRange})`).replace(/\n/g, " ");
           if (ctx.isIdle()) {
             pi.sendUserMessage(message);
-            ctx.ui.notify(`Comment sent to agent for ${payload.relPath} (${payload.lineRange})`, "info");
+            ctx.ui.notify(`Comment sent to agent for ${displayTarget}`, "info");
           } else {
             pi.sendUserMessage(message, { deliverAs: "followUp" });
-            ctx.ui.notify(`Comment queued for agent for ${payload.relPath} (${payload.lineRange})`, "info");
+            ctx.ui.notify(`Comment queued for agent for ${displayTarget}`, "info");
           }
         };
 

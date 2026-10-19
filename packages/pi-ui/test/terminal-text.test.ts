@@ -44,24 +44,24 @@ for (const [name, sequence] of [
   });
 }
 
-test("strips every C0/C1 control and DEL except tab and LF", () => {
+test("strips every C0/C1 control and DEL except expanded tab and LF", () => {
   for (let code = 0; code <= 0x9f; code++) {
     if (code >= 0x20 && code < 0x7f) continue;
     const char = String.fromCharCode(code);
-    assert.equal(sanitizeTerminalText(char), code === 9 || code === 10 ? char : "", `U+${code.toString(16)}`);
+    assert.equal(sanitizeTerminalText(char), code === 9 ? "   " : code === 10 ? char : "", `U+${code.toString(16)}`);
   }
   assert.equal(sanitizeTerminalText("one\r\ntwo\rthree"), "one\ntwothree");
 });
 
-test("strips exactly the specified Unicode bidi controls", () => {
+test("strips Unicode bidi controls", () => {
   const codes = [0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067, 0x2068, 0x2069, 0x200e, 0x200f, 0x061c];
   for (const code of codes) {
     assert.equal(sanitizeTerminalText(`before${String.fromCharCode(code)}after`), "beforeafter");
   }
 });
 
-test("preserves benign printable text, Unicode, emoji, tabs and newlines byte-for-byte", () => {
-  for (const text of ["", "  plain [31m ]52;c;text ~ ", "café\t漢字\nمرحبا שלום", "👩🏽‍💻 👨‍👩‍👧‍👦 e\u0301\n\tend\n"]) {
+test("preserves benign printable text, Unicode, emoji and LF byte-for-byte", () => {
+  for (const text of ["", "  plain [31m ]52;c;text ~ ", "café 漢字\nمرحبا שלום", "👩🏽‍💻 👨‍👩‍👧‍👦 e\u0301\nend\n"]) {
     assert.equal(sanitizeTerminalText(text), text);
   }
 });

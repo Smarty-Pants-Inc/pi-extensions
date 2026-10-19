@@ -17,7 +17,8 @@ for (const [name, body, expected] of [
   ["OSC52 ST", "before\x1b]52;c;cHduZWQ=\x1b\\after", "beforeafter"],
   ["C1 OSC52", "before\u009d52;c;cHduZWQ=\u009cafter", "beforeafter"],
   ["CSI and bidi", "before\x1b[31m\u202eafter\u202c\x1b[0m", "beforeafter"],
-  ["benign Unicode and tabs", "café\t漢字 👩🏽‍💻 e\u0301", "café\t漢字 👩🏽‍💻 e\u0301"],
+  ["benign Unicode and expanded tabs", "café\t漢字 👩🏽‍💻 e\u0301", "café   漢字 👩🏽‍💻 e\u0301"],
+  ["format controls and separators", "a\u206a\u206f\u200db\u2028c\u2029d", "ab c d"],
 ] as const) {
   test(`file viewer neutralises ${name} before selection styling, without changing comment source`, () => {
     const root = mkdtempSync(join(tmpdir(), "viewer-terminal-"));
