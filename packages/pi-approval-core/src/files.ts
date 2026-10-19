@@ -1,6 +1,6 @@
-import { constants } from "node:fs";
-import { access, lstat, mkdir, open, realpath, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { type BigIntStats, constants } from "node:fs";
+import { access, type FileHandle, lstat, mkdir, open, stat, statfs } from "node:fs/promises";
+import { basename, dirname, isAbsolute, resolve } from "node:path";
 import { generateUnifiedPatch } from "@earendil-works/pi-coding-agent";
 import {
   type ApprovalOperation,
@@ -18,81 +18,230 @@ interface Identity {
   readonly token: string | null;
 }
 interface Capture {
+  readonly path: string;
   readonly bytes: Buffer | null;
-  readonly identities: readonly Identity[];
+  readonly target: string | null;
+  readonly ancestors: readonly Identity[];
+  readonly descriptorRelative: boolean;
+}
+interface HeldDirectory {
+  readonly handle: FileHandle;
+  readonly via: string;
+  readonly token: string;
 }
 function missing(error: unknown): boolean {
   return error instanceof Error && "code" in error && error.code === "ENOENT";
 }
+function token(stat: BigIntStats, target: boolean): string {
+  if (target && (!stat.isFile() || stat.nlink !== 1n))
+    throw new Error("Approval target must be a regular non-aliased file");
+  if (!target && !stat.isDirectory()) throw new Error("Approval ancestor must be a non-symlink directory");
+  if (target && stat.size > BigInt(MAX_FILE_BYTES)) throw new Error("File exceeds approval size limit");
+  // Inode identities can exceed Number precision on Linux and macOS. Preserve
+  // exact identity and nanosecond timestamps at this approval trust boundary.
+  return JSON.stringify(
+    [stat.dev, stat.ino, stat.mode, ...(target ? [stat.size, stat.mtimeNs, stat.ctimeNs] : [])].map(String),
+  );
+}
 async function identity(path: string, target: boolean): Promise<string | null> {
   try {
-    const stat = await lstat(path);
-    if (target && (!stat.isFile() || stat.isSymbolicLink() || stat.nlink > 1))
-      throw new Error("Approval target must be a regular non-aliased file");
-    if (!target && !stat.isDirectory() && !stat.isSymbolicLink()) throw new Error("Invalid approval ancestor");
-    if (target && stat.size > MAX_FILE_BYTES) throw new Error("File exceeds approval size limit");
-    return JSON.stringify([
-      await realpath(path),
-      stat.dev,
-      stat.ino,
-      stat.mode,
-      ...(target ? [stat.size, stat.mtimeMs, stat.ctimeMs] : []),
-    ]);
+    return token(await lstat(path, { bigint: true }), target);
   } catch (error) {
     if (missing(error)) return null;
     throw error;
   }
 }
-async function boundedRead(path: string): Promise<Buffer> {
-  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-  try {
-    const stat = await handle.stat();
-    if (!stat.isFile() || stat.size > MAX_FILE_BYTES)
-      throw new Error("File exceeds approval size limit or is not regular");
-    const buffer = Buffer.alloc(MAX_FILE_BYTES + 1);
-    let count = 0;
-    while (count < buffer.length) {
-      const { bytesRead } = await handle.read(buffer, count, buffer.length - count, count);
-      if (!bytesRead) break;
-      count += bytesRead;
-    }
-    if (count > MAX_FILE_BYTES) throw new Error("File exceeds approval size limit");
-    const result = buffer.subarray(0, count);
-    snapshot(result);
-    return result;
-  } finally {
-    await handle.close();
+function descriptorPath(handle: FileHandle): string {
+  return `/proc/self/fd/${handle.fd}`;
+}
+async function closeDirectories(directories: readonly HeldDirectory[]): Promise<void> {
+  await Promise.all(directories.map(({ handle }) => handle.close()));
+}
+async function validateHeld(directories: readonly HeldDirectory[]): Promise<void> {
+  for (const directory of directories) {
+    if (
+      token(await directory.handle.stat({ bigint: true }), false) !== directory.token ||
+      (await identity(directory.via, false)) !== directory.token
+    )
+      throw new Error("Approval ancestor changed while held");
   }
 }
-async function capture(path: string): Promise<Capture> {
-  const identities: Identity[] = [];
-  const token = await identity(path, true);
-  identities.push({ path, token });
-  let parent = dirname(path);
-  while (true) {
-    identities.push({ path: parent, token: await identity(parent, false) });
-    const next = dirname(parent);
-    if (next === parent) break;
-    parent = next;
+async function holdAncestors(path: string, captured?: Capture, options?: ApprovalRequestOptions) {
+  if (!isAbsolute(path) || resolve(path) !== path || dirname(path) === path)
+    throw new Error("Safe approval file IO requires a normalized absolute file path");
+  // Capability detection is separate from identity validation: once procfs is
+  // available, no open/stat/identity failure may downgrade to pathname IO.
+  let descriptorRelative = false;
+  if (process.platform === "linux") {
+    try {
+      descriptorRelative = (await statfs("/proc/self/fd")).type === 0x9fa0;
+    } catch (error) {
+      if (
+        !(error instanceof Error) ||
+        !("code" in error) ||
+        !["ENOENT", "ENOTDIR", "ENOSYS", "ENOTSUP", "EACCES"].includes(String(error.code))
+      )
+        throw error;
+    }
   }
-  const bytes = token === null ? null : await boundedRead(path);
-  const result = { bytes, identities };
-  await recheck(result);
+  if (captured?.descriptorRelative && !descriptorRelative)
+    throw new Error("Approval descriptor path capability changed; refusing an unsafe downgrade");
+  // Without openat or procfs, held no-follow descriptors and before/after
+  // checks detect changes but cannot eliminate an ancestor-swap window.
+  const paths: string[] = [];
+  for (let parent = dirname(path); ; parent = dirname(parent)) {
+    paths.unshift(parent);
+    if (dirname(parent) === parent) break;
+  }
+  const directories: HeldDirectory[] = [];
+  const ancestors: Identity[] = [];
+  try {
+    for (const [index, parent] of paths.entries()) {
+      const previous = directories[index - 1];
+      const via =
+        index === 0
+          ? parent
+          : previous
+            ? descriptorRelative
+              ? `${descriptorPath(previous.handle)}/${basename(parent)}`
+              : parent
+            : null;
+      let current = via === null ? null : await identity(via, false);
+      const approved = captured?.ancestors[index];
+      if (captured && (!approved || approved.path !== parent || current !== approved.token))
+        throw new Error("Approval ancestor changed");
+      if (current === null && options && via !== null) {
+        assertCurrent(options);
+        // Non-recursive mkdir through a held parent. EEXIST is a race, not an
+        // invitation to adopt another writer's directory or follow a symlink.
+        try {
+          await mkdir(via);
+        } catch (error) {
+          throw new Error("Approval ancestor changed or could not be created safely", { cause: error });
+        }
+        assertCurrent(options);
+        current = await identity(via, false);
+        if (current === null) throw new Error("Created approval ancestor disappeared");
+      }
+      ancestors.push({ path: parent, token: current });
+      if (current === null || via === null) continue;
+      try {
+        const handle = await open(via, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+        // Register immediately so every error path closes the new descriptor.
+        directories.push({ handle, via, token: current });
+        if (
+          token(await handle.stat({ bigint: true }), false) !== current ||
+          (descriptorRelative && token(await stat(descriptorPath(handle), { bigint: true }), false) !== current)
+        )
+          throw new Error("Approval ancestor identity changed");
+      } catch (error) {
+        throw new Error("Approval ancestor identity cannot be held safely", { cause: error });
+      }
+    }
+    await validateHeld(directories);
+    const parent = directories.at(-1);
+    return {
+      directories,
+      ancestors,
+      descriptorRelative,
+      targetPath:
+        parent && directories.length === paths.length
+          ? descriptorRelative
+            ? `${descriptorPath(parent.handle)}/${basename(path)}`
+            : path
+          : null,
+    };
+  } catch (error) {
+    await closeDirectories(directories);
+    throw error;
+  }
+}
+async function boundedRead(handle: FileHandle): Promise<Buffer> {
+  token(await handle.stat({ bigint: true }), true);
+  const buffer = Buffer.alloc(MAX_FILE_BYTES + 1);
+  let count = 0;
+  while (count < buffer.length) {
+    const { bytesRead } = await handle.read(buffer, count, buffer.length - count, count);
+    if (!bytesRead) break;
+    count += bytesRead;
+  }
+  if (count > MAX_FILE_BYTES) throw new Error("File exceeds approval size limit");
+  const result = buffer.subarray(0, count);
+  snapshot(result);
   return result;
 }
-async function recheck(captured: Capture, directoriesCreated = false): Promise<void> {
-  for (const [index, item] of captured.identities.entries()) {
-    if (directoriesCreated && index > 0 && item.token === null) {
-      // These directories were absent during review and have just been created.
-      // This is not proof against an external writer racing mkdir/lstat/write.
-      if (!(await lstat(item.path)).isDirectory()) throw new Error("Created approval ancestor changed");
-    } else if ((await identity(item.path, index === 0)) !== item.token)
-      throw new Error("Approval target or ancestor changed");
+async function capture(path: string): Promise<Capture> {
+  const held = await holdAncestors(path);
+  try {
+    const target = held.targetPath === null ? null : await identity(held.targetPath, true);
+    let bytes: Buffer | null = null;
+    if (target !== null && held.targetPath !== null) {
+      const handle = await open(held.targetPath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      try {
+        if (token(await handle.stat({ bigint: true }), true) !== target) throw new Error("Approval target changed");
+        bytes = await boundedRead(handle);
+        if (token(await handle.stat({ bigint: true }), true) !== target) throw new Error("Approval target changed");
+      } finally {
+        await handle.close();
+      }
+    }
+    await validateHeld(held.directories);
+    if (held.targetPath !== null && (await identity(held.targetPath, true)) !== target)
+      throw new Error("Approval target changed");
+    return { path, bytes, target, ancestors: held.ancestors, descriptorRelative: held.descriptorRelative };
+  } finally {
+    await closeDirectories(held.directories);
   }
-  const target = captured.identities[0];
-  if (!target) throw new Error("Missing approval capture");
-  if (captured.bytes && !(await boundedRead(target.path)).equals(captured.bytes))
-    throw new Error("Approval file contents changed");
+}
+async function pinnedWrite(captured: Capture, after: Buffer, options: ApprovalRequestOptions): Promise<void> {
+  const held = await holdAncestors(captured.path, captured, options);
+  try {
+    if (!held.targetPath) throw new Error("Cannot safely hold approval target parent");
+    if ((await identity(held.targetPath, true)) !== captured.target) throw new Error("Approval target changed");
+    assertCurrent(options);
+    let handle: FileHandle;
+    try {
+      handle = await open(
+        held.targetPath,
+        constants.O_RDWR |
+          constants.O_NOFOLLOW |
+          constants.O_NONBLOCK |
+          (captured.target === null ? constants.O_CREAT | constants.O_EXCL : 0),
+        0o666,
+      );
+    } catch (error) {
+      throw new Error("Approval target changed or could not be opened safely", { cause: error });
+    }
+    try {
+      const openedStat = await handle.stat({ bigint: true });
+      const opened = token(openedStat, true);
+      if (
+        (captured.target !== null && opened !== captured.target) ||
+        (captured.target === null && openedStat.size !== 0n)
+      )
+        throw new Error("Approval target identity changed");
+      if (captured.bytes !== null && !(await boundedRead(handle)).equals(captured.bytes))
+        throw new Error("Approval file contents changed");
+      await validateHeld(held.directories);
+      if (
+        (await identity(held.targetPath, true)) !== opened ||
+        token(await handle.stat({ bigint: true }), true) !== opened
+      )
+        throw new Error("Approval target identity changed while held");
+      assertCurrent(options);
+      // Positional reads above leave the descriptor offset at zero. Neither
+      // opening nor checking an existing file truncates it before validation.
+      await handle.writeFile(after);
+      assertCurrent(options);
+      await handle.truncate(after.length);
+      await validateHeld(held.directories);
+      assertCurrent(options);
+    } finally {
+      await handle.close();
+    }
+  } finally {
+    await closeDirectories(held.directories);
+  }
 }
 export interface FileInvocation {
   readonly kind: "write" | "edit";
@@ -148,22 +297,14 @@ export function createFileOperations(invocation: FileInvocation) {
     writeFile: async (path: string, content: string): Promise<void> => {
       assertCurrent(invocation.options);
       const captured = invocation.kind === "edit" ? original : await capture(path);
-      if (!captured) throw new Error("Edit did not capture its input");
+      if (!captured || captured.path !== path) throw new Error("Edit did not capture its input path");
       const after = Buffer.from(content, "utf8");
       if (after.toString("utf8") !== content) throw new Error("Invalid UTF-8 output");
       const operation = review(invocation, path, captured.bytes, after);
       await invocation.request(operation, invocation.options);
       assertCurrent(invocation.options);
-      await recheck(captured);
-      assertCurrent(invocation.options);
-      if (invocation.kind === "write") {
-        await mkdir(dirname(path), { recursive: true });
-        // Failure after mkdir may leave directories behind; no rollback promise.
-        assertCurrent(invocation.options);
-        await recheck(captured, true);
-        assertCurrent(invocation.options);
-      }
-      await writeFile(path, after);
+      // Failures after approved creation may leave empty files/directories.
+      await pinnedWrite(captured, after, invocation.options);
       assertCurrent(invocation.options);
     },
   };

@@ -3,7 +3,7 @@ import syncFs from "node:fs";
 import fs from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   createAgentSession,
@@ -288,6 +288,312 @@ it.each(["edit", "write", "bash"] as const)(
     expect(admission.mock.calls.length).toBeGreaterThan(1);
   },
 );
+// Exercise both the old pathname write and the new descriptor open. Hooks
+// mutate the real filesystem exactly once, then call the original native IO.
+function beforeMutation(path: string, approved: () => boolean, swap: () => Promise<void>) {
+  let swaps = 0;
+  const trigger = async () => {
+    if (!approved() || swaps !== 0) return;
+    swaps++;
+    await swap();
+  };
+  const open = fs.open;
+  const writeFile = fs.writeFile;
+  vi.spyOn(fs, "open").mockImplementation(async (...args: Parameters<typeof fs.open>) => {
+    if (typeof args[1] === "number" && args[1] & (syncFs.constants.O_WRONLY | syncFs.constants.O_RDWR)) await trigger();
+    return open(...args);
+  });
+  vi.spyOn(fs, "writeFile").mockImplementation(async (...args: Parameters<typeof fs.writeFile>) => {
+    if (args[0] === path) await trigger();
+    return writeFile(...args);
+  });
+  syncBuiltinESMExports();
+  return () => swaps;
+}
+it.each([
+  ["write", "target-symlink"],
+  ["edit", "target-symlink"],
+  ["write", "ancestor-symlink"],
+  ["edit", "ancestor-symlink"],
+  ["write", "regular-inode"],
+  ["write", "new-target-symlink"],
+  ["write", "new-target-regular"],
+] as const)("pinned file race: %s refuses %s at native mutation seam", async (kind, race) => {
+  const { cwd, ctx } = await fixture();
+  const parent = join(cwd, "approved");
+  const otherParent = join(cwd, "other");
+  await fs.mkdir(parent);
+  await fs.mkdir(otherParent);
+  const path = join(parent, "target");
+  const other = join(otherParent, "target");
+  const saved = race === "ancestor-symlink" ? join(cwd, "saved-parent", "target") : join(parent, "saved-target");
+  await fs.writeFile(other, "other destination must survive");
+  const newTarget = race.startsWith("new-target-");
+  if (!newTarget) await fs.writeFile(path, "original bytes must survive");
+  let approved = false;
+  const [edit, write] = createApprovalToolDefinitions({
+    source: "test",
+    isCurrent: () => true,
+    request: async () => {
+      approved = true;
+    },
+  });
+  const swaps = beforeMutation(
+    path,
+    () => approved,
+    async () => {
+      if (race === "ancestor-symlink") {
+        await fs.rename(parent, dirname(saved));
+        await fs.symlink(otherParent, parent, "dir");
+      } else {
+        if (!newTarget) await fs.rename(path, saved);
+        // Identical bytes ensure the inode check, not only a content check,
+        // is necessary to refuse an existing regular-file replacement.
+        if (race === "regular-inode" || race === "new-target-regular")
+          await fs.writeFile(path, "original bytes must survive");
+        else await fs.symlink(other, path);
+      }
+    },
+  );
+  const running =
+    kind === "edit"
+      ? edit.execute("race", { path, edits: [{ oldText: "original", newText: "changed" }] }, undefined, undefined, ctx)
+      : write.execute("race", { path, content: "changed" }, undefined, undefined, ctx);
+  await expect(running).rejects.toThrow(/Approval|non-symlink|ELOOP|ENOTDIR/);
+  expect(swaps()).toBe(1);
+  expect(await fs.readFile(other, "utf8")).toBe("other destination must survive");
+  if (!newTarget) expect(await fs.readFile(saved, "utf8")).toBe("original bytes must survive");
+  if (race === "regular-inode" || race === "new-target-regular")
+    expect(await fs.readFile(path, "utf8")).toBe("original bytes must survive");
+});
+it("pinned file race: refuses an ancestor swap after writable open before descriptor write", async () => {
+  const { cwd, ctx } = await fixture();
+  const parent = join(cwd, "approved");
+  const otherParent = join(cwd, "other");
+  await fs.mkdir(parent);
+  await fs.mkdir(otherParent);
+  const path = join(parent, "target");
+  await fs.writeFile(path, "original");
+  await fs.writeFile(join(otherParent, "target"), "other");
+  let approved = false;
+  let swapped = false;
+  const swap = async () => {
+    if (!approved || swapped) return;
+    swapped = true;
+    await fs.rename(parent, join(cwd, "saved"));
+    await fs.symlink(otherParent, parent, "dir");
+  };
+  const open = fs.open;
+  const writeFile = fs.writeFile;
+  vi.spyOn(fs, "open").mockImplementation(async (...args: Parameters<typeof fs.open>) => {
+    const handle = await open(...args);
+    if (typeof args[1] === "number" && args[1] & (syncFs.constants.O_WRONLY | syncFs.constants.O_RDWR)) await swap();
+    return handle;
+  });
+  vi.spyOn(fs, "writeFile").mockImplementation(async (...args: Parameters<typeof fs.writeFile>) => {
+    if (args[0] === path) await swap();
+    return writeFile(...args);
+  });
+  syncBuiltinESMExports();
+  const [, write] = createApprovalToolDefinitions({
+    source: "test",
+    isCurrent: () => true,
+    request: async () => {
+      approved = true;
+    },
+  });
+  await expect(write.execute("race", { path, content: "changed" }, undefined, undefined, ctx)).rejects.toThrow(
+    /Approval|non-symlink/,
+  );
+  expect(swapped).toBe(true);
+  expect(await fs.readFile(join(cwd, "saved", "target"), "utf8")).toBe("original");
+  expect(await fs.readFile(join(otherParent, "target"), "utf8")).toBe("other");
+});
+it.each([false, true])(
+  "pinned file controls: shorter, unchanged and missing nested writes (fallback=%s)",
+  async (fallback) => {
+    const { cwd, ctx } = await fixture();
+    if (fallback) {
+      vi.spyOn(fs, "statfs").mockRejectedValue(Object.assign(new Error("procfs unavailable"), { code: "ENOENT" }));
+      syncBuiltinESMExports();
+    }
+    const request = vi.fn(async () => {});
+    const [, write] = createApprovalToolDefinitions({ source: "test", isCurrent: () => true, request });
+    const path = join(cwd, "target");
+    await fs.writeFile(path, "long original bytes");
+    await write.execute("shorter", { path, content: "short" }, undefined, undefined, ctx);
+    expect(await fs.readFile(path, "utf8")).toBe("short");
+    await write.execute("unchanged", { path, content: "short" }, undefined, undefined, ctx);
+    expect(await fs.readFile(path, "utf8")).toBe("short");
+    const nested = join(cwd, "new", "nested", "target");
+    await write.execute("new", { path: nested, content: "created" }, undefined, undefined, ctx);
+    expect(await fs.readFile(nested, "utf8")).toBe("created");
+    expect(request).toHaveBeenCalledTimes(3);
+  },
+);
+it("pinned file identity: accepts exact virtual inode IDs above 2^53 through SDK write", async () => {
+  // Keep reason: inode identity is an approval trust boundary; large valid
+  // identities must not reject safe writes, including on macOS without procfs.
+  const { cwd, ctx } = await fixture();
+  const path = join(cwd, "large-inode");
+  await fs.writeFile(path, "original bytes");
+  const offset = 1n << 54n;
+  const observed = new Set<bigint>();
+  let numericStats = 0;
+  let descriptorStats = 0;
+  function virtualInode<T extends syncFs.Stats | syncFs.BigIntStats>(value: T): T {
+    const inode = BigInt(value.ino) + offset;
+    observed.add(inode);
+    if (typeof value.ino === "bigint") value.ino = inode;
+    else {
+      numericStats++;
+      value.ino = Number(inode);
+    }
+    return value;
+  }
+  const lstat = fs.lstat;
+  const stat = fs.stat;
+  const open = fs.open;
+  vi.spyOn(fs, "lstat").mockImplementation(async (...args: Parameters<typeof fs.lstat>) =>
+    virtualInode(await lstat(...args)),
+  );
+  vi.spyOn(fs, "stat").mockImplementation(async (...args: Parameters<typeof fs.stat>) =>
+    virtualInode(await stat(...args)),
+  );
+  vi.spyOn(fs, "open").mockImplementation(async (...args: Parameters<typeof fs.open>) => {
+    const handle = await open(...args);
+    const handleStat = handle.stat.bind(handle);
+    vi.spyOn(handle, "stat").mockImplementation(async (...options: Parameters<typeof handle.stat>) => {
+      descriptorStats++;
+      const stats = await handleStat(...options);
+      if (stats === undefined) throw new Error("Fixture handle.stat returned no stats");
+      return virtualInode(stats);
+    });
+    return handle;
+  });
+  syncBuiltinESMExports();
+  const request = vi.fn(async () => {});
+  const [, write] = createApprovalToolDefinitions({ source: "test", isCurrent: () => true, request });
+  await write.execute("large-inode", { path, content: "exact new bytes" }, undefined, undefined, ctx);
+  expect(await fs.readFile(path, "utf8")).toBe("exact new bytes");
+  expect(request).toHaveBeenCalledOnce();
+  expect(descriptorStats).toBeGreaterThan(0);
+  expect(observed.size).toBeGreaterThan(1);
+  expect([...observed].every((inode) => inode > BigInt(Number.MAX_SAFE_INTEGER))).toBe(true);
+  expect(numericStats).toBe(0);
+});
+it("pinned file fallback: detects an ancestor swap before mutation and preserves both files", async () => {
+  const { cwd, ctx } = await fixture();
+  vi.spyOn(fs, "statfs").mockRejectedValue(Object.assign(new Error("procfs unavailable"), { code: "ENOENT" }));
+  const parent = join(cwd, "approved");
+  const other = join(cwd, "other");
+  await fs.mkdir(parent);
+  await fs.mkdir(other);
+  const path = join(parent, "target");
+  await fs.writeFile(path, "original");
+  await fs.writeFile(join(other, "target"), "other");
+  let approved = false;
+  const [, write] = createApprovalToolDefinitions({
+    source: "test",
+    isCurrent: () => true,
+    request: async () => {
+      approved = true;
+    },
+  });
+  const swaps = beforeMutation(
+    path,
+    () => approved,
+    async () => {
+      await fs.rename(parent, join(cwd, "saved"));
+      await fs.symlink(other, parent, "dir");
+    },
+  );
+  await expect(write.execute("fallback-race", { path, content: "changed" }, undefined, undefined, ctx)).rejects.toThrow(
+    /Approval|non-symlink/,
+  );
+  expect(swaps()).toBe(1);
+  expect(await fs.readFile(join(cwd, "saved", "target"), "utf8")).toBe("original");
+  expect(await fs.readFile(join(other, "target"), "utf8")).toBe("other");
+});
+it.skipIf(process.platform !== "linux").each(["capability", "identity"] as const)(
+  "pinned file capability: Linux refuses %s failure rather than downgrading",
+  async (failure) => {
+    const { cwd, ctx } = await fixture();
+    const path = join(cwd, "target");
+    await fs.writeFile(path, "original");
+    let approved = false;
+    const statfs = fs.statfs;
+    const stat = fs.stat;
+    vi.spyOn(fs, "statfs").mockImplementation(async (...args: Parameters<typeof fs.statfs>) => {
+      if (approved && failure === "capability")
+        throw Object.assign(new Error("procfs disappeared"), { code: "ENOENT" });
+      return statfs(...args);
+    });
+    vi.spyOn(fs, "stat").mockImplementation(async (...args: Parameters<typeof fs.stat>) => {
+      if (approved && failure === "identity" && String(args[0]).startsWith("/proc/self/fd/"))
+        throw new Error("descriptor verification failed");
+      return stat(...args);
+    });
+    syncBuiltinESMExports();
+    const [, write] = createApprovalToolDefinitions({
+      source: "test",
+      isCurrent: () => true,
+      request: async () => {
+        approved = true;
+      },
+    });
+    await expect(
+      write.execute("no-downgrade", { path, content: "changed" }, undefined, undefined, ctx),
+    ).rejects.toThrow(/Approval.*(capability|identity)/);
+    expect(await fs.readFile(path, "utf8")).toBe("original");
+  },
+);
+it("pinned file directory creation: missing nested mkdir refuses a swapped ancestor", async () => {
+  const { cwd, ctx } = await fixture();
+  const parent = join(cwd, "approved");
+  const other = join(cwd, "other");
+  await fs.mkdir(parent);
+  await fs.mkdir(join(other, "new"), { recursive: true });
+  await fs.writeFile(join(other, "new", "target"), "other");
+  let approved = false;
+  let swaps = 0;
+  const mkdir = fs.mkdir;
+  vi.spyOn(fs, "mkdir").mockImplementation(async (...args: Parameters<typeof fs.mkdir>) => {
+    if (approved && swaps === 0) {
+      swaps++;
+      await fs.rename(parent, join(cwd, "saved"));
+      await fs.symlink(other, parent, "dir");
+    }
+    return mkdir(...args);
+  });
+  syncBuiltinESMExports();
+  const [, write] = createApprovalToolDefinitions({
+    source: "test",
+    isCurrent: () => true,
+    request: async () => {
+      approved = true;
+    },
+  });
+  await expect(
+    write.execute("mkdir-race", { path: join(parent, "new", "target"), content: "changed" }, undefined, undefined, ctx),
+  ).rejects.toThrow(/Approval|non-symlink/);
+  expect(swaps).toBe(1);
+  expect(await fs.readFile(join(other, "new", "target"), "utf8")).toBe("other");
+  expect(syncFs.existsSync(join(cwd, "saved", "new", "target"))).toBe(false);
+});
+it("pinned file controls: existing symlink ancestors are refused before requesting approval", async () => {
+  const { cwd, ctx } = await fixture();
+  await fs.mkdir(join(cwd, "real"));
+  await fs.writeFile(join(cwd, "real", "target"), "original");
+  await fs.symlink(join(cwd, "real"), join(cwd, "alias"), "dir");
+  const request = vi.fn(async () => {});
+  const [, write] = createApprovalToolDefinitions({ source: "test", isCurrent: () => true, request });
+  await expect(
+    write.execute("symlink", { path: join(cwd, "alias", "target"), content: "changed" }, undefined, undefined, ctx),
+  ).rejects.toThrow(/non-symlink/);
+  expect(request).not.toHaveBeenCalled();
+  expect(await fs.readFile(join(cwd, "real", "target"), "utf8")).toBe("original");
+});
 it("B: SDK factory prefixes the exact reviewed command without replacing output behavior", async () => {
   const { ctx, cwd } = await fixture();
   const request = vi.fn(async () => {});
