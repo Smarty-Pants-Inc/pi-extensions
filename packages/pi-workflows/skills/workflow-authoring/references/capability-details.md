@@ -2,7 +2,7 @@
 # Exhaustive workflow capability facts
 
 Contract format: `2.0.0`<br>
-Contract content / skill / extension: `1.7.5`
+Contract content / skill / extension: `1.8.0`
 
 Every exact fact below is projected from the installed extension's capability contract. Explanatory judgment belongs in the hand-written references next to this file.
 
@@ -224,7 +224,7 @@ Every exact fact below is projected from the installed extension's capability co
 - Classification: `workflow-tool-input`
 - Support: `supported`
 - Signature: `script?: string`
-- Constraint: required raw JavaScript workflow source unless `name` is given
+- Constraint: disabled in this build: every inline script tool call is refused because node:vm is not a sandbox
 
 <a id="workflow-tool-input-name"></a>
 ## name
@@ -232,8 +232,8 @@ Every exact fact below is projected from the installed extension's capability co
 - Classification: `workflow-tool-input`
 - Support: `supported`
 - Signature: `name?: string`
-- Constraint: resolves a saved workflow first, then one of the 5 built-in patterns
-- Constraint: mutually exclusive with script and resumeFromRunId
+- Constraint: disabled in this build: every workflow tool call is refused before any saved file is read (smarty-dev#11769)
+- Constraint: saved and built-in workflows run only through user-typed slash commands
 
 <a id="workflow-tool-input-args"></a>
 ## args
@@ -301,7 +301,7 @@ Every exact fact below is projected from the installed extension's capability co
 - Classification: `workflow-tool-input`
 - Support: `supported`
 - Signature: `resumeFromRunId?: string`
-- Constraint: resumes a prior incomplete run with an edited script
+- Constraint: disabled in this build: refused by the workflow tool like every other call; workflow_control resume is refused too; resume is the user's /workflows resume
 - Constraint: original args and execution limits are reused on resume
 - Constraint: unchanged positional calls replay from cache until the first changed call
 - Constraint: always runs in the background

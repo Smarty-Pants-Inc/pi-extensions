@@ -66,6 +66,7 @@ test("settings screen exposes bounded controls and invalid files remain repairab
     screen.items.map((item) => [item.id, item.currentValue]),
     [
       ["enabled", "On"],
+      ["allowCanonicalHistory", "Off"],
       ["requestTimeoutMs", "5 min"],
       ["maxRetries", "2"],
       ["replacementTokenBudget", "64K tokens"],
@@ -115,12 +116,14 @@ test("menu actions persist exact setting patches", async () => {
     value,
   });
   await menu.actions["set-enabled"](action("Off"));
+  await menu.actions["set-canonical"](action("On"));
   await menu.actions["set-timeout"](action("10 min"));
   await menu.actions["set-retries"](action("1"));
   await menu.actions["set-retention"](action("96K tokens"));
   await menu.actions["set-notify"](action("Off"));
   assert.deepEqual(memory.patches, [
     { enabled: false },
+    { allowCanonicalHistory: true },
     { requestTimeoutMs: 600_000 },
     { maxRetries: 1 },
     { replacementTokenBudget: 96_000 },
@@ -128,7 +131,7 @@ test("menu actions persist exact setting patches", async () => {
   ]);
 });
 
-test("TUI manual action compacts once after close and reports core errors", async () => {
+test("TUI manual action compacts once after close and reports fixed credential-free failure", async () => {
   const memory = memoryRuntime();
   let compactions = 0;
   let compactOptions: { onError?: (error: Error) => void } | undefined;
@@ -146,8 +149,10 @@ test("TUI manual action compacts once after close and reports core errors", asyn
     isCurrent: () => true,
   });
   assert.equal(compactions, 1);
-  compactOptions?.onError?.(new Error("nothing to compact"));
-  assert.match(notifications.at(-1)?.message ?? "", /nothing to compact/);
+  compactOptions?.onError?.(
+    new Error("https://USER_CANARY:PASS_CANARY@failure.test/?token=TOKEN_CANARY Authorization: Bearer HEADER_CANARY"),
+  );
+  assert.equal(notifications.at(-1)?.message, "Compaction failed.");
   assert.equal(notifications.at(-1)?.level, "error");
 });
 
@@ -171,6 +176,31 @@ test("stale menu ownership cannot trigger delayed manual compaction", async () =
   });
   assert.equal(compactions, 0);
 });
+
+for (const retirement of ["abort", "navigation"] as const) {
+  test(`late manual error after menu close and ${retirement} cannot notify stale UI`, async () => {
+    const memory = memoryRuntime();
+    const controller = new AbortController();
+    let current = true;
+    let compactOptions: { onError?: (error: Error) => void } | undefined;
+    const { ctx, notifications } = createMockContext({
+      mode: "tui",
+      select: async (_title: string, options: string[]) => options.find((option) => option.startsWith("Compact now")),
+      compact: (options: { onError?: (error: Error) => void }) => {
+        compactOptions = options;
+      },
+    });
+    await showCodexCompactMenu(memory.runtime, ctx, {
+      signal: controller.signal,
+      isCurrent: () => current,
+    });
+    assert.ok(compactOptions?.onError, "manual action has closed and dispatched compaction");
+    if (retirement === "abort") controller.abort();
+    else current = false;
+    compactOptions.onError(new Error("https://USER_CANARY:PASS_CANARY@failure.test/?token=TOKEN_CANARY"));
+    assert.deepEqual(notifications, []);
+  });
+}
 
 test("non-TUI command reports the settings path without compacting", async () => {
   const memory = memoryRuntime();

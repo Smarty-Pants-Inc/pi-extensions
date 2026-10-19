@@ -95,15 +95,12 @@ describe("hasTriggerWord — what counts as typing the word", () => {
 });
 
 describe("WORKFLOW_ARMED_DIRECTIVE", () => {
-  it("authorizes rather than instructs, so a conversational turn stays conversational", () => {
-    expect(WORKFLOW_ARMED_DIRECTIVE).toContain("authorized");
+  it("points to user slash commands without enabling the disabled model tool", () => {
+    expect(WORKFLOW_ARMED_DIRECTIVE).toContain("smarty-dev#11769");
+    expect(WORKFLOW_ARMED_DIRECTIVE).toContain("user-typed slash command");
     expect(WORKFLOW_ARMED_DIRECTIVE).toContain("permission, not an instruction");
+    expect(WORKFLOW_ARMED_DIRECTIVE).toContain("do not call the disabled tool");
     expect(WORKFLOW_ARMED_DIRECTIVE).toContain("do not run a workflow");
-  });
-
-  it("explains that a background run ending the turn is expected, not a stall", () => {
-    expect(WORKFLOW_ARMED_DIRECTIVE).toContain("background");
-    expect(WORKFLOW_ARMED_DIRECTIVE).toContain("stall");
   });
 
   it("keeps one directive when an earlier hook added it more than once", () => {

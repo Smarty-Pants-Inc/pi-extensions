@@ -18,7 +18,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
 import { test } from "vitest";
-import btw from "../src/btw.js";
+import btw, { resolveBtwModel, runBtwThread } from "../src/btw.js";
 import { runBtwFullscreen } from "../src/fullscreen-ui.js";
 import { runBtwMenuPreservingEditor, showBtwCommandMenu } from "../src/menu.js";
 
@@ -26,7 +26,7 @@ initTheme("dark", false);
 
 // Call Pi's actual showExtensionCustom implementation on a minimal TUI shell.
 // In particular, its savedText/restoreEditor logic must not be simulated away.
-function createPiEditorHost(initialText: string) {
+function createPiEditorHost(initialText: string, laterCompletionText?: string) {
   let editorText = initialText;
   let openComponent: Component | undefined;
   let opened!: () => void;
@@ -73,7 +73,16 @@ function createPiEditorHost(initialText: string) {
     keybindings: { matches: () => false, getKeys: () => [] },
   }) as unknown as { showExtensionCustom: ExtensionCommandContext["ui"]["custom"] };
   const custom: ExtensionCommandContext["ui"]["custom"] = (factory, options) =>
-    host.showExtensionCustom(factory, options);
+    host.showExtensionCustom(
+      (tui, theme, keys, done) =>
+        factory(tui, theme, keys, (result) => {
+          done(result);
+          // A later writer runs after native savedText restoration but before
+          // the shared adapter's synchronous repair.
+          if (laterCompletionText !== undefined) editor.setText(laterCompletionText);
+        }),
+      options,
+    );
   return {
     custom,
     editor,
@@ -570,3 +579,484 @@ test.each(
     (["writer-before-btw", "btw-before-writer"] as const).map((order) => [transition, order] as const),
   ),
 )("real Pi %s transition (%s) keeps the owning editor text during and after BTW closure", withRealPiFullscreen);
+
+function gate() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+test.each(
+  (["settings", "auth", "side-answer"] as const).flatMap((stage) =>
+    (["sibling", "append", "cancelled"] as const).map((navigation) => [stage, navigation] as const),
+  ),
+)("real SDK %s validates %s independently of delayed tree delivery", async (stage, navigation) => {
+  const cwd = await mkdtemp(join(tmpdir(), "btw-live-origin-"));
+  const entered = gate();
+  const releaseWork = gate();
+  const treeEntered = gate();
+  const releaseTree = gate();
+  let session: AgentSession | undefined;
+  let calls = 0;
+  let reads = 0;
+  let ownTree = false;
+  const model = { provider: "test", id: "side", reasoning: false } as Model<Api>;
+  try {
+    const settingsManager = SettingsManager.inMemory();
+    const loader = new DefaultResourceLoader({
+      cwd,
+      agentDir: cwd,
+      settingsManager,
+      noSkills: true,
+      noPromptTemplates: true,
+      noThemes: true,
+      noContextFiles: true,
+      extensionFactories: [
+        {
+          name: "two-gate-btw",
+          factory: (pi) => {
+            if (navigation === "cancelled") pi.on("session_before_tree", () => ({ cancel: true }));
+            pi.on("session_tree", async () => {
+              treeEntered.resolve();
+              await releaseTree.promise;
+            });
+            btw(pi, {
+              loadSettings: async () => {
+                if (stage === "settings") {
+                  entered.resolve();
+                  await releaseWork.promise;
+                }
+                return {};
+              },
+              resolveModel: async (_settings, ctx, isCurrent) => {
+                const selected = await resolveBtwModel({
+                  settings: {},
+                  currentModel: model,
+                  modelRegistry: ctx.modelRegistry,
+                  isCurrent,
+                });
+                return selected ? { kind: "selected", selected } : { kind: "cancelled" };
+              },
+              runFullscreen: async (ctx, run) => run(ctx),
+              runThread: (options) =>
+                runBtwThread({
+                  ...options,
+                  dependencies: {
+                    interact: async () => ({ kind: "close" }),
+                    ask: async (_thread, _question, _selected, _thinking, _ctx, steering) => {
+                      assert.notEqual(steering.prepareContext(), false);
+                      calls++;
+                      if (calls === 1) steering.submit("--with-parent=test/side queued question");
+                      entered.resolve();
+                      await releaseWork.promise;
+                      return { kind: "error", message: "side answer" };
+                    },
+                  },
+                }),
+            });
+            pi.on("session_tree", () => {
+              ownTree = true;
+            });
+          },
+        },
+      ],
+    });
+    await loader.reload();
+    const manager = SessionManager.inMemory(cwd);
+    const root = manager.appendMessage({ role: "user", content: "parent secret", timestamp: 1 });
+    const origin = manager.appendCustomEntry("origin metadata");
+    const originMessages = manager.buildSessionProjection().messages;
+    manager.branch(root);
+    const destination = manager.appendCustomEntry("destination metadata");
+    assert.deepEqual(manager.buildSessionProjection().messages, originMessages);
+    manager.branch(origin);
+    ({ session } = await createAgentSession({
+      cwd,
+      agentDir: cwd,
+      model,
+      settingsManager,
+      resourceLoader: loader,
+      sessionManager: manager,
+      noTools: "all",
+    }));
+    let editor = "owning editor";
+    await session.bindExtensions({
+      mode: "tui",
+      uiContext: {
+        getEditorText: () => editor,
+        setEditorText: (value: string) => {
+          editor = value;
+        },
+        notify() {},
+      } as never,
+    });
+    const ctx = session.extensionRunner.createCommandContext();
+    ctx.modelRegistry.getApiKeyAndHeaders = async () => {
+      if (stage === "auth") {
+        entered.resolve();
+        await releaseWork.promise;
+      }
+      return { ok: true, apiKey: "test" };
+    };
+    const projection = manager.buildSessionProjection.bind(manager);
+    manager.buildSessionProjection = () => {
+      reads++;
+      return projection();
+    };
+    const command = session.extensionRunner.getCommand("btw");
+    assert.ok(command);
+    const openingLeaf = manager.getLeafId();
+    const running = command.handler("side question", ctx);
+    await entered.promise;
+    let tree: ReturnType<AgentSession["navigateTree"]> | undefined;
+    if (navigation === "sibling") {
+      tree = session.navigateTree(destination);
+      await treeEntered.promise;
+      assert.equal(manager.getLeafId(), destination);
+    } else if (navigation === "cancelled") {
+      assert.equal((await session.navigateTree(destination)).cancelled, true);
+      assert.equal(manager.getLeafId(), openingLeaf);
+    } else {
+      manager.appendCustomEntry("ordinary appended metadata");
+    }
+    assert.equal(ownTree, false);
+    editor = "destination editor";
+    const priorReads = reads;
+    releaseWork.resolve();
+    await running;
+    assert.equal(ownTree, false, "work settled before BTW's tree handler");
+    if (navigation === "sibling") {
+      assert.equal(reads, priorReads, "no stale parent projection read");
+      assert.equal(calls, stage === "side-answer" ? 1 : 0, "no stale or queued provider request");
+    } else {
+      assert.ok(reads > priorReads, "the explicitly opted-in queued request may read an unchanged prefix");
+      assert.equal(calls, 2, "normal appends and canceled navigation preserve queued side questions");
+    }
+    assert.equal(editor, "destination editor");
+    releaseTree.resolve();
+    await tree;
+  } finally {
+    releaseWork.resolve();
+    releaseTree.resolve();
+    session?.dispose();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test.each(["pre-existing-descendant", "same-branch", "new-append"] as const)(
+  "real SDK delayed /btw menu release guards %s navigation and parent context",
+  async (navigation) => {
+    const cwd = await mkdtemp(join(tmpdir(), "btw-menu-descendant-"));
+    const menuEntered = gate();
+    const releaseMenu = gate();
+    const treeEntered = gate();
+    const releaseTree = gate();
+    let session: AgentSession | undefined;
+    let tree: ReturnType<AgentSession["navigateTree"]> | undefined;
+    let ownTree = false;
+    let reads = 0;
+    let credentialCalls = 0;
+    let interactCalls = 0;
+    let providerCalls = 0;
+    const contexts: (string | false)[] = [];
+    const editorWrites: string[] = [];
+    const model = { provider: "test", id: "side", reasoning: false } as Model<Api>;
+    try {
+      const settingsManager = SettingsManager.inMemory();
+      const loader = new DefaultResourceLoader({
+        cwd,
+        agentDir: cwd,
+        settingsManager,
+        noSkills: true,
+        noPromptTemplates: true,
+        noThemes: true,
+        noContextFiles: true,
+        extensionFactories: [
+          {
+            name: "menu-descendant-btw",
+            factory: (pi) => {
+              // An earlier session_tree handler holds delivery to BTW's own handler.
+              pi.on("session_tree", async () => {
+                treeEntered.resolve();
+                await releaseTree.promise;
+              });
+              btw(pi, {
+                // Held opening menu; it deliberately neither registers a closer nor
+                // consults ownership, so only the live-origin guard can refuse.
+                showCommandMenu: async () => {
+                  menuEntered.resolve();
+                  await releaseMenu.promise;
+                  return "start";
+                },
+                loadSettings: async () => ({}),
+                resolveModel: async (_settings, ctx, isCurrent) => {
+                  const selected = await resolveBtwModel({
+                    settings: {},
+                    currentModel: model,
+                    modelRegistry: ctx.modelRegistry,
+                    isCurrent,
+                  });
+                  return selected ? { kind: "selected", selected } : { kind: "cancelled" };
+                },
+                runFullscreen: async (ctx, run) => run(ctx),
+                runThread: (options) =>
+                  runBtwThread({
+                    ...options,
+                    dependencies: {
+                      interact: async () => {
+                        interactCalls++;
+                        return interactCalls === 1
+                          ? { kind: "submit", question: "--with-parent=test/side menu side question" }
+                          : { kind: "close" };
+                      },
+                      ask: async (_thread, _question, _selected, _thinking, _ctx, steering) => {
+                        contexts.push(steering.prepareContext());
+                        providerCalls++;
+                        if (providerCalls === 1) steering.submit("default follow-up without consent");
+                        return { kind: "error", message: "side answer" };
+                      },
+                    },
+                  }),
+              });
+              pi.on("session_tree", () => {
+                ownTree = true;
+              });
+            },
+          },
+        ],
+      });
+      await loader.reload();
+      const manager = SessionManager.inMemory(cwd);
+      manager.appendMessage({ role: "user", content: "parent secret", timestamp: 1 });
+      const ancestor = manager.appendCustomEntry("ancestor metadata");
+      ({ session } = await createAgentSession({
+        cwd,
+        agentDir: cwd,
+        model,
+        settingsManager,
+        resourceLoader: loader,
+        sessionManager: manager,
+        noTools: "all",
+      }));
+      let editor = "owning editor";
+      await session.bindExtensions({
+        mode: "tui",
+        uiContext: {
+          getEditorText: () => editor,
+          setEditorText: (value: string) => {
+            editorWrites.push(value);
+            editor = value;
+          },
+          notify() {},
+        } as never,
+      });
+      // Descendant exists after the SDK started but before /btw captures its
+      // origin; the leaf returns to the ancestor without a navigation event.
+      manager.appendMessage({ role: "user", content: "destination-only history", timestamp: 2 });
+      const descendant = manager.appendCustomEntry("pre-existing descendant metadata");
+      manager.branch(ancestor);
+      assert.equal(manager.getLeafId(), ancestor);
+      const ctx = session.extensionRunner.createCommandContext();
+      ctx.modelRegistry.getApiKeyAndHeaders = async () => {
+        credentialCalls++;
+        return { ok: true, apiKey: "test" };
+      };
+      const projection = manager.buildSessionProjection.bind(manager);
+      manager.buildSessionProjection = () => {
+        reads++;
+        return projection();
+      };
+      const command = session.extensionRunner.getCommand("btw");
+      assert.ok(command);
+      const running = command.handler("", ctx);
+      await menuEntered.promise;
+      if (navigation === "pre-existing-descendant") {
+        tree = session.navigateTree(descendant);
+        await treeEntered.promise;
+        assert.equal(manager.getLeafId(), descendant);
+      } else if (navigation === "same-branch") {
+        assert.deepEqual(await session.navigateTree(ancestor), { cancelled: false });
+        assert.equal(manager.getLeafId(), ancestor);
+      } else {
+        const appended = manager.appendCustomEntry("genuinely new appended metadata");
+        assert.notEqual(appended, descendant);
+        assert.equal(manager.getLeafId(), appended);
+      }
+      assert.equal(ownTree, false);
+      editor = "destination editor";
+      const priorReads = reads;
+      const priorCredentials = credentialCalls;
+      releaseMenu.resolve();
+      await running;
+      assert.equal(ownTree, false, "menu work settled before BTW's tree handler");
+      if (navigation === "pre-existing-descendant") {
+        assert.equal(reads, priorReads, "no stale parent projection read");
+        assert.equal(credentialCalls, priorCredentials, "no credential lookup after refusal");
+        assert.equal(interactCalls, 0, "no side thread opened");
+        assert.equal(providerCalls, 0, "no provider dispatch");
+        assert.deepEqual(contexts, []);
+      } else {
+        assert.ok(credentialCalls > priorCredentials, "accepted menu request resolves credentials");
+        assert.equal(interactCalls, 2, "accepted menu request opens the side thread");
+        assert.equal(providerCalls, 2, "explicit request and queued follow-up both dispatch");
+        assert.equal(contexts.length, 2);
+        assert.equal(typeof contexts[0], "string");
+        assert.match(contexts[0] as string, /parent secret/u, "explicit --with-parent shares parent context");
+        assert.doesNotMatch(contexts[0] as string, /destination-only history/u);
+        assert.equal(contexts[1], "", "follow-up without consent receives no parent context");
+      }
+      assert.equal(editor, "destination editor", "destination editor is not overwritten");
+      assert.deepEqual(editorWrites, []);
+      releaseTree.resolve();
+      await tree;
+      if (navigation === "pre-existing-descendant") assert.equal(ownTree, true);
+    } finally {
+      releaseMenu.resolve();
+      releaseTree.resolve();
+      await Promise.resolve(tree).catch(() => undefined);
+      session?.dispose();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  },
+  20_000,
+);
+
+test.each(["repair", "later-writer", "invalid-sdk-scope"] as const)(
+  "real Pi fullscreen completion before delayed tree delivery respects %s",
+  async (completion) => {
+    const cwd = await mkdtemp(join(tmpdir(), "btw-fullscreen-live-origin-"));
+    const laterCompletionText = completion === "later-writer" ? "later destination draft" : undefined;
+    const expectedText =
+      completion === "invalid-sdk-scope" ? "opening draft" : (laterCompletionText ?? "destination draft");
+    const host = createPiEditorHost("opening draft", laterCompletionText);
+    const providerEntered = gate();
+    const releaseProvider = gate();
+    const treeEntered = gate();
+    const releaseTree = gate();
+    let session: AgentSession | undefined;
+    let ownTree = false;
+    let providerCalls = 0;
+    let bringChoices = 0;
+    let bringDeliveries = 0;
+    const editorWrites: string[] = [];
+    const model = { provider: "test", id: "side", reasoning: false } as Model<Api>;
+    try {
+      const settingsManager = SettingsManager.inMemory();
+      const loader = new DefaultResourceLoader({
+        cwd,
+        agentDir: cwd,
+        settingsManager,
+        noSkills: true,
+        noPromptTemplates: true,
+        noThemes: true,
+        noContextFiles: true,
+        extensionFactories: [
+          {
+            name: "fullscreen-two-gate-btw",
+            factory: (pi) => {
+              pi.on("session_tree", async () => {
+                host.editor.setText("destination draft");
+                treeEntered.resolve();
+                await releaseTree.promise;
+              });
+              btw(pi, {
+                loadSettings: async () => ({}),
+                resolveModel: async () => ({ kind: "selected", selected: { model, auth: {} } }),
+                runFullscreen: runBtwFullscreen,
+                runThread: (options) =>
+                  runBtwThread({
+                    ...options,
+                    dependencies: {
+                      ask: async (_thread, _question, _selected, _thinking, _ctx, steering) => {
+                        assert.notEqual(steering.prepareContext(), false);
+                        providerCalls++;
+                        steering.submit("--with-parent=test/side queued question");
+                        providerEntered.resolve();
+                        await releaseProvider.promise;
+                        return { kind: "error", message: "late provider response" };
+                      },
+                      interact: async () => ({ kind: "bringToMain", questionDraft: "stale draft" }),
+                      chooseBringToMain: async () => {
+                        bringChoices++;
+                        return { kind: "closed" };
+                      },
+                      loadBringToMainDraft: async () => {
+                        bringDeliveries++;
+                        return "loaded";
+                      },
+                    },
+                  }),
+              });
+              pi.on("session_tree", () => {
+                ownTree = true;
+              });
+            },
+          },
+        ],
+      });
+      await loader.reload();
+      const manager = SessionManager.inMemory(cwd);
+      const root = manager.appendMessage({ role: "user", content: "same transcript", timestamp: 1 });
+      const origin = manager.appendCustomEntry("origin metadata");
+      const originMessages = manager.buildSessionProjection().messages;
+      manager.branch(root);
+      const destination = manager.appendCustomEntry("destination metadata");
+      assert.deepEqual(manager.buildSessionProjection().messages, originMessages);
+      manager.branch(origin);
+      ({ session } = await createAgentSession({
+        cwd,
+        agentDir: cwd,
+        model,
+        settingsManager,
+        resourceLoader: loader,
+        sessionManager: manager,
+        noTools: "all",
+      }));
+      await session.bindExtensions({
+        mode: "tui",
+        uiContext: {
+          custom: host.custom,
+          getEditorText: () => host.text,
+          setEditorText: (text: string) => {
+            editorWrites.push(text);
+            host.editor.setText(text);
+          },
+          notify() {},
+        } as never,
+      });
+      const command = session.extensionRunner.getCommand("btw");
+      assert.ok(command);
+      const running = command.handler("side question", session.extensionRunner.createCommandContext());
+      await host.waitForOpen();
+      await providerEntered.promise;
+      assert.equal(host.closeCount, 0);
+      const tree = session.navigateTree(destination);
+      await treeEntered.promise;
+      assert.equal(manager.getLeafId(), destination);
+      assert.equal(host.text, "destination draft");
+      assert.equal(ownTree, false);
+      if (completion === "invalid-sdk-scope") session.extensionRunner.invalidate("test retired SDK context");
+      releaseProvider.resolve();
+      await running;
+      assert.equal(ownTree, false, "fullscreen finishes before BTW's committed tree handler");
+      assert.equal(host.closeCount, 1, "native custom done restored the opening text");
+      assert.equal(host.text, expectedText);
+      assert.deepEqual(editorWrites, completion === "repair" ? ["destination draft"] : []);
+      assert.equal(providerCalls, 1, "retired queued request never dispatches");
+      assert.equal(bringChoices, 0, "retired thread never chooses bring-to-main");
+      assert.equal(bringDeliveries, 0, "retired thread never delivers bring-to-main");
+      releaseTree.resolve();
+      await tree;
+      assert.equal(ownTree, true);
+      assert.equal(host.text, expectedText);
+      assert.equal(host.closeCount, 1);
+    } finally {
+      releaseProvider.resolve();
+      releaseTree.resolve();
+      session?.dispose();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  },
+);

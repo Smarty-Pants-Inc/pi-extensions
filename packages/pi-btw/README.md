@@ -102,6 +102,10 @@ A failed active response is shown in the transcript and does not discard later s
 The footer shows `PgUp`/`PgDn` only when history can scroll; press `Ctrl+C` to cancel the active
 response and discard the ephemeral side-thread draft and steering queue.
 Steering remains entirely inside pi-btw and never appends to the main conversation or editor.
+Pending commands and side threads validate their opening manager, session ID, leaf and full raw
+branch-ID prefix at async boundaries. Ordinary appends and canceled navigation remain valid;
+observed divergence retires the operation permanently, even before its tree handler runs. Queued
+parent-history questions cannot read a destination branch or dispatch after that retirement.
 
 After at least one successful answer, press `Ctrl+R` to bring selected context to the main
 editor. The scope menu shows the size of the latest question and answer and the entire side
@@ -126,9 +130,15 @@ draft, append is the recommended default. Replace is labeled as destructive and 
 confirmation; Cancel returns to the side thread without changing either draft. Concurrent editor
 updates made while these menus are open are preserved. A success message reports whether context
 was loaded, appended, or replaced and its approximate size. If a committed session switch or
-tree navigation closes `/btw`, it preserves the editor text already written by another extension,
-regardless of handler order; a canceled switch leaves an open side thread running and its
-current main-editor draft unchanged.
+tree navigation closes `/btw`, the shared custom-editor adapter preserves an observable editor
+write made before completion and leaves a later destination write alone. Fullscreen host repair
+also runs when a provider finishes after live branch retirement but before pi-btw's tree handler:
+it is guarded by public context/editor identity, not by the retired thread's ownership. Retirement
+still blocks queued provider dispatch and bring-to-main callbacks; host repair never replays cached
+side-thread task data. This is not a universal editor-ownership guarantee: invalid SDK contexts
+and indistinguishable writes of the opening text
+cannot be recovered through Pi's public UI API. A canceled switch leaves an open side thread
+running and its current main-editor draft unchanged.
 Without an explicit bring-to-main action, closing `/btw` never adds the side thread to the main
 conversation. Completed questions,
 answers, and visibly rendered errors remain only in memory for Resume during the current extension

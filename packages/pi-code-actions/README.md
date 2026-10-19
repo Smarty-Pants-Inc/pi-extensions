@@ -52,12 +52,18 @@ Examples:
 
 - Copy: puts the snippet on your clipboard using a private temporary file that is removed afterward
 - Insert: appends the snippet to the TUI input editor. RPC cannot read or append to the client draft, so insertion requires confirmation before replacing the entire draft
-- Run: executes the snippet in your shell (asks for confirmation)
+- Run: executes the complete snippet with `bash -lc` on POSIX or `powershell -NoProfile -Command` on Windows (asks for confirmation), in the working directory captured before confirmation. Output and the shell's exit code are displayed after cleanup.
+
+`/code run` is a user-confirmed full-shell action, not an agent tool call. Tool-call permission rules and plan-mode tool restrictions do not intercept it. Confirmation is not a sandbox: review the entire snippet, and use copy/insert instead when execution is forbidden by your policy.
 
 ## Notes
 
-- Pending dialogs and clipboard utilities are cancelled on pre-switch, pre-fork, pre-tree, session start, committed tree, and shutdown events. A pre-navigation event cancels the interaction even if navigation is later vetoed; this does not provide an atomic post-veto transition.
+- Pending dialogs, clipboard utilities, and running snippets are cancelled on pre-switch, pre-fork, pre-tree, session start, committed tree, and shutdown events. A pre-navigation event cancels the interaction even if navigation is later vetoed; this does not provide an atomic post-veto transition.
 - At pre-navigation boundaries, custom TUI panes close synchronously, restoring their captured draft before navigation can write a new one.
+- Snippet subprocesses are owned locally, not delegated to a background extension. On POSIX, a detached supervisor holds a private process group alive through a 250 ms TERM grace period, then KILLs the group; this also cleans up background children after normal shell exit. Signals never target Pi's/ancestor shells' group or a previously reaped leader. Cleanup waits are bounded (up to two 1-second waits for exit/output closure). On Windows, the live supervisor anchors `taskkill /PID /T /F`, with a 1-second taskkill deadline and direct-parent fallback; this is best-effort tree cleanup, not a Windows Job Object guarantee.
+- When Pi runs under Bun (including compiled standalone builds), snippet supervision requires a Node.js executable named `node` on `PATH`; a missing executable reports a failed run. Node-hosted Pi reuses its Node executable. The supervisor must signal readiness within 5 seconds; stalled startup (for example, inherited `NODE_OPTIONS=--inspect-brk=0`) or disconnected IPC fails the run and triggers owned cleanup. This startup deadline does not limit snippet execution after readiness. Runtime/security options and the snippet environment are inherited unchanged.
+- This is lifecycle cleanup, not containment: processes that deliberately create a new session/group, detached Windows processes, an externally killed supervisor, or abrupt termination of Pi can evade cleanup. Keep long-lived services outside `/code run`.
+- Snippet output captures the first 64 KiB of stdout and stderr independently (128 KiB combined, plus small per-stream loss notices). Both pipes continue draining after overflow, without retaining further data. UTF-8 is decoded independently per stream, and a character cut at the capture boundary is dropped rather than replaced. Decoded output is also byte-bounded, including invalid UTF-8 replacement expansion. Only an overflowing stream gets a truncation notice; discarded output is not saved elsewhere. Ordinary output and exit codes are unchanged.
 - Only assistant messages are scanned.
 - Inline code uses single backticks. Code blocks use triple backticks.
 - Inline snippets are filtered to path-like content: `~/...`, `./...`, paths with 2+ slashes, or files with extensions. Use `blocks` to show only code blocks.

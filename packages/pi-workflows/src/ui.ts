@@ -1,6 +1,6 @@
 import type { ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
-import { Container, type SelectItem, SelectList, Text } from "@earendil-works/pi-tui";
+import { Key, matchesKey, type SelectItem, SelectList, Text } from "@earendil-works/pi-tui";
 import type { WorkflowEngine } from "./engine.js";
 import type { ScriptRun } from "./journal.js";
 import { sanitizeDisplayText } from "./safe-text.js";
@@ -62,6 +62,15 @@ export function formatWorkflowRunLabel(run: ScriptRun): string {
   return `${name} · ${run.status}${phases} · ${calls} calls · ${elapsed(Math.max(0, (isTerminal(run.status) ? run.updatedAt : Date.now()) - run.startedAt))}`;
 }
 
+function resultText(value: unknown): string {
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value) ?? "(no preview)";
+  } catch {
+    return "(unavailable preview)";
+  }
+}
+
 export function formatWorkflowDetail(engine: WorkflowEngine, runId: string): string {
   const state = engine.getState(runId);
   if (!state) return "Workflow run is no longer available.";
@@ -89,7 +98,7 @@ export function formatWorkflowDetail(engine: WorkflowEngine, runId: string): str
       const parts = [`  ${status.padEnd(11)} call ${sanitizeDisplayText(nodeId, MAX_ID_CHARS)}${agent}${compact}`];
       if (result?.error) parts.push(`    error: ${sanitizeDisplayText(result.error, MAX_RESULT_CHARS)}`);
       if (result?.result !== undefined && result.status === "completed") {
-        parts.push(`    result: ${sanitizeDisplayText(String(result.result), MAX_RESULT_CHARS)}`);
+        parts.push(`    result: ${sanitizeDisplayText(resultText(result.result), MAX_RESULT_CHARS)}`);
       }
       return parts.join("\n");
     });
@@ -145,12 +154,13 @@ async function selectList<T>(
   items: SelectItem[],
   renderExtra: (theme: Pick<Theme, "fg">) => string,
 ): Promise<T | undefined> {
-  if (ctx.mode !== "tui") return undefined;
-  return ctx.ui.custom<T | undefined>((_tui, theme, _keybindings, done) => {
-    const container = new Container();
-    container.addChild(new DynamicBorder((s: string) => theme.fg("borderAccent", s)));
-    container.addChild(new Text(theme.fg("accent", theme.bold(title)), 1, 0));
-    container.addChild(new Text(theme.fg("dim", renderExtra(theme)), 1, 0));
+  if (ctx.mode !== "tui" || !ctx.hasUI) return undefined;
+  return ctx.ui.custom<T | undefined>((tui, theme, _keybindings, done) => {
+    const border = new DynamicBorder((s: string) => theme.fg("borderAccent", s));
+    const heading = new Text(theme.fg("accent", theme.bold(title)), 1, 0);
+    const detail = new Text(theme.fg("dim", renderExtra(theme)), 1, 0);
+    let offset = 0;
+    let pageSize = 1;
     const list = new SelectList(items, Math.min(12, Math.max(1, items.length)), {
       selectedPrefix: (text) => theme.fg("accent", text),
       selectedText: (text) => theme.fg("accent", text),
@@ -160,13 +170,27 @@ async function selectList<T>(
     });
     list.onSelect = (item) => done(item.value as T);
     list.onCancel = () => done(undefined);
-    container.addChild(list);
-    container.addChild(new Text(theme.fg("dim", "↑↓ select · enter confirm · esc back"), 1, 0));
-    container.addChild(new DynamicBorder((s: string) => theme.fg("borderAccent", s)));
+    const hint = new Text(theme.fg("dim", "↑↓ select · enter confirm · esc back · PgUp/PgDn details"), 1, 0);
     return {
-      render: (width) => container.render(width),
-      invalidate: () => container.invalidate(),
-      handleInput: (data) => list.handleInput(data),
+      render: (width) => {
+        const top = [...border.render(width), ...heading.render(width).slice(0, 2)];
+        const bottom = [...list.render(width), ...hint.render(width), ...border.render(width)];
+        pageSize = Math.max(1, tui.terminal.rows - top.length - bottom.length - 1);
+        const lines = detail.render(width);
+        offset = Math.max(0, Math.min(offset, lines.length - pageSize));
+        return [...top, ...lines.slice(offset, offset + pageSize), ...bottom];
+      },
+      invalidate: () => {
+        heading.invalidate();
+        detail.invalidate();
+        list.invalidate();
+      },
+      handleInput: (data) => {
+        if (matchesKey(data, Key.pageDown)) offset += pageSize;
+        else if (matchesKey(data, Key.pageUp)) offset = Math.max(0, offset - pageSize);
+        else list.handleInput(data);
+        tui.requestRender();
+      },
     };
   });
 }

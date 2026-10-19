@@ -16,6 +16,7 @@
  */
 
 import { readFileSync } from "node:fs";
+import { stripVTControlCharacters } from "node:util";
 import type { UserMessage } from "@earendil-works/pi-ai";
 import {
   CustomEditor,
@@ -39,6 +40,8 @@ import {
   visibleWidth,
   wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
+
+import { installEditor } from "./editor-install.js";
 
 const MAX_MESSAGES = 100;
 /** Repeat presses while the history scan is pending cannot grow without bound. */
@@ -115,11 +118,10 @@ export default function (pi: ExtensionAPI) {
         editor.addToHistory?.(items[i]?.text);
       }
     };
-    // Compose synchronously, before the user can paste into the editor. Pi copies
-    // getText() when replacing an editor, not its private large-paste contents.
-    // When I/O finishes, update the existing instances rather than replacing them.
+    // Compose synchronously, preserving a completed startup paste through public
+    // expanded text. When I/O finishes, seed existing instances, never replace them.
     const prevComponentFactory = ctx.ui.getEditorComponent();
-    ctx.ui.setEditorComponent((tui, theme, keybindings) => {
+    installEditor(ctx.ui, (tui, theme, keybindings) => {
       const editor = prevComponentFactory?.(tui, theme, keybindings) ?? new CustomEditor(tui, theme, keybindings);
       if (generation === loadGeneration && !editors.has(editor)) {
         editors.add(editor);
@@ -254,13 +256,19 @@ type Done = (value: string | null) => void;
 
 /** Subsequence fuzzy match: all chars in needle appear in haystack in order. */
 export function subsequence(haystack: string, needle: string): boolean {
-  let hi = 0;
-  for (let ni = 0; ni < needle.length; ni++) {
-    const idx = haystack.indexOf(needle[ni], hi);
-    if (idx === -1) return false;
-    hi = idx + 1;
+  return subsequencePositions(Array.from(haystack), needle) !== undefined;
+}
+
+function subsequencePositions(haystack: string[], needle: string): number[] | undefined {
+  const positions: number[] = [];
+  let start = 0;
+  for (const point of needle) {
+    const index = haystack.indexOf(point, start);
+    if (index === -1) return undefined;
+    positions.push(index);
+    start = index + 1;
   }
-  return true;
+  return positions;
 }
 
 export function fuzzyMatch(item: string, query: string): boolean {
@@ -298,42 +306,23 @@ function highlightMatch(text: string, query: string, theme: Pick<Theme, "fg">, m
 
   if (!query) return theme.fg("text", plain);
 
-  // Find positions of subsequence-matched characters
-  const lower = plain.toLowerCase();
-  const tokens = query.toLowerCase().split(/\s+/).filter(Boolean);
-  const matchPositions = new Set<number>();
-
-  for (const token of tokens) {
-    let hi = 0;
-    for (let ni = 0; ni < token.length; ni++) {
-      const idx = lower.indexOf(token[ni], hi);
-      if (idx !== -1) {
-        matchPositions.add(idx);
-        hi = idx + 1;
-      }
-    }
+  // Search code points, but style whole graphemes (emoji/ZWJ/combining marks).
+  const graphemes = Array.from(new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(plain));
+  // Lowercase the complete string, like filtering (context-sensitive final sigma).
+  const points = Array.from(plain.toLowerCase());
+  const owners: number[] = [];
+  for (const [index, grapheme] of graphemes.entries()) {
+    owners.push(...Array.from(grapheme.segment.toLowerCase(), () => index));
   }
-
-  // Build styled string — group consecutive chars to reduce ANSI overhead
-  let result = "";
-  let i = 0;
-  while (i < plain.length) {
-    if (matchPositions.has(i)) {
-      // Collect consecutive matched chars
-      let j = i;
-      while (j < plain.length && matchPositions.has(j)) j++;
-      // Accent color + underline
-      result += `\x1b[4m${theme.fg("accent", plain.slice(i, j))}\x1b[24m`;
-      i = j;
-    } else {
-      // Collect consecutive non-matched chars
-      let j = i;
-      while (j < plain.length && !matchPositions.has(j)) j++;
-      result += theme.fg("text", plain.slice(i, j));
-      i = j;
-    }
+  const matched = new Set<number>();
+  for (const token of query.toLowerCase().split(/\s+/).filter(Boolean)) {
+    for (const position of subsequencePositions(points, token) ?? []) matched.add(owners[position]);
   }
-  return result;
+  return graphemes
+    .map(({ segment }, index) =>
+      matched.has(index) ? `\x1b[4m${theme.fg("accent", segment)}\x1b[24m` : theme.fg("text", segment),
+    )
+    .join("");
 }
 
 /**
@@ -353,6 +342,8 @@ function highlightMatch(text: string, query: string, theme: Pick<Theme, "fg">, m
 export class HistoryPopupComponent implements Component, Focusable {
   private _focused = false;
   private readonly input = new Input();
+  /** Display/search copies are separate from the exact text accepted into the editor. */
+  private readonly displayEntries: { preview: string; fullText: string; searchKey: string }[];
 
   private query = "";
   /** Indices into `history` that match the query, newest-first. */
@@ -369,6 +360,10 @@ export class HistoryPopupComponent implements Component, Focusable {
     private readonly done: Done,
     initialSelection = 0,
   ) {
+    this.displayEntries = history.map(({ text }) => {
+      const fullText = stripVTControlCharacters(text);
+      return { fullText, preview: toSingleLinePreview(fullText), searchKey: fullText.toLowerCase() };
+    });
     this.input.onEscape = () => this.done(null);
     this.input.onSubmit = () => {
       this.done(this.getCurrentEntry()?.text ?? null);
@@ -389,7 +384,7 @@ export class HistoryPopupComponent implements Component, Focusable {
   private recomputeMatches(resetPointer: boolean): void {
     const matches: number[] = [];
     for (let i = 0; i < this.history.length; i++) {
-      if (fuzzyMatch(this.history[i]?.text, this.query)) {
+      if (fuzzyMatch(this.displayEntries[i]?.searchKey, this.query)) {
         matches.push(i);
       }
     }
@@ -477,7 +472,7 @@ export class HistoryPopupComponent implements Component, Focusable {
    * overlay caps us at, minus the frame (2) and the query + help lines (2).
    */
   private layout(): { rows: number; showHelp: boolean } {
-    const terminalRows = process.stdout.rows ?? 24;
+    const terminalRows = this.tui.terminal?.rows ?? process.stdout.rows ?? 24;
     // Must mirror the overlay's own maths exactly: it resolves "85%" as
     // floor(termHeight * 85 / 100) and then hard-truncates anything taller with
     // `overlayLines.slice(0, maxHeight)` — from the BOTTOM, which would eat the
@@ -506,7 +501,7 @@ export class HistoryPopupComponent implements Component, Focusable {
     const historyIndex = this.matchIndices[matchIdx];
     const entry = historyIndex === undefined ? undefined : this.history[historyIndex];
     if (!entry) return "";
-    const text = toSingleLinePreview(entry.text);
+    const text = this.displayEntries[historyIndex]?.preview ?? "";
 
     const marker = isSelected ? "▌ " : "  ";
     const gutter = `${String(matchIdx + 1).padStart(indexWidth)} ${relativeAge(entry.timestamp, now).padStart(
@@ -531,21 +526,27 @@ export class HistoryPopupComponent implements Component, Focusable {
     const entry = this.getCurrentEntry();
     if (!entry || height <= 0) return [];
 
-    const wrapped = wrapTextWithAnsi(entry.text, width);
-    const maxOffset = Math.max(0, wrapped.length - height);
+    const historyIndex = this.matchIndices[this.matchPointer];
+    const wrapped = wrapTextWithAnsi(this.displayEntries[historyIndex]?.fullText ?? "", width);
+    // Reserve the hint before computing the viewport, never overwrite payload rows.
+    const showHint = wrapped.length > height && height > 1;
+    const contentHeight = Math.max(1, height - (showHint ? 1 : 0));
+    const maxOffset = Math.max(0, wrapped.length - contentHeight);
     // Clamp here rather than in the key handler: the pane height is only known
     // at render time, so Ctrl+D cannot know where the end is.
     this.previewOffset = Math.min(this.previewOffset, maxOffset);
 
-    const lines = wrapped.slice(this.previewOffset, this.previewOffset + height).map((line) => t.fg("text", line));
+    const lines = wrapped
+      .slice(this.previewOffset, this.previewOffset + contentHeight)
+      .map((line) => t.fg("text", line));
 
-    if (maxOffset > 0 && lines.length > 0) {
+    if (showHint) {
       // Spend the last row on a scroll indicator — without it, a truncated
       // preview is indistinguishable from a short prompt.
       const remaining = maxOffset - this.previewOffset;
       const hint =
         remaining > 0 ? `↓ ${remaining} more line${remaining === 1 ? "" : "s"} · ctrl+d/u` : "↑ ctrl+u to scroll back";
-      lines[lines.length - 1] = t.fg("dim", truncateToWidth(hint, width));
+      lines.push(t.fg("dim", truncateToWidth(hint, width)));
     }
     return lines;
   }
@@ -650,8 +651,8 @@ function collectBranchHistory(ctx: ExtensionContext): HistoryEntry[] {
       if (entry.type !== "message") continue;
       const message = entry.message as { role?: unknown; content?: unknown };
       if (message.role !== "user") continue;
-      const text = extractText(message.content as UserMessage["content"])?.trim();
-      if (text && text.length > 0) {
+      const text = extractText(message.content as UserMessage["content"]);
+      if (text?.trim()) {
         history.push({ text, timestamp: parseTimestamp(entry.timestamp) });
       }
     }
@@ -687,10 +688,9 @@ async function loadRecentPrompts(cwd: string, sessionDir: string, maxMessages: n
       const userMessages = extractUserMessages(session.path);
       for (const msg of userMessages) {
         if (allMessages.length >= maxMessages) break;
-        const trimmed = msg.text.trim();
-        if (trimmed && !seen.has(trimmed)) {
-          seen.add(trimmed);
-          allMessages.push({ text: trimmed, timestamp: msg.timestamp });
+        if (msg.text.trim() && !seen.has(msg.text)) {
+          seen.add(msg.text);
+          allMessages.push(msg);
         }
       }
     }
@@ -723,9 +723,10 @@ function extractUserMessages(sessionPath: string): HistoryEntry[] {
 
 export function extractText(content: UserMessage["content"]): string | null {
   if (typeof content === "string") return content || null;
-  return (
-    content.find(
-      (c): c is { type: "text"; text: string } => c.type === "text" && typeof c.text === "string" && c.text.length > 0,
-    )?.text ?? null
-  );
+  // Text-only recall: image parts cannot be restored by the editor text API.
+  const text = content
+    .filter((part): part is { type: "text"; text: string } => part.type === "text" && typeof part.text === "string")
+    .map((part) => part.text)
+    .join("");
+  return text || null;
 }

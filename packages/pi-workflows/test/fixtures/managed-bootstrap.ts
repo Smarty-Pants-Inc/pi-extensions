@@ -156,7 +156,11 @@ if (mode === "slow") {
   assert.equal(spawns, 2);
 } else if (mode === "busy") {
   assert.match(JSON.stringify(outcome) + JSON.stringify(entries), /Script execution timed out after 1000ms/);
-  assert.equal(spawns, 0, "timed-out script must not allocate a deferred child");
+  assert.ok(spawns <= 1, "only the call posted before the loop may be admitted");
+  assert.ok(
+    [...allocations.values()].every((allocation) => allocation.cleaned),
+    "admitted calls must settle before failure publication",
+  );
 } else {
   assert.ok(reconciliations > 0);
   assert.equal(cleanedAtSettlement, true, "run must await exact-owner cleanup");

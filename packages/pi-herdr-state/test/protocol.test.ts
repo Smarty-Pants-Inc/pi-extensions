@@ -250,14 +250,14 @@ test("poll allocation is session-scoped: discovery/headless zero, TUI one, shutd
     assert.equal(interval.mock.calls.length, 0);
     await pi.emit("session_start", { reason: "startup" }, context("tui", undefined, "tui"));
     await pi.emit("session_start", { reason: "startup" }, context("tui", undefined, "tui"));
-    assert.equal(interval.mock.calls.length, 1);
-    assert.equal(clear.mock.calls.length, 0);
+    assert.equal(interval.mock.calls.length, 2);
+    assert.equal(clear.mock.calls.length, 1, "replacement retires the captured old poll; exactly one remains live");
     await pi.emit("session_shutdown", { reason: "reload" });
-    assert.equal(clear.mock.calls.length, 1);
+    assert.equal(clear.mock.calls.length, 2);
     await pi.emit("session_shutdown", { reason: "reload" });
     await pi.emit("session_start", { reason: "startup" }, context("tui", undefined, "tui"));
-    assert.equal(interval.mock.calls.length, 1);
-    assert.equal(clear.mock.calls.length, 1);
+    assert.equal(interval.mock.calls.length, 2);
+    assert.equal(clear.mock.calls.length, 2);
   } finally {
     await pi.emit("session_shutdown", { reason: "reload" });
     interval.mockRestore();

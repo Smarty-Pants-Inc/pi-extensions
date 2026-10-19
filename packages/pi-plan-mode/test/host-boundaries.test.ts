@@ -205,8 +205,24 @@ test("committed tree A -> earlier inactive -> A restores state without writing A
   try {
     const manager = f.session.sessionManager;
     const inactive = manager.appendCustomEntry("plan-mode-state", { enabled: false, awaitingAction: false });
+    manager.appendCustomEntry("setup", {});
+    await f.session.navigateTree(inactive);
     await f.command("start");
     const completed = f.tool("plan_mode_complete");
+    const native = {
+      role: "user" as const,
+      content: [{ type: "text" as const, text: "Plan Branch A" }],
+      timestamp: Date.now(),
+    };
+    await f.runner.emitInput("Plan Branch A", undefined, "rpc");
+    await f.runner.emit({ type: "message_start", message: native });
+    manager.appendMessage(native);
+    await f.runner.emitToolCall({
+      type: "tool_call",
+      toolName: "plan_mode_complete",
+      toolCallId: "complete",
+      input: { plan: "# Branch A" },
+    });
     const result = await completed.execute(
       "complete",
       { plan: "# Branch A" },
@@ -329,11 +345,17 @@ test("committed tree restores implementation retention without arming cleanup be
       awaitingAction: false,
       activeImplementation: implementation,
     });
+    manager.appendCustomEntry("setup", {});
+    await f.session.navigateTree(target);
     await f.command("start");
     await f.session.navigateTree(target);
     await f.runner.emit({ type: "agent_settled", reason: "completed" } as never);
     assert.equal(manager.getLeafId(), target, "no outgoing or prematurely settled state written onto the target");
-    const context = await f.runner.emitContext([{ role: "user", content: "Continue", timestamp: 1 }]);
+    await f.runner.emitInput("Continue", undefined, "rpc");
+    const native = { role: "user" as const, content: [{ type: "text" as const, text: "Continue" }], timestamp: 1 };
+    await f.runner.emit({ type: "message_start", message: native });
+    manager.appendMessage(native);
+    const context = await f.runner.emitContext([native]);
     assert.match(JSON.stringify(context), /Target plan/);
     await f.runner.emit({ type: "agent_settled", reason: "completed" } as never);
     const state = manager
@@ -356,6 +378,8 @@ test.each(["tool", "exit", "tree", "shutdown"] as const)(
         enabled: false,
         awaitingAction: false,
       });
+      f.session.sessionManager.appendCustomEntry("setup", {});
+      await f.session.navigateTree(inactive);
       await f.command("start");
       let opened!: () => void;
       const opening = new Promise<void>((resolve) => {

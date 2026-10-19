@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
 import planMode from "../src/plan-mode.js";
+import { nativeInput } from "./native-input.js";
 import { createMockContext, createMockPi } from "./support.js";
 
 test("issue 302: re-entered Plan Mode hides the previous implementation handoff", async () => {
@@ -25,13 +26,16 @@ test("issue 302: re-entered Plan Mode hides the previous implementation handoff"
   assert.ok(contextHook);
   const implementationMessages = [
     { role: "user", content: "Plan a one-line README change." },
-    { role: "user", content: implementationHandoff },
+    await nativeInput(mock, context.ctx, implementationHandoff, "extension"),
     { role: "assistant", content: "Implemented the requested plan." },
   ];
   const inactiveContext = (await contextHook({ messages: implementationMessages }, context.ctx)) as {
     messages: unknown[];
   };
-  assert.deepEqual(inactiveContext.messages, implementationMessages);
+  assert.equal(inactiveContext.messages.length, implementationMessages.length);
+  assert.deepEqual(inactiveContext.messages[0], implementationMessages[0]);
+  assert.equal((inactiveContext.messages[1] as { customType?: string }).customType, "plan-mode-implementation-handoff");
+  assert.deepEqual(inactiveContext.messages[2], implementationMessages[2]);
 
   await mock.commands.get("plan")?.handler("start", context.ctx);
   assert.equal(context.statuses.get("plan-mode"), "plan active");

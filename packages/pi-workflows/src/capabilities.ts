@@ -252,7 +252,7 @@ export const WORKFLOW_CAPABILITIES: readonly CapabilityEntry[] = [
     classification: "workflow-tool-input",
     signature: "script?: string",
     options: [],
-    constraints: ["required raw JavaScript workflow source unless `name` is given"],
+    constraints: ["disabled in this build: every inline script tool call is refused because node:vm is not a sandbox"],
   },
   {
     name: "name",
@@ -260,8 +260,8 @@ export const WORKFLOW_CAPABILITIES: readonly CapabilityEntry[] = [
     signature: "name?: string",
     options: [],
     constraints: [
-      "resolves a saved workflow first, then one of the 5 built-in patterns",
-      "mutually exclusive with script and resumeFromRunId",
+      "disabled in this build: every workflow tool call is refused before any saved file is read (smarty-dev#11769)",
+      "saved and built-in workflows run only through user-typed slash commands",
     ],
   },
   { name: "args", classification: "workflow-tool-input", signature: "args?: unknown", options: [], constraints: [] },
@@ -325,7 +325,7 @@ export const WORKFLOW_CAPABILITIES: readonly CapabilityEntry[] = [
     signature: "resumeFromRunId?: string",
     options: [],
     constraints: [
-      "resumes a prior incomplete run with an edited script",
+      "disabled in this build: refused by the workflow tool like every other call; workflow_control resume is refused too; resume is the user's /workflows resume",
       "original args and execution limits are reused on resume",
       "unchanged positional calls replay from cache until the first changed call",
       "always runs in the background",

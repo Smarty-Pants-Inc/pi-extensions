@@ -7,13 +7,14 @@
 
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import { type Component, Input, matchesKey, type TUI, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { sanitizeDisplayText } from "@signalridge/pi-ui";
 import { renderAgentName } from "../agent-color.js";
 import { extractText } from "../context.js";
 import type { AgentRecordSnapshot } from "../types.js";
 import { getLifetimeTotal, getSessionContextPercent } from "../usage.js";
 import type { Theme } from "./agent-display.js";
 import { type AgentActivity, buildInvocationTags, describeActivity, fgPreservingNestedStyles, formatDuration, formatSessionTokens, getPromptModeLabel } from "./agent-display.js";
-import { PREVIEW_SCAN_LIMIT, safeTerminalText, sanitizeDisplayText, truncateCodePoints } from "./safe-text.js";
+import { PREVIEW_SCAN_LIMIT, safeTerminalText, truncateCodePoints } from "./safe-text.js";
 import { getAgentStatusColor, getAgentStatusLabel, getAgentStatusMark } from "./status-label.js";
 import { createViewerKeys, type ViewerKeybindings, type ViewerKeys } from "./viewer-keys.js";
 
@@ -56,6 +57,10 @@ function isBashExecutionMessage(message: { role: string }): message is BashExecu
     && typeof message.output === "string";
 }
 
+// biome-ignore lint/suspicious/noConfusingVoidType: preserve existing void-returning steering callbacks.
+export type SteerAcceptance = boolean | void;
+export type SteerHandler = (message: string) => SteerAcceptance | Promise<SteerAcceptance>;
+
 export class ConversationViewer implements Component {
   private scrollOffset = 0;
   private autoScroll = true;
@@ -67,6 +72,8 @@ export class ConversationViewer implements Component {
   private keys: ViewerKeys;
   /** Steering composer — present while the user is typing a message to the agent. */
   private composer: Input | undefined;
+  private steerError: string | undefined;
+  private sending = false;
 
   constructor(
     private tui: TUI,
@@ -80,7 +87,7 @@ export class ConversationViewer implements Component {
     /** User keybindings from `ctx.ui.custom()`. Omitted → hardcoded defaults. */
     keybindings?: ViewerKeybindings,
     /** Send a steering message to the agent. Omitted → no compose affordance. */
-    private onSteer?: (message: string) => void,
+    private onSteer?: SteerHandler,
     /** Retrieve a fresh public snapshot so the viewer reflects status changes. */
     private getRecord?: () => AgentRecordSnapshot | undefined,
   ) {
@@ -92,16 +99,19 @@ export class ConversationViewer implements Component {
   }
 
   private refreshRecord(): AgentRecordSnapshot {
-    const current = this.getRecord?.();
-    if (current) this.record = current;
+    try {
+      const current = this.getRecord?.();
+      if (current) this.record = current;
+    } catch { /* a disposed owner cannot erase the retained snapshot */ }
     return this.record;
   }
 
   handleInput(data: string): void {
+    if (this.closed) return;
     // While composing a steer message, the input owns all keys (Enter sends,
     // Esc cancels — both wired in openComposer()). Editing keys flow through.
     if (this.composer) {
-      this.composer.handleInput(data);
+      if (!this.sending || matchesKey(data, "escape")) this.composer.handleInput(data);
       this.tui.requestRender();
       return;
     }
@@ -206,9 +216,9 @@ export class ConversationViewer implements Component {
     const headerStats: string[] = [duration];
     const toolUses = this.activity?.toolUses ?? this.record.toolUses;
     if (toolUses > 0) headerStats.unshift(`tools ${toolUses}`);
-    const tokens = getLifetimeTotal(this.activity?.lifetimeUsage);
-    if (tokens > 0) {
-      const percent = getSessionContextPercent(this.activity?.session);
+    const tokens = getLifetimeTotal(this.activity?.lifetimeUsage ?? this.record.lifetimeUsage);
+    if (tokens > 0 || this.record.compactionCount > 0) {
+      const percent = getSessionContextPercent(this.activity?.session ?? this.session);
       headerStats.push(formatSessionTokens(tokens, percent, th, this.record.compactionCount));
     }
 
@@ -245,10 +255,8 @@ export class ConversationViewer implements Component {
       const renderedComposer = this.composer.render(innerW)[0] ?? "";
       const composerLine = renderedComposer.startsWith("> ") ? renderedComposer.slice(2) : renderedComposer;
       lines.push(row(composerLine));
-      const composeHint = th.fg("dim", "Enter send · Esc cancel");
-      const composeLeft = th.fg("accent", "chat");
-      const composeGap = Math.max(1, innerW - visibleWidth(composeLeft) - visibleWidth(composeHint));
-      lines.push(row(composeLeft + " ".repeat(composeGap) + composeHint));
+      const composeHint = this.sending ? "Sending..." : this.steerError ?? "Enter send · Esc cancel";
+      lines.push(row(th.fg(this.steerError ? "error" : "dim", composeHint)));
     } else {
       const sep = th.fg("dim", " · ");
       const actions: string[] = [];
@@ -278,13 +286,13 @@ export class ConversationViewer implements Component {
   /** Stoppable only when a stop handler exists and the agent is still active. */
   private isStoppable(): boolean {
     const record = this.refreshRecord();
-    return !!this.onStop && (record.status === "running" || record.status === "queued");
+    return !record.detached && !!this.onStop && (record.status === "running" || record.status === "queued");
   }
 
   /** Steerable only when a steer handler exists and the agent is still active. */
   private canSteer(): boolean {
     const record = this.refreshRecord();
-    return !!this.onSteer && (record.status === "running" || record.status === "queued");
+    return !record.detached && !!this.onSteer && (record.status === "running" || record.status === "queued");
   }
 
   /** Open the inline steering composer and route subsequent input to it. */
@@ -293,12 +301,34 @@ export class ConversationViewer implements Component {
     input.focused = true;
     input.onSubmit = (value: string) => {
       const message = value.trim();
-      this.composer = undefined;
-      if (message) this.onSteer?.(message);
+      if (!message) { this.composer = undefined; this.tui.requestRender(); return; }
+      if (!this.canSteer()) {
+        this.steerError = "Agent finished; draft retained · Esc cancel";
+        this.tui.requestRender();
+        return;
+      }
+      this.steerError = undefined;
+      const settle = (accepted: SteerAcceptance): void => {
+        if (this.closed || this.composer !== input) return;
+        this.sending = false;
+        if (accepted === false) this.steerError = "Steering rejected; draft retained · Esc cancel";
+        else this.composer = undefined;
+        this.tui.requestRender();
+      };
+      const reject = (): void => settle(false);
+      try {
+        const result = this.onSteer?.(message);
+        if (result && typeof result === "object") {
+          this.sending = true;
+          void result.then(settle, reject);
+        } else settle(result);
+      } catch { reject(); }
       this.tui.requestRender();
     };
     input.onEscape = () => {
       this.composer = undefined;
+      this.steerError = undefined;
+      this.sending = false;
       this.tui.requestRender();
     };
     this.composer = input;
@@ -336,14 +366,15 @@ export class ConversationViewer implements Component {
     const { modelName, tags } = buildInvocationTags(this.record.invocation);
     const parts = modelName ? [modelName, ...tags] : tags;
     if (parts.length === 0) return undefined;
-    return this.theme.fg("dim", `  invocation · ${parts.join(" · ")}`);
+    return this.theme.fg("dim", `  invocation · ${parts.map(part => sanitizeDisplayText(part)).join(" · ")}`);
   }
 
   private buildContentLines(width: number): string[] {
     if (width <= 0) return [];
 
     const th = this.theme;
-    const messages = this.session.messages;
+    let messages: AgentSession["messages"];
+    try { messages = this.session.messages; } catch { messages = []; }
     const lines: string[] = [];
 
     if (messages.length === 0) {

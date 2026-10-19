@@ -15,6 +15,7 @@ import {
   sessionEntryToContextMessages,
 } from "@earendil-works/pi-coding-agent";
 import { type Component, Container, Text, type TUI, truncateToWidth } from "@earendil-works/pi-tui";
+import { captureSessionOrigin } from "./session-origin.ts";
 
 type Model = Parameters<typeof completeSimple>[0];
 
@@ -324,6 +325,7 @@ async function generateRecap(
   signal: AbortSignal | undefined,
   isCurrent: () => boolean,
 ): Promise<RecapGeneration | undefined> {
+  if (signal?.aborted || !isCurrent()) return undefined;
   // Ambient-auth providers can succeed without returning an API key.
   const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
   if (signal?.aborted || !isCurrent() || !auth?.ok) return undefined;
@@ -383,6 +385,7 @@ async function generateRecap(
     throw err;
   }
 
+  if (signal?.aborted || !isCurrent()) return undefined;
   const text = response.content
     .filter((c): c is { type: "text"; text: string } => c.type === "text")
     .map((c) => c.text)
@@ -690,7 +693,9 @@ export default function (pi: ExtensionAPI) {
     if (!hasRecapUi(ctx)) return;
     const generation = sessionGeneration;
     const sessionManager = ctx.sessionManager;
-    if (!isCurrentIdentity(generation, sessionManager)) return;
+    const ownsOrigin = captureSessionOrigin(ctx);
+    const isCurrent = () => ownsOrigin() && isCurrentIdentity(generation, sessionManager);
+    if (!isCurrent()) return;
 
     // A context hook can redact only the parent request, not this independent
     // completion. Projected SessionManager entries are pre-hook, unredacted history.
@@ -730,6 +735,7 @@ export default function (pi: ExtensionAPI) {
       );
     };
 
+    if (!isCurrent()) return;
     const entries = projectedEntries(sessionManager);
     if (reason !== "manual" && !hasMeaningfulActivity(entries)) return;
 
@@ -748,12 +754,12 @@ export default function (pi: ExtensionAPI) {
 
     try {
       const result = await generateRecap(recapContext, ctx, model, controller.signal, () => {
-        if (!isCurrentIdentity(generation, sessionManager) || !stillAuthorized()) return false;
+        if (!isCurrent() || !stillAuthorized()) return false;
         const currentEntries = projectedEntries(sessionManager);
         if (reason !== "manual" && !hasMeaningfulActivity(currentEntries)) return false;
         return JSON.stringify(buildRecapContext(currentEntries, sessionManager.getBranch())) === startContext;
       });
-      if (!isCurrentIdentity(generation, sessionManager) || !stillAuthorized() || controller.signal.aborted) return;
+      if (!isCurrent() || !stillAuthorized() || controller.signal.aborted) return;
       if (result?.kind === "endpoint-mismatch") {
         if (reason === "manual") {
           try {
@@ -772,18 +778,18 @@ export default function (pi: ExtensionAPI) {
       const currentEntries = projectedEntries(sessionManager);
       if (reason !== "manual" && !hasMeaningfulActivity(currentEntries)) return;
       const currentContext = buildRecapContext(currentEntries, sessionManager.getBranch());
-      if (!isCurrentIdentity(generation, sessionManager) || JSON.stringify(currentContext) !== startContext) return;
+      if (!isCurrent() || JSON.stringify(currentContext) !== startContext) return;
 
       lastDraftedContext = startContext;
       clearIdleTimer();
       clearPostSettleTimer();
       showRecap(ctx, result.text);
     } catch (err) {
-      if (!controller.signal.aborted) console.error("[session-recap] failed:", err);
+      if (!controller.signal.aborted && isCurrent()) console.error("[session-recap] failed:", err);
     } finally {
       if (activeController === controller) {
         activeController = undefined;
-        if (showStatus && isCurrentIdentity(generation, sessionManager)) setRecapStatus(ctx, undefined);
+        if (showStatus && isCurrent()) setRecapStatus(ctx, undefined);
       }
     }
   };
@@ -793,15 +799,17 @@ export default function (pi: ExtensionAPI) {
     reason: RecapReason,
     generation: number,
     sessionManager: ExtensionContext["sessionManager"],
+    ownsOrigin: () => boolean,
   ): void => {
-    if (!isCurrentIdentity(generation, sessionManager)) return;
+    if (!ownsOrigin() || !isCurrentIdentity(generation, sessionManager)) return;
     void Promise.resolve()
       .then(() => {
-        if (!isCurrentIdentity(generation, sessionManager)) return;
+        if (!ownsOrigin() || !isCurrentIdentity(generation, sessionManager)) return;
         return generateAndShow(ctx, reason);
       })
       .catch((err: unknown) => {
-        if (isCurrentIdentity(generation, sessionManager)) console.error("[session-recap] failed:", err);
+        if (ownsOrigin() && isCurrentIdentity(generation, sessionManager))
+          console.error("[session-recap] failed:", err);
       });
   };
 
@@ -813,7 +821,7 @@ export default function (pi: ExtensionAPI) {
     if (!activeController) {
       const generation = sessionGeneration;
       const sessionManager = ctx.sessionManager;
-      runGenerationSafely(ctx, "focus", generation, sessionManager);
+      runGenerationSafely(ctx, "focus", generation, sessionManager, captureSessionOrigin(ctx));
     }
   };
 
@@ -827,10 +835,11 @@ export default function (pi: ExtensionAPI) {
 
     const generation = sessionGeneration;
     const sessionManager = ctx.sessionManager;
+    const ownsOrigin = captureSessionOrigin(ctx);
     const timer = setTimeout(
       () => {
         if (awayTimer === timer) awayTimer = undefined;
-        if (!isCurrentIdentity(generation, sessionManager)) return;
+        if (!ownsOrigin() || !isCurrentIdentity(generation, sessionManager)) return;
         tryAwayRecap(ctx);
       },
       flagMilliseconds("recap-away-seconds", DEFAULT_AWAY_SECONDS),
@@ -959,6 +968,7 @@ export default function (pi: ExtensionAPI) {
     // queued work, so neither automatic timer starts from an intermediate run.
     const generation = sessionGeneration;
     const sessionManager = ctx.sessionManager;
+    const ownsOrigin = captureSessionOrigin(ctx);
     if (ctx.mode === "tui" && isBlurred) {
       // The blur threshold can expire during the settlement debounce. Let the
       // settled path own the recap so later handlers can queue a continuation.
@@ -966,7 +976,7 @@ export default function (pi: ExtensionAPI) {
       clearPostSettleTimer();
       const timer = setTimeout(() => {
         if (postSettleTimer === timer) postSettleTimer = undefined;
-        if (!isCurrentIdentity(generation, sessionManager)) return;
+        if (!ownsOrigin() || !isCurrentIdentity(generation, sessionManager)) return;
         tryAwayRecap(ctx);
       }, POST_SETTLE_DEBOUNCE_MS);
       postSettleTimer = timer;
@@ -977,8 +987,8 @@ export default function (pi: ExtensionAPI) {
       const timer = setTimeout(
         () => {
           if (idleTimer === timer) idleTimer = undefined;
-          if (!isCurrentIdentity(generation, sessionManager)) return;
-          if (!focusEventsSeen) runGenerationSafely(ctx, "idle", generation, sessionManager);
+          if (!ownsOrigin() || !isCurrentIdentity(generation, sessionManager)) return;
+          if (!focusEventsSeen) runGenerationSafely(ctx, "idle", generation, sessionManager, ownsOrigin);
         },
         flagMilliseconds("recap-idle-seconds", DEFAULT_IDLE_SECONDS),
       );
@@ -1032,10 +1042,11 @@ export default function (pi: ExtensionAPI) {
     if (event.reason === "resume" || event.reason === "fork") {
       const generation = sessionGeneration;
       const sessionManager = ctx.sessionManager;
+      const ownsOrigin = captureSessionOrigin(ctx);
       const timer = setTimeout(() => {
         if (resumeTimer === timer) resumeTimer = undefined;
         if (!isCurrentIdentity(generation, sessionManager)) return;
-        runGenerationSafely(ctx, "resume", generation, sessionManager);
+        runGenerationSafely(ctx, "resume", generation, sessionManager, ownsOrigin);
       }, 300);
       resumeTimer = timer;
     }

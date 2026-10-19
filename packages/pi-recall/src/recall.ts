@@ -20,7 +20,7 @@ export function createRecallExtension(dependencies: Partial<RecallDependencies> 
   return function recallExtension(pi: ExtensionAPI): void {
     let generation = 0;
     let sessionController = new AbortController();
-    let activeSessionManager: unknown;
+    let activeSessionManager: ExtensionContext["sessionManager"] | undefined;
 
     pi.registerCommand("recall", {
       description: "Save and recall messages across Pi sessions",
@@ -35,14 +35,25 @@ export function createRecallExtension(dependencies: Partial<RecallDependencies> 
         const owner = ctx.sessionManager;
         const ownerGeneration = generation;
         const controller = sessionController;
-        const isCurrent = () =>
+        const isSessionCurrent = () =>
           activeSessionManager === owner && generation === ownerGeneration && !controller.signal.aborted;
+        if (!isSessionCurrent()) throw new Error("Pi Recall session is no longer active.");
+        const sessionId = owner.getSessionId();
+        const branch = owner.getBranch();
+        const leafId = owner.getLeafId();
+        const branchIds = branch.map(({ id }) => id);
+        // Every entry that already exists at capture. Navigating into an existing descendant
+        // keeps the origin path as a prefix, so only genuinely new entries may extend it.
+        const existingIds = new Set(owner.getEntries().map(({ id }) => id));
+        let retired = false;
+        const isCurrent = () => {
+          retired ||= !(isSessionCurrent() && ownsBranch(owner, sessionId, leafId, branchIds, existingIds));
+          return !retired;
+        };
         if (!isCurrent()) throw new Error("Pi Recall session is no longer active.");
-
-        const sessionId = ctx.sessionManager.getSessionId();
         const cwd = normalizeCwd(ctx.cwd, process.platform);
         const sessionName = ctx.sessionManager.getSessionName();
-        const candidates = extractMessageCandidates(ctx.sessionManager.getBranch(), {
+        const candidates = extractMessageCandidates(branch, {
           sessionId,
           ...(sessionName ? { sessionName } : {}),
           cwd,
@@ -52,9 +63,9 @@ export function createRecallExtension(dependencies: Partial<RecallDependencies> 
           path: store.path,
           current: { sessionId, cwd },
           candidates,
-          load: (signal) => store.load(signal),
-          save: (candidate, signal) => store.save(candidate, signal),
-          delete: (id, signal) => store.delete(id, signal),
+          load: (signal) => store.load(signal, isCurrent),
+          save: (candidate, signal) => store.save(candidate, signal, isCurrent),
+          delete: (id, signal) => store.delete(id, signal, isCurrent),
         };
         await showRecallMenu(ctx, source, { signal: controller.signal, isCurrent });
       },
@@ -68,6 +79,13 @@ export function createRecallExtension(dependencies: Partial<RecallDependencies> 
       if (ctx.hasUI) safeNotify(ctx, EXPERIMENTAL_WARNING, "warning");
     });
 
+    pi.on("session_tree", (_event, ctx) => {
+      if (ctx.sessionManager !== activeSessionManager) return;
+      sessionController.abort(new DOMException("Pi Recall session branch changed", "AbortError"));
+      sessionController = new AbortController();
+      generation += 1;
+    });
+
     pi.on("session_shutdown", (_event, ctx) => {
       if (ctx.sessionManager !== activeSessionManager) return;
       sessionController.abort(new DOMException("Pi Recall session shut down", "AbortError"));
@@ -75,6 +93,31 @@ export function createRecallExtension(dependencies: Partial<RecallDependencies> 
       generation += 1;
     });
   };
+}
+
+function ownsBranch(
+  owner: ExtensionContext["sessionManager"],
+  sessionId: string,
+  leafId: string | null,
+  branchIds: readonly string[],
+  existingIds: ReadonlySet<string>,
+): boolean {
+  try {
+    const liveLeafId = owner.getLeafId();
+    const liveBranch = owner.getBranch();
+    // Pi commits navigation before awaiting sequential session_tree handlers. Check the live
+    // public branch at callback boundaries, not just our not-yet-delivered generation event.
+    // Ordinary appends preserve the origin path as a prefix and must not retire an interaction.
+    return (
+      owner.getSessionId() === sessionId &&
+      (branchIds.at(-1) ?? null) === leafId &&
+      (liveBranch.at(-1)?.id ?? null) === liveLeafId &&
+      branchIds.every((id, index) => liveBranch[index]?.id === id) &&
+      liveBranch.slice(branchIds.length).every(({ id }) => !existingIds.has(id))
+    );
+  } catch {
+    return false;
+  }
 }
 
 function rejectCommand(ctx: ExtensionContext, message: string): void {

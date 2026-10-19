@@ -1078,7 +1078,7 @@ test("collectUsageData suppresses canonical tool usage already present in a link
   assert.equal(data.today.providers.has("Tools"), false);
 });
 
-test("collectUsageData counts the full aggregate when any child session is missing", async (t) => {
+test("collectUsageData reconciles exact partial child vectors without duplicating scanned usage", async (t) => {
   const { sessionsDir, cachePath } = fixture(t);
   const parentPath = join(sessionsDir, "mixed.jsonl");
   const childPath = join(sessionsDir, "mixed", "run-a", "run-0", "session.jsonl");
@@ -1087,7 +1087,7 @@ test("collectUsageData counts the full aggregate when any child session is missi
     childPath,
     `${[
       sessionLine("child", TS_TODAY),
-      assistantLine({ ts: TS_TODAY + 1000, cost: 2, input: 20, output: 2, reasoning: 2 }),
+      assistantLine({ ts: TS_TODAY + 1000, cost: 2, input: 20, output: 2, reasoning: 2, cacheRead: 2, cacheWrite: 3 }),
     ].join("\n")}\n`,
   );
   writeFileSync(
@@ -1097,23 +1097,47 @@ test("collectUsageData counts the full aggregate when any child session is missi
       nestedToolResultLine({
         id: "mixed-children",
         ts: TS_TODAY + 2000,
-        reported: { cost: 5, input: 50, output: 5, reasoning: 5 },
+        reported: { cost: 5, input: 50, output: 5, reasoning: 5, cacheRead: 7, cacheWrite: 9 },
         children: [
-          { cost: 2, input: 20, output: 2, reasoning: 2 }, // resolved through the standard derived path
-          { cost: 3, input: 30, output: 3, reasoning: 3, sessionFile: join(sessionsDir, "missing.jsonl") },
+          { cost: 2, input: 20, output: 2, reasoning: 2, cacheRead: 2, cacheWrite: 3 }, // standard derived path
+          {
+            cost: 3,
+            input: 30,
+            output: 3,
+            reasoning: 3,
+            cacheRead: 5,
+            cacheWrite: 6,
+            sessionFile: join(sessionsDir, "missing.jsonl"),
+          },
         ],
       }),
     ].join("\n")}\n`,
   );
 
   const data = await collectUsageData({ sessionsDir, cachePath, now: NOW });
-  // One child is missing, so the $5 aggregate is counted whole next to the
-  // scanned $2 child — a deliberate small overcount instead of residual math.
-  assert.equal(data.today.totals.cost, 7);
+  assert.equal(data.today.totals.cost, 5);
+  assert.equal(data.today.totals.tokens.input, 50);
+  assert.equal(data.today.totals.tokens.output, 5);
+  assert.equal(data.today.totals.tokens.cacheRead, 7);
+  assert.equal(data.today.totals.tokens.cacheWrite, 9);
+  assert.equal(data.today.totals.tokens.total, 64);
+  assert.equal(
+    [...data.hourly.values()].reduce(
+      (sum, bucket) => sum + [...bucket.values()].reduce((s, cell) => s + cell.reasoning, 0),
+      0,
+    ),
+    5,
+  );
+  assert.equal(
+    data.today.insights.insights.some((insight) => /unresolved overlap/.test(insight.headline)),
+    false,
+  );
   assert.equal(data.today.totals.messages, 1);
   assert.equal(data.today.providers.get("anthropic").cost, 2);
-  assert.equal(data.today.providers.get("Tools").cost, 5);
-  assert.equal(data.today.providers.get("Tools").models.get("summaries").cost, 5);
+  assert.equal(data.today.providers.get("Tools").cost, 3);
+  assert.equal(data.today.providers.get("Tools").models.get("summaries").cost, 3);
+  const warm = await collectUsageData({ sessionsDir, cachePath, now: NOW });
+  assert.deepEqual(warm.today.totals, data.today.totals);
 });
 
 test("collectUsageData backfills legacy nested usage only when no scanned child session represents it", async (t) => {

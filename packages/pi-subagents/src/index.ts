@@ -165,7 +165,9 @@ import {
   streamToOutputFile,
   writeInitialEntry,
 } from "./output-file.js";
+import { registerParentQuestions } from "./parent-questions.js";
 import { captureProjectTrust, isProjectResource } from "./project-trust.js";
+import { captureQuestionOrigin } from "./question-origin.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import {
@@ -1194,6 +1196,28 @@ function activateRootRuntime(
   // same session. Invalidate pending off-screen mention turns only when the
   // replacement commits: before-switch/tree handlers can still cancel it.
   let sessionGeneration = 0;
+  const parentQuestions = registerParentQuestions(pi, () => currentCtx);
+  manager.setParentQuestionFactory((record, ctx) => {
+    const generation = sessionGeneration;
+    const sessionId = ctx.sessionManager.getSessionId();
+    const originCurrent = captureQuestionOrigin(ctx);
+    return (question, choices, signal) => {
+      // A retained channel can resume after ordinary native appends. Each
+      // question also owns the LIVE complete prefix at its own invocation.
+      const questionOriginCurrent = currentCtx ? captureQuestionOrigin(currentCtx) : () => false;
+      const controller = record.abortController;
+      const owner = JSON.stringify(record.owner);
+      const isCurrent = () => currentCtx !== undefined &&
+        sessionGeneration === generation && boundSessionId === sessionId &&
+        originCurrent(currentCtx) && questionOriginCurrent(currentCtx) &&
+        manager.getRecordMutable(record.id) === record && !record.detached &&
+        record.isBackground === true && record.status === "running" &&
+        record.abortController === controller && !controller?.signal.aborted &&
+        JSON.stringify(record.owner) === owner;
+      return parentQuestions.broker.request({ agentId: record.id, isCurrent }, question, choices,
+        controller ? AbortSignal.any([controller.signal, ...(signal ? [signal] : [])]) : signal);
+    };
+  });
   // Public synchronous bus preflight works in either extension load order. A
   // filtered-out activation has no bound context and must not veto navigation.
   pi.events.on("pi:navigation-preflight", (raw: unknown) => {
@@ -1264,6 +1288,7 @@ function activateRootRuntime(
       manager.detachForBranchChange();
       manager.resetManagedSpawns();
     }
+    parentQuestions.retire();
     sessionGeneration++;
     const replacingConfiguration = currentCtx !== undefined;
     configurationOwner = ctx;
@@ -1388,6 +1413,7 @@ function activateRootRuntime(
   const detachCommittedTree = (event: unknown): void => {
     if (!currentCtx || detachedTreeEvent === event) return;
     detachedTreeEvent = event;
+    parentQuestions.retire();
     manager.detachForBranchChange();
   };
   // If workflows' committed-tree handler runs first, it must detach our old
@@ -1446,6 +1472,7 @@ function activateRootRuntime(
         },
       });
       scheduler.stop();
+      parentQuestions.retire();
       currentCtx = undefined; // reject new spawns; owned cleanup RPC remains bound
       if (pending.length > 0) {
         let timer: ReturnType<typeof setTimeout> | undefined;
@@ -2050,7 +2077,7 @@ function activateRootRuntime(
    * prose working. A delivered mention costs no main-model turn; the answer
    * arrives through the ordinary completion notification either way.
    */
-  pi.on("input", async (event, ctx) => {
+  pi.on("input", parentQuestions.observeHandledInput(async (event, ctx) => {
     // Never hijack text the extension layer itself submitted (pi.sendMessage,
     // scheduled prompts) — only something a person typed can be a mention.
     if (event.source === "extension" || !isAgentMentionsEnabled())
@@ -2289,7 +2316,7 @@ function activateRootRuntime(
       );
     }
     return { action: "handled" };
-  });
+  }));
 
   // ---- Agent tool ----
 
@@ -2489,6 +2516,9 @@ Terse command-style prompts produce shallow, generic work.
             "Set to true to run in background. Returns agent ID immediately. You will be notified on completion.",
         }),
       ),
+      supervisor_questions: Type.Optional(Type.Union([Type.Literal("human"), Type.Literal("parent"), Type.Literal("off")], {
+        description: 'Explicit question routing, default human. "parent" is ordinary clarification only (never permission/approval), supported only for fresh non-isolated top-level background calls. No schedules or mode-changing resumes.',
+      })),
       resume: Type.Optional(
         Type.String({
           description:
@@ -2723,6 +2753,16 @@ Terse command-style prompts produce shallow, generic work.
         ...params,
         agentTiers: getAgentTiersSettings(),
       });
+      if (params.supervisor_questions === "parent" &&
+          (!resolvedConfig.runInBackground || resolvedConfig.isolated || params.schedule || params.resume || !isSupervisorQuestionsEnabled())) {
+        throw new Error('supervisor_questions: "parent" requires a fresh non-isolated background Agent. Set run_in_background: true, omit schedule/resume, and enable Supervisor questions. Foreground calls cannot answer while blocked.');
+      }
+      if (params.schedule && params.supervisor_questions !== undefined) {
+        throw new Error('Scheduled calls do not support per-call question routing; omit supervisor_questions.');
+      }
+      if (params.resume && params.supervisor_questions !== undefined) {
+        throw new Error('Resume preserves the child question mode; omit supervisor_questions and use run_in_background: true for a parent-mode child.');
+      }
       if (!params.resume && !params.schedule && resolvedConfig.inheritContext) {
         return textResult(INHERIT_CONTEXT_UNAVAILABLE);
       }
@@ -3041,6 +3081,7 @@ Terse command-style prompts produce shallow, generic work.
             : thinking,
           agentTier: resolvedConfig.requestedAgentTier,
           isBackground: true,
+          supervisorQuestions: params.supervisor_questions === "parent" ? "parent" : params.supervisor_questions === "off" ? false : undefined,
           isolation,
           invocation: agentInvocation,
           rootSessionId: ctx.sessionManager.getSessionId(),
@@ -3198,6 +3239,7 @@ Terse command-style prompts produce shallow, generic work.
               : thinking,
             agentTier: resolvedConfig.requestedAgentTier,
             isolation,
+            supervisorQuestions: params.supervisor_questions === "off" ? false : undefined,
             invocation: agentInvocation,
             signal,
             rootSessionId: ctx.sessionManager.getSessionId(),

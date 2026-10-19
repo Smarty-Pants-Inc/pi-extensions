@@ -139,6 +139,31 @@ test("save action persists the selected active-branch candidate and returns to m
   assert.equal(data.records[0]?.source.entryId, "user");
 });
 
+for (const action of ["saveMessage", "deleteMessage"] as const) {
+  test(`stale ${action} callback closes before invoking storage mutation`, async () => {
+    const data = source();
+    let writes = 0;
+    data.save = async () => {
+      writes += 1;
+      return record();
+    };
+    data.delete = async () => {
+      writes += 1;
+      return true;
+    };
+    const controller = createRecallMenu(data, { isCurrent: () => false });
+    controller.selectRecordForTest("saved-a");
+    const result = await controller.menu.actions[action]({
+      ctx: createMockContext({ mode: "rpc" }).ctx,
+      state: await state(controller),
+      signal: new AbortController().signal,
+      itemId: "user",
+    });
+    assert.deepEqual(result, { kind: "close" });
+    assert.equal(writes, 0);
+  });
+}
+
 test("RPC saved-message selection asks for scope explicitly and opens selected actions", async () => {
   const data = source();
   let calls = 0;

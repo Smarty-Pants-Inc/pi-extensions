@@ -116,7 +116,7 @@ export function createAnalyticsExtension(
       const now = deps.now();
       const tracker = skillTracker;
       tracker?.observeInput(event.text, event.source, now);
-      if (event.source !== "extension") pendingTriggerSource = event.source;
+      pendingTriggerSource = event.source;
       if (!tracker || !collector.hasActiveRun()) return;
       const explicit = tracker.consumeExplicitSkill();
       if (!explicit || !tracker.hasAvailableSkill(explicit.name)) return;
@@ -228,6 +228,7 @@ export function createAnalyticsExtension(
         name: event.toolName,
         now: deps.now(),
         model: dispatchedModel,
+        parentToolCallId: event.parentToolCallId,
       });
     });
 
@@ -263,6 +264,10 @@ export function createAnalyticsExtension(
 
     pi.on("tool_execution_end", (event) => {
       collector.finishTool({ id: event.toolCallId, now: deps.now(), isError: event.isError });
+    });
+
+    pi.on("turn_end", (event) => {
+      collector.reconcileToolResults(event.toolResults);
     });
 
     pi.on("agent_settled", async (_event, ctx) => {

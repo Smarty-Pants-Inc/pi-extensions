@@ -9,6 +9,7 @@ export const MAX_SETTINGS_BYTES = 64 * 1024;
 
 export interface CodexCompactSettings {
   enabled: boolean;
+  allowCanonicalHistory: boolean;
   requestTimeoutMs: number;
   maxRetries: number;
   replacementTokenBudget: number;
@@ -17,6 +18,7 @@ export interface CodexCompactSettings {
 
 export const DEFAULT_CODEX_COMPACT_SETTINGS: Readonly<CodexCompactSettings> = Object.freeze({
   enabled: true,
+  allowCanonicalHistory: false,
   requestTimeoutMs: 300_000,
   maxRetries: 2,
   replacementTokenBudget: 64_000,
@@ -55,6 +57,9 @@ function validInteger(value: unknown, minimum: number, maximum: number): value i
 export function normalizeCodexCompactSettings(value: unknown): CodexCompactSettings | undefined {
   if (!isRecord(value)) return undefined;
   if (Object.hasOwn(value, "enabled") && typeof value.enabled !== "boolean") return undefined;
+  if (Object.hasOwn(value, "allowCanonicalHistory") && typeof value.allowCanonicalHistory !== "boolean") {
+    return undefined;
+  }
   if (Object.hasOwn(value, "notifyOnFallback") && typeof value.notifyOnFallback !== "boolean") {
     return undefined;
   }
@@ -67,6 +72,7 @@ export function normalizeCodexCompactSettings(value: unknown): CodexCompactSetti
   }
   return {
     enabled: typeof value.enabled === "boolean" ? value.enabled : DEFAULT_CODEX_COMPACT_SETTINGS.enabled,
+    allowCanonicalHistory: value.allowCanonicalHistory === true,
     requestTimeoutMs:
       typeof value.requestTimeoutMs === "number"
         ? value.requestTimeoutMs
@@ -109,7 +115,13 @@ export async function loadCodexCompactSettings(
       await handle.close();
     }
     aborted(signal);
-    const document = JSON.parse(text) as unknown;
+    let document: unknown;
+    try {
+      document = JSON.parse(text) as unknown;
+    } catch {
+      // Parser messages can quote unknown/private fields from the document.
+      throw new Error("settings file is not valid JSON");
+    }
     const settings = normalizeCodexCompactSettings(document);
     if (!settings || !isRecord(document)) throw new Error("invalid settings shape or bounds");
     return { kind: "loaded", path, settings, document };

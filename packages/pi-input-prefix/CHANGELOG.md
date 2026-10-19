@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.6
+### Patch Changes
+
+- c2fd867: Preserve completed large startup pastes when composing editor factories by capturing the publicly focused editor's expanded text and restoring it after the host copies the draft, without private paste state or persistent setter hooks.
+
 ## 1.2.5
 ### Patch Changes
 

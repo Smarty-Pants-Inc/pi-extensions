@@ -11,7 +11,7 @@ import {
   utimes as utimesCallback,
   utimesSync,
 } from "node:fs";
-import { chmod, constants, lstat, mkdir, open, rename, rm } from "node:fs/promises";
+import { constants, lstat, mkdir, open, rename, rm } from "node:fs/promises";
 import { dirname, isAbsolute } from "node:path";
 import lockfile from "proper-lockfile";
 import {
@@ -72,20 +72,30 @@ export class RecallStore {
     this.beforeRename = options.beforeRename;
   }
 
-  async load(signal?: AbortSignal): Promise<RecallStoreSnapshot> {
-    throwIfAborted(signal);
-    if (!(await this.fileOrLockExists())) return { path: this.path, records: [], bytes: 0 };
+  async load(signal?: AbortSignal, isCurrent?: () => boolean): Promise<RecallStoreSnapshot> {
+    const assertCurrent = () => throwIfStale(signal, isCurrent);
+    assertCurrent();
+    const exists = await this.fileOrLockExists();
+    assertCurrent();
+    if (!exists) return { path: this.path, records: [], bytes: 0 };
     return this.withLock(signal, async () => {
-      const contents = await readPrivateRegularFileIfExists(this.path);
-      throwIfAborted(signal);
+      const contents = await readPrivateRegularFileIfExists(this.path, assertCurrent);
+      assertCurrent();
       return snapshotFromContents(this.path, contents);
     });
   }
 
-  async save(candidate: MessageCandidate, signal?: AbortSignal): Promise<RecallMessageRecord> {
+  async save(
+    candidate: MessageCandidate,
+    signal?: AbortSignal,
+    isCurrent?: () => boolean,
+  ): Promise<RecallMessageRecord> {
+    throwIfStale(signal, isCurrent);
     await mkdir(dirname(this.path), { recursive: true, mode: 0o700 });
     return this.withLock(signal, async (checkCompromised) => {
-      const contents = await readPrivateRegularFileIfExists(this.path);
+      throwIfStale(signal, isCurrent);
+      const contents = await readPrivateRegularFileIfExists(this.path, () => throwIfStale(signal, isCurrent));
+      throwIfStale(signal, isCurrent);
       const current = snapshotFromContents(this.path, contents).records;
       const identity = candidateIdentity(candidate.source.sessionId, candidate.entryId);
       if (current.some((record) => candidateIdentity(record.source.sessionId, record.source.entryId) === identity)) {
@@ -99,25 +109,34 @@ export class RecallStore {
         throw new RecallStoreFormatError(`Pi Recall generated duplicate ID ${record.id}`);
       }
       const next = serializeRecords([...current, record]);
-      throwIfAborted(signal);
+      throwIfStale(signal, isCurrent);
       checkCompromised();
-      await this.publish(next);
+      await this.publish(next, () => {
+        throwIfStale(signal, isCurrent);
+        checkCompromised();
+      });
       checkCompromised();
       return record;
     });
   }
 
-  async delete(id: string, signal?: AbortSignal): Promise<boolean> {
+  async delete(id: string, signal?: AbortSignal, isCurrent?: () => boolean): Promise<boolean> {
+    throwIfStale(signal, isCurrent);
     await mkdir(dirname(this.path), { recursive: true, mode: 0o700 });
     return this.withLock(signal, async (checkCompromised) => {
-      const contents = await readPrivateRegularFileIfExists(this.path);
+      throwIfStale(signal, isCurrent);
+      const contents = await readPrivateRegularFileIfExists(this.path, () => throwIfStale(signal, isCurrent));
+      throwIfStale(signal, isCurrent);
       const current = snapshotFromContents(this.path, contents).records;
       const nextRecords = current.filter((record) => record.id !== id);
       if (nextRecords.length === current.length) return false;
       const next = serializeRecords(nextRecords);
-      throwIfAborted(signal);
+      throwIfStale(signal, isCurrent);
       checkCompromised();
-      await this.publish(next);
+      await this.publish(next, () => {
+        throwIfStale(signal, isCurrent);
+        checkCompromised();
+      });
       checkCompromised();
       return true;
     });
@@ -149,7 +168,7 @@ export class RecallStore {
     return pathExists(this.path);
   }
 
-  private async publish(contents: string): Promise<void> {
+  private async publish(contents: string, assertCurrent: () => void): Promise<void> {
     const temporaryPath = `${this.path}.${randomUUID()}.tmp`;
     let handle: Awaited<ReturnType<typeof open>> | undefined;
     try {
@@ -160,8 +179,10 @@ export class RecallStore {
       await handle.close();
       handle = undefined;
       await this.beforeRename?.(temporaryPath, this.path);
+      // No await between this ownership check and dispatching the canonical mutation.
+      assertCurrent();
+      // Replacement retains the already-private temporary file's permissions.
       await rename(temporaryPath, this.path);
-      await chmod(this.path, 0o600);
     } finally {
       await handle?.close().catch(() => undefined);
       await rm(temporaryPath, { force: true }).catch(() => undefined);
@@ -270,7 +291,8 @@ function serializeRecords(records: readonly RecallMessageRecord[]): string {
   return contents;
 }
 
-async function readPrivateRegularFileIfExists(path: string): Promise<string | undefined> {
+async function readPrivateRegularFileIfExists(path: string, assertCurrent: () => void): Promise<string | undefined> {
+  assertCurrent();
   let before: Awaited<ReturnType<typeof lstat>>;
   try {
     before = await lstat(path);
@@ -281,17 +303,33 @@ async function readPrivateRegularFileIfExists(path: string): Promise<string | un
   if (!before.isFile() || before.isSymbolicLink()) {
     throw new RecallStoreFormatError(`Pi Recall storage path must be a regular file: ${path}`);
   }
+  assertCurrent();
   const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
   try {
+    assertCurrent();
     const after = await handle.stat();
+    assertCurrent();
     if (!after.isFile() || before.dev !== after.dev || before.ino !== after.ino) {
       throw new RecallStoreFormatError(`Pi Recall storage path must be a stable regular file: ${path}`);
     }
     if (after.size > MAX_RECALL_FILE_BYTES) {
       throw new RecallStoreLimitError(`Pi Recall storage exceeds ${MAX_RECALL_FILE_BYTES} bytes and is read-only`);
     }
+    const bytes = await handle.readFile();
+    assertCurrent();
+    let contents: string;
+    try {
+      contents = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+    } catch {
+      throw new RecallStoreFormatError("Pi Recall storage contains invalid UTF-8 and is read-only");
+    }
+    // Invalid storage is read-only, including permission bits. Validate the
+    // complete JSONL before repairing this already-open canonical descriptor.
+    snapshotFromContents(path, contents);
+    assertCurrent();
     await handle.chmod(0o600);
-    return await handle.readFile("utf8");
+    assertCurrent();
+    return contents;
   } finally {
     await handle.close();
   }
@@ -335,6 +373,11 @@ function abortableDelay(milliseconds: number, signal: AbortSignal | undefined): 
     };
     signal.addEventListener("abort", abort, { once: true });
   });
+}
+
+function throwIfStale(signal: AbortSignal | undefined, isCurrent: (() => boolean) | undefined): void {
+  throwIfAborted(signal);
+  if (isCurrent && !isCurrent()) throw new DOMException("Pi Recall operation is no longer current", "AbortError");
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {

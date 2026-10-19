@@ -9,6 +9,8 @@
  */
 
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { stripTerminalSequences, truncateToWidth } from "@earendil-works/pi-tui";
+import { sanitizeDisplayText } from "@signalridge/pi-ui";
 import type { SubagentScheduler } from "../schedule.js";
 import type { ScheduledSubagent } from "../types.js";
 import { selectItem } from "./select-item.js";
@@ -38,14 +40,19 @@ export function statusText(j: ScheduledSubagent): string {
   return "ready";
 }
 
+function displayCell(text: string, width: number): string {
+  // Drop only trusted truncation resets, after neutralizing untrusted controls.
+  return stripTerminalSequences(truncateToWidth(sanitizeDisplayText(text), width));
+}
+
 /** Compact selectable row — name, schedule, agent type, next/last run, count. */
 function formatJob(j: ScheduledSubagent, scheduler: SubagentScheduler): string {
   const next = scheduler.getNextRun(j.id);
   return [
     statusText(j),
-    j.name.padEnd(18).slice(0, 18),
-    j.schedule.padEnd(14).slice(0, 14),
-    `[${j.subagent_type}]`,
+    displayCell(j.name, 18).padEnd(18),
+    displayCell(j.schedule, 14).padEnd(14),
+    `[${sanitizeDisplayText(j.subagent_type)}]`,
     `next ${relTime(next)}`,
     `last ${relTime(j.lastRun)}`,
     `runs ${j.runCount}`,
@@ -59,12 +66,12 @@ function formatDetails(j: ScheduledSubagent, scheduler: SubagentScheduler): stri
     `name:      ${j.name}`,
     `schedule:  ${j.schedule} (${j.scheduleType})`,
     `agent:     ${j.subagent_type}`,
-    `prompt:    ${j.prompt.slice(0, 200)}${j.prompt.length > 200 ? "..." : ""}`,
+    `prompt:    ${displayCell(j.prompt, 200)}`,
     `created:   ${j.createdAt}`,
     `last run:  ${j.lastRun ?? "not set"} (${j.lastStatus ?? "not set"})`,
     `next run:  ${next}`,
     `runs:      ${j.runCount}`,
-  ].join("\n");
+  ].map(line => sanitizeDisplayText(line)).join("\n");
 }
 
 /**
@@ -94,9 +101,9 @@ export async function showSchedulesMenu(
   );
   if (!job) return;
 
-  const ok = await ctx.ui.confirm(`Cancel "${job.name}"?`, formatDetails(job, scheduler));
+  const ok = await ctx.ui.confirm(`Cancel "${sanitizeDisplayText(job.name)}"?`, formatDetails(job, scheduler));
   if (!ok) return;
 
   scheduler.removeJob(job.id);
-  ctx.ui.notify(`Cancelled "${job.name}".`, "info");
+  ctx.ui.notify(`Cancelled "${sanitizeDisplayText(job.name)}".`, "info");
 }
