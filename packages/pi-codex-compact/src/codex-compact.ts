@@ -12,6 +12,7 @@ import {
   type SessionEntry,
   sessionEntryToContextMessages,
 } from "@earendil-works/pi-coding-agent";
+import { authorizeCanonicalHistory } from "./authorization.js";
 import {
   buildReplacementHistory,
   CHECKPOINT_KIND,
@@ -247,23 +248,40 @@ async function compactRemotely(
   ctx: ExtensionContext,
   settings: CodexCompactSettings,
   toolState: ToolStateTracker,
+  ownerSignal: AbortSignal,
   fetch?: typeof globalThis.fetch,
 ) {
   const model = ctx.model;
   if (!settings.enabled || !isSupportedModel(model)) return undefined;
-  const deadline = performance.now() + settings.requestTimeoutMs;
+  const signal = AbortSignal.any([event.signal, ownerSignal]);
   const sessionId = ctx.sessionManager.getSessionId();
-  ctx.ui.setStatus(STATUS_KEY, "Codex remote compaction…");
+  const sourceBranch = JSON.stringify(event.branchEntries.map((entry) => entry.id));
+  const sourceLeafId = event.branchEntries.at(-1)?.id ?? null;
+  const sourceModel = JSON.stringify([model.provider, model.api, model.id, model.baseUrl]);
+  const isCurrent = () =>
+    sessionStillOwned(ctx, sessionId, signal) &&
+    JSON.stringify([ctx.model?.provider, ctx.model?.api, ctx.model?.id, ctx.model?.baseUrl]) === sourceModel &&
+    JSON.stringify(ctx.sessionManager.getBranch().map((entry) => entry.id)) === sourceBranch &&
+    (ctx.sessionManager.getLeafId?.() ?? ctx.sessionManager.getBranch().at(-1)?.id ?? null) === sourceLeafId;
+  if (!isCurrent()) return { cancel: true };
+  // Native compaction also bypasses request-local filters. Lack of consent must
+  // cancel, not fall through to a native summary of the same canonical history.
+  if (settings.allowCanonicalHistory !== true && !(await authorizeCanonicalHistory(ctx, signal))) {
+    return { cancel: true };
+  }
+  if (!isCurrent()) return { cancel: true };
+  const deadline = performance.now() + settings.requestTimeoutMs;
+  if (ctx.mode === "tui" && ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, "Codex remote compaction…");
   try {
-    const auth = await awaitCompactionAuth(ctx, model, event.signal, deadline);
-    if (!sessionStillOwned(ctx, sessionId, event.signal)) return { cancel: true };
+    const auth = await awaitCompactionAuth(ctx, model, signal, deadline);
+    if (!isCurrent()) return { cancel: true };
     if (!auth.ok || !auth.apiKey) {
       throw new Error("OpenAI Codex OAuth token is unavailable");
     }
     const provider = ctx.modelRegistry.getProvider(model.provider);
     if (!provider) throw new Error("OpenAI Codex provider is unavailable");
+    const requestModel = { ...model, baseUrl: auth.baseUrl ?? model.baseUrl };
     const current = projectedCurrentMessages(event, model);
-    const sourceLeafId = event.branchEntries.at(-1)?.id ?? null;
     if (!sessionStateMatchesRequest(current.transcript, pi, ctx, sourceLeafId, toolState)) {
       throw new Error("Live prompt or tools differ from the persisted transcript");
     }
@@ -277,13 +295,14 @@ async function compactRemotely(
     if (remainingMs <= 0) throw new Error("OpenAI Codex compaction deadline exceeded");
     const response = await requestRemoteCompaction({
       provider,
-      model,
+      model: requestModel,
       context,
+      isCurrent,
       validatePayload: toolState.payloadValidator(ctx.sessionManager, sessionId),
       apiKey: auth.apiKey,
       headers: auth.headers,
       env: auth.env,
-      signal: event.signal,
+      signal,
       priorCheckpoint: current.prior
         ? {
             marker: checkpointMarker(current.prior.checkpointId),
@@ -294,7 +313,7 @@ async function compactRemotely(
       maxRetries: settings.maxRetries,
       fetch,
     });
-    if (!sessionStillOwned(ctx, sessionId, event.signal)) return { cancel: true };
+    if (!isCurrent()) return { cancel: true };
     // appendCompaction will snapshot the session's resolved system/tool state;
     // never persist a checkpoint for a request that became stale while in flight.
     if (
@@ -324,13 +343,15 @@ async function compactRemotely(
       },
     };
   } catch {
-    if (event.signal.aborted || ctx.sessionManager.getSessionId() !== sessionId) {
+    if (!isCurrent()) {
       return { cancel: true };
     }
     notifyFailure(ctx, settings);
     return undefined;
   } finally {
-    if (ctx.sessionManager.getSessionId() === sessionId) ctx.ui.setStatus(STATUS_KEY, undefined);
+    if (!ownerSignal.aborted && ctx.mode === "tui" && ctx.hasUI && ctx.sessionManager.getSessionId() === sessionId) {
+      ctx.ui.setStatus(STATUS_KEY, undefined);
+    }
   }
 }
 
@@ -398,7 +419,15 @@ export function createCodexCompactExtension(
     });
 
     pi.on("session_before_compact", (event, ctx) =>
-      compactRemotely(pi, event, ctx, settingsRuntime.get().settings, toolState, options.fetch),
+      compactRemotely(
+        pi,
+        event,
+        ctx,
+        settingsRuntime.get().settings,
+        toolState,
+        sessionController.signal,
+        options.fetch,
+      ),
     );
 
     // Legacy hosts trim a recovery tail after compaction. Canonical hosts have
@@ -421,6 +450,10 @@ export function createCodexCompactExtension(
     });
 
     pi.on("session_tree", (_event, ctx) => {
+      generation += 1;
+      sessionController.abort();
+      sessionController = new AbortController();
+      if (ctx.mode === "tui" && ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, undefined);
       toolState.reset(ctx.sessionManager);
       if (active) resetTailProvenance(ctx);
     });
@@ -506,7 +539,7 @@ export function createCodexCompactExtension(
       generation += 1;
       sessionController.abort();
       providerWarnings.clear();
-      ctx.ui.setStatus(STATUS_KEY, undefined);
+      if (ctx.mode === "tui" && ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, undefined);
       await settingsRuntime.flush();
     });
   };

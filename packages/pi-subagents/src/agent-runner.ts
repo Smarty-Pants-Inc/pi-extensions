@@ -17,9 +17,11 @@ import {
   DefaultResourceLoader,
   type ExtensionAPI,
   getAgentDir,
+  type ResolvedResource,
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import { type ApprovalEvents, captureApprovalService, queryApprovalAdapter, requiresApprovalAdapter, schemaRequiresApprovalAdapter } from "@signalridge/pi-approval-core";
 import { type AgentTierResolutionSnapshot, resolveAgentTier } from "./agent-tiers.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getConfig, getMemoryToolNames, getReadOnlyMemoryToolNames, getToolNamesForType } from "./agent-types.js";
 import { createAskGate } from "./ask-tools.js";
@@ -28,6 +30,7 @@ import { extractText } from "./context.js";
 import { assertNoRawInheritance, assertSafeChildSession } from "./context-boundary.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
+import { extensionResourceIdentity, resolveExtensionResourceNames } from "./extension-resource-names.js";
 import { formatGateVerdict, type GateExec, runGate, workspaceFingerprint } from "./gate.js";
 import {
   INTERNAL_AGENT_CONFIG_OVERRIDE,
@@ -40,8 +43,11 @@ import { type ModelRegistry, resolveModel, shortModelLabel } from "./model-resol
 import { parentModelSessionOptions } from "./model-runtime-bridge.js";
 import { checkModelScope } from "./model-scope.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
+import { createChildApprovalTools } from "./operation-approvals.js";
+import { ANSWER_SUBAGENT_QUESTION, type ParentQuestionHandler } from "./parent-questions.js";
 import { captureProjectTrust, childProjectTrust, configurationMcpFactory, isProjectResource } from "./project-trust.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
+import { captureQuestionOrigin } from "./question-origin.js";
 import { shutdownAndDisposeSession } from "./session-lifecycle.js";
 import { preloadSkills } from "./skill-loader.js";
 import { createSupervisorTool } from "./supervisor.js";
@@ -57,6 +63,7 @@ export const SUBAGENT_TOOL_NAMES = {
   AGENT: "Agent",
   GET_RESULT: "get_subagent_result",
   STEER: "steer_subagent",
+  ANSWER_QUESTION: ANSWER_SUBAGENT_QUESTION,
 } as const;
 
 /** Names of tools registered by this extension that subagents must NOT inherit. */
@@ -241,8 +248,9 @@ function extensionToolNamesInScope(session: AgentSession, ctx: {
   extNames: Set<string>;
   narrowing: Map<string, Set<string>>;
   nestedToolNames: Set<string>;
+  resolvedNames: Map<string, string[]>;
 }): () => Set<string> {
-  const { loader, toolNames, disallowedSet, extNames, narrowing, nestedToolNames } = ctx;
+  const { loader, toolNames, disallowedSet, extNames, narrowing, nestedToolNames, resolvedNames } = ctx;
   const builtins = new Set(toolNames);
   return () => {
     const keep = new Set<string>();
@@ -258,7 +266,7 @@ function extensionToolNamesInScope(session: AgentSession, ctx: {
       const path = tool.sourceInfo.path;
       const extension = extensionsByPath.get(path);
       if (extension) {
-        const canons = extensionCanonicalNames(extension.path);
+        const canons = resolvedNames.get(extension.path) ?? extensionCanonicalNames(extension.path);
         if (optInActive && !canons.some((c) => extNames.has(c))) continue;
         // First alias that carries a narrowing set — a user won't narrow one
         // extension under two different names, so first-match is correct.
@@ -392,9 +400,11 @@ interface ApprovalTimer {
   hasInteractiveAsk: boolean;
   isInteractiveAsk: (name: string) => boolean;
   armApproved: (toolCallId: string, toolName: string) => void;
+  pauseHuman: (toolCallId: string) => () => void;
 }
 // The policy survives runAgent for resumed turns; the current prompt owns its
-// abort timers, so resume replaces armApproved instead of arming a stale timer.
+// abort timers, so resume replaces both approval callbacks instead of using
+// a stale execution budget.
 const approvalTimers = new WeakMap<AgentSession, ApprovalTimer>();
 let defaultToolTimeoutMs = DEFAULT_TOOL_TIMEOUT_MS;
 export function getDefaultToolTimeoutMs(): number { return defaultToolTimeoutMs; }
@@ -423,7 +433,8 @@ export function withTimeout<T>(promise: Promise<T>, ms: number, label: string): 
 function createToolTimeouts(session: AgentSession, grace: number, isInteractiveAsk: (name: string) => boolean) {
   const pending = new Map<string, ReturnType<typeof setTimeout>>();
   const due = new Map<string, number>();
-  const paused = new Map<string, { remaining: number; children: Set<string> }>();
+  const paused = new Map<string, { remaining: number; children: Set<string>; human: number }>();
+  let disposed = false;
   const clear = (id: string): void => {
     const handle = pending.get(id);
     if (handle) clearTimeout(handle);
@@ -432,7 +443,7 @@ function createToolTimeouts(session: AgentSession, grace: number, isInteractiveA
     paused.delete(id);
   };
   const arm = (id: string, name: string, delay = defaultToolTimeoutMs + grace): void => {
-    if (defaultToolTimeoutMs <= 0 || name === "contact_supervisor") return;
+    if (disposed || defaultToolTimeoutMs <= 0 || name === "contact_supervisor") return;
     due.set(id, performance.now() + delay);
     const handle = setTimeout(() => {
       pending.delete(id);
@@ -446,25 +457,42 @@ function createToolTimeouts(session: AgentSession, grace: number, isInteractiveA
     handle.unref?.();
     pending.set(id, handle);
   };
+  const pause = (id: string) => {
+    const existing = paused.get(id);
+    if (existing) return existing;
+    const handle = pending.get(id);
+    const deadline = due.get(id);
+    if (!handle || deadline === undefined) return undefined;
+    clearTimeout(handle);
+    pending.delete(id);
+    due.delete(id);
+    const state = { remaining: Math.max(0, deadline - performance.now()), children: new Set<string>(), human: 0 };
+    paused.set(id, state);
+    return state;
+  };
+  const resume = (id: string): void => {
+    const state = paused.get(id);
+    if (!state || state.children.size || state.human) return;
+    paused.delete(id);
+    arm(id, "", state.remaining);
+  };
   return {
     armApproved: (id: string, name: string): void => arm(id, name),
+    pauseHuman: (id: string): (() => void) => {
+      const state = pause(id);
+      if (!state) return () => {};
+      state.human++;
+      let finished = false;
+      return () => {
+        if (finished) return;
+        finished = true;
+        state.human--;
+        resume(id);
+      };
+    },
     start: (event: { toolCallId: string; toolName: string; parentToolCallId?: string }): void => {
       if (event.parentToolCallId) {
-        const parent = paused.get(event.parentToolCallId);
-        if (parent) parent.children.add(event.toolCallId);
-        else {
-          const handle = pending.get(event.parentToolCallId);
-          const deadline = due.get(event.parentToolCallId);
-          if (handle && deadline !== undefined) {
-            clearTimeout(handle);
-            pending.delete(event.parentToolCallId);
-            due.delete(event.parentToolCallId);
-            paused.set(event.parentToolCallId, {
-              remaining: Math.max(0, deadline - performance.now()),
-              children: new Set([event.toolCallId]),
-            });
-          }
-        }
+        pause(event.parentToolCallId)?.children.add(event.toolCallId);
       }
       if (!isInteractiveAsk(event.toolName)) arm(event.toolCallId, event.toolName);
     },
@@ -474,11 +502,10 @@ function createToolTimeouts(session: AgentSession, grace: number, isInteractiveA
       const parent = paused.get(event.parentToolCallId);
       if (!parent) return;
       parent.children.delete(event.toolCallId);
-      if (parent.children.size > 0) return;
-      paused.delete(event.parentToolCallId);
-      arm(event.parentToolCallId, "", parent.remaining);
+      resume(event.parentToolCallId);
     },
     dispose: (): void => {
+      disposed = true;
       for (const handle of pending.values()) clearTimeout(handle);
       pending.clear();
       due.clear();
@@ -685,7 +712,9 @@ export interface RunOptions {
    * Defaults to on wherever there is a UI to ask through; `false` withholds the
    * tool entirely rather than injecting one that always refuses.
    */
-  supervisorQuestions?: boolean;
+  supervisorQuestions?: boolean | "parent";
+  /** Manager-issued root clarification channel; never supplied by child tool args. */
+  parentQuestion?: ParentQuestionHandler;
   /** Runtime bridge for opt-in child-safe nested delegation. */
   nestedRuntime?: {
     manager: NestedAgentManager;
@@ -838,9 +867,11 @@ function resolveConfiguredSessionDir(sessionDir: string | undefined, cwd: string
  * reads instead, leaving registration/unsubscription and all metadata intact.
  * Each read wraps the CURRENT callbacks before Pi takes its event snapshot.
  */
+type ToolCallAdmission = () => ToolCallEventResult | undefined;
 function guardExtensionToolCalls(
   extension: Extension,
   deadlines: WeakMap<object, number>,
+  admissions: WeakMap<object, ToolCallAdmission>,
 ): Extension {
   type Handler = NonNullable<ReturnType<Extension["handlers"]["get"]>>[number];
   const guarded = new WeakMap<Handler, Handler>();
@@ -858,18 +889,23 @@ function guardExtensionToolCalls(
                 return { block: true, reason: "Invalid subagent tool_call event." };
               }
               const deadline = deadlines.get(call);
-              if (deadline === undefined) {
+              const admission = admissions.get(call);
+              if (deadline === undefined || !admission) {
                 return { block: true, reason: "Subagent tool policy was bypassed." };
               }
-              if (deadline === Infinity) return handler(...args);
               const toolName = Reflect.get(call, "toolName");
               const label = `tool_call for "${typeof toolName === "string" ? toolName : "unknown"}"`;
               const remaining = Math.ceil(deadline - performance.now());
               if (remaining <= 0) return { block: true, reason: `${label} timed out before the extension handler.` };
               try {
-                // This race blocks the call; it cannot cancel side effects of
-                // a handler that keeps running after its Promise loses.
-                return await withTimeout(Promise.resolve().then(() => handler(...args)), remaining, label);
+                // This race cannot cancel side effects in a timed-out handler.
+                const result = deadline === Infinity ? await handler(...args)
+                  : await withTimeout(Promise.resolve().then(() => handler(...args)), remaining, label);
+                if (deadline <= performance.now()) return { block: true, reason: `${label} timed out` };
+                // Later handlers mutate the native args object. Check after EACH
+                // handler using the original execution name/schema, not its mutable
+                // event.toolName. This admission never invokes askGate again.
+                return admission() ?? result;
               } catch (error) {
                 // Pi does not catch tool_call handler failures. A timeout must
                 // block the tool, not leave a rejected event or an awaited hook.
@@ -902,6 +938,14 @@ export async function runAgent(
   // an already-cancelled caller. This matters for tool-call signals: the
   // caller may be cancelled before this async function gets its first turn.
   throwIfAborted(options.signal);
+  // Capture the ROOT peer synchronously, before discovery or resource allocation.
+  // Only absence is optional; malformed/duplicate peers must fail closed here.
+  const approvalCapture = options.pi.events ? captureApprovalService(options.pi.events) : undefined;
+  const approvalService = approvalCapture?.service;
+  const approvalRootOrigin = approvalService ? captureQuestionOrigin(ctx) : undefined;
+  if (options.supervisorQuestions === "parent" && !options.parentQuestion) {
+    throw new Error('Parent clarification requires a manager-issued background channel. Use Agent with run_in_background: true and supervisor_questions: "parent".');
+  }
   const parentProjectTrust = captureProjectTrust(ctx);
   // Configuration provenance is established synchronously, before definition
   // admission, model setup, callbacks, or any await. Execution cwd is not trust.
@@ -1086,12 +1130,12 @@ export async function runAgent(
   const settingsManager = SettingsManager.create(configCwd, agentDir, { projectTrusted });
 
   // Extension loading:
-  // - true  → all default-discovered extensions
+  // - true  → all child-safe default-discovered extensions
   // - false → none (noExtensions)
   // - string[] → allowlist. Bare names keep matching default-discovered
   //   extensions; path entries load explicitly; "*" keeps all defaults.
-  //   On Pi with replaceable built-ins, restrictive policies resolve paths
-  //   before loading, so excluded factories cannot replace a selected built-in.
+  //   Resolve enabled resources before loading: excluded factories cannot
+  //   replace selected built-ins or schedule unmanaged asynchronous wakes.
   //
   // Suppress AGENTS.md/CLAUDE.md and APPEND_SYSTEM.md — upstream's
   // buildSystemPrompt() re-appends both AFTER systemPromptOverride, which
@@ -1112,12 +1156,11 @@ export async function runAgent(
     : undefined;
   const keepNames = extensionsSpec?.names ?? new Set<string>();
   // `exclude_extensions:` is a denylist applied AFTER the include set — exclude wins.
-  // Plain canonical names only (case-insensitive). Without preselection,
-  // filtering is post-factory, not a sandbox for extensions that already loaded.
+  // Plain canonical names only (case-insensitive). Preselection prevents
+  // factory execution, but resolving packages is not an untrusted-code sandbox.
   const excludeNames = new Set((excludeExtensions ?? []).map((n) => n.toLowerCase()));
   const hasExcludes = excludeNames.size > 0;
-  // The override filters without preselection, validates preselection when used,
-  // and ALWAYS puts our tool policy first. Pi passes one mutable
+  // The override validates preselection and ALWAYS puts our tool policy first. Pi passes one mutable
   // tool_call event through handlers in extension order; if an earlier extension
   // changes event.toolName, a later gate would inspect a different name from the
   // one Pi actually executes. Ordering before untrusted handlers is essential.
@@ -1131,16 +1174,21 @@ export async function runAgent(
   let discoveredNames: Set<string> | undefined;
   let prefilteredExtensionPaths: Set<string> | undefined;
   const resolvedExplicitNames = new Set<string>();
+  let resolvedNames = new Map<string, string[]>();
   const interactiveAskNames = new Set(ctx.hasUI ? (agentConfig?.askTools ?? []).map((name) => name.toLowerCase()) : []);
   const approvalTimer: ApprovalTimer = {
     hasInteractiveAsk: interactiveAskNames.size > 0,
     isInteractiveAsk: (name) => interactiveAskNames.has(name.toLowerCase()),
     armApproved: () => {},
+    pauseHuman: () => () => {},
   };
   // The policy starts a single monotonic deadline for each public tool_call
   // event. All subsequently selected extension handlers share its remainder,
   // including calls initiated by another tool through ctx.executeTool().
   const toolCallDeadlines = new WeakMap<object, number>();
+  const toolCallAdmissions = new WeakMap<object, ToolCallAdmission>();
+  let captureAdmission: (name: string, input: unknown) => ToolCallAdmission =
+    () => () => ({ block: true, reason: "Subagent tool policy is not ready." });
   const extensionsOverride = (base: LoadExtensionsResult): LoadExtensionsResult => {
     const policy = base.extensions.find((e) => e.path === `<inline:${TOOL_POLICY_EXTENSION}>`);
     if (!policy) throw new Error("Subagent tool policy extension failed to load.");
@@ -1163,7 +1211,7 @@ export async function runAgent(
     return {
       ...base,
       extensions: [policy, ...selected.filter((e) => e !== policy)
-        .map((extension) => guardExtensionToolCalls(extension, toolCallDeadlines))],
+        .map((extension) => guardExtensionToolCalls(extension, toolCallDeadlines, toolCallAdmissions))],
     };
   };
 
@@ -1171,12 +1219,14 @@ export async function runAgent(
   // ctx.executeTool calls. A policy factory also loads with noExtensions: true,
   // without loading any discovered extension. Deny until the child policy is
   // installed, including calls an extension might make during session_start.
-  let checkToolCall: (name: string, input: unknown, deadline: number) => Promise<ToolCallEventResult | undefined> =
+  let checkToolCall: (name: string, input: unknown, deadline: number, admission: ToolCallAdmission) => Promise<ToolCallEventResult | undefined> =
     async () => ({ block: true, reason: "Subagent tool policy is not ready." });
+  let childApprovalEvents: ApprovalEvents | undefined;
   const extensionFactories: InlineExtension[] = [{
     name: TOOL_POLICY_EXTENSION,
     hidden: true,
     factory: (pi) => {
+      childApprovalEvents = pi.events;
       pi.on("tool_call", async (event, hookCtx) => {
         if (hookCtx?.signal?.aborted) return { block: true, reason: "Subagent tool call was aborted." };
         const waitingForHuman = approvalTimer.isInteractiveAsk(event.toolName);
@@ -1187,7 +1237,9 @@ export async function runAgent(
           ? performance.now() + defaultToolTimeoutMs
           : Infinity;
         toolCallDeadlines.set(event, deadline);
-        const decision = await checkToolCall(event.toolName, event.input, deadline);
+        const admission = captureAdmission(event.toolName, event.input);
+        toolCallAdmissions.set(event, admission);
+        const decision = await checkToolCall(event.toolName, event.input, deadline, admission);
         // Abort cannot interrupt an already-open human dialog on these hosts.
         // Do not execute a tool if that dialog eventually approves a stopped run.
         if (hookCtx?.signal?.aborted) return { block: true, reason: "Subagent tool call was aborted." };
@@ -1226,11 +1278,12 @@ export async function runAgent(
   // discovered extension can register /mcp, replace builtin:mcp, and only then
   // get filtered out by our allowlist. Resolve configured resources through the
   // public package API first and feed only the selected paths into a loader with
-  // discovery off. Without the built-in factory capability, retain the
-  // post-load filtering fallback rather than assuming replacement behavior.
+  // discovery off. Always preselect, even under default inheritance: a
+  // pi-background factory can schedule model wakes beyond session.prompt(),
+  // after the manager has completed the record and cleaned its worktree.
   const builtinNames = extensionFactories.filter((factory) => typeof factory !== "function" && factory.builtin)
     .map((factory) => factory.name);
-  const prefilter = !noExtensions && (!loadAll || hasExcludes || !projectTrusted) && builtinNames.length > 0;
+  const prefilter = !noExtensions;
   if (prefilter) {
     await settingsManager.reload();
     throwIfAborted(options.signal);
@@ -1240,31 +1293,58 @@ export async function runAgent(
     // state or replace its source-resolution rules with path heuristics.
     const configured = await packages.resolve();
     throwIfAborted(options.signal);
-    const explicit = await packages.resolveExtensionSources(extensionsSpec?.paths ?? [], { temporary: true });
-    throwIfAborted(options.signal);
+    // Validate each source before cross-source dedup discards valid alias metadata.
+    const explicitSources = new Map<string, ResolvedResource[]>();
     for (const source of extensionsSpec?.paths ?? []) {
-      if (!existsSync(source) || !explicit.extensions.some((resource) => resource.enabled && resource.metadata.source === source)) {
+      const resolved = await packages.resolveExtensionSources([source], { temporary: true });
+      throwIfAborted(options.signal);
+      const enabled = resolved.extensions.filter(resource => resource.enabled);
+      if (!existsSync(source) || enabled.length === 0) {
         throw new Error(`Extension source "${source}" requested by agent "${type}" was not found or has no enabled extensions.`);
       }
+      explicitSources.set(source, enabled);
     }
+    const explicitResources = [...explicitSources.values()].flat();
     settingsBeforeLoad = JSON.stringify([settingsManager.getGlobalSettings(), settingsManager.getProjectSettings()]);
-    const enabledConfigured = configured.extensions.filter((resource) => resource.enabled && !deniedProjectResource(resource.path)).map((resource) => resource.path);
-    const enabledExplicit = explicit.extensions.filter((resource) => resource.enabled);
+    const enabledConfigured = configured.extensions.filter((resource) => resource.enabled && !deniedProjectResource(resource.path));
+    const enabledExplicit = explicitResources;
     for (const resource of enabledExplicit) {
       if (deniedProjectResource(resource.path)) {
         throw new Error(`Project extension "${resource.path}" requested by agent "${type}" is not trusted.`);
       }
     }
-    discoveredNames = new Set([...enabledConfigured, ...enabledExplicit.map((resource) => resource.path)].flatMap(extensionCanonicalNames));
+    const resolved = await resolveExtensionResourceNames(
+      [...configured.extensions.filter(resource => !deniedProjectResource(resource.path)), ...enabledExplicit],
+      packages, extensionCanonicalNames,
+    );
+    throwIfAborted(options.signal);
+    resolvedNames = resolved.names;
+    discoveredNames = new Set([...enabledConfigured, ...enabledExplicit]
+      .flatMap(resource => resolvedNames.get(resource.path) ?? []));
+    let warnedBackground = false;
+    const admitChildExtension = (resource: ResolvedResource, intentional: boolean): boolean => {
+      if (approvalService && resolvedNames.get(resource.path)?.includes("pi-approvals")) {
+        if (intentional) throw new Error(`pi-approvals cannot load in agent "${type}"; integrate approvals in the root session instead (requested extension "${resource.path}").`);
+        return false;
+      }
+      if (!resolvedNames.get(resource.path)?.includes("pi-background")) return true;
+      const reason = `pi-background cannot load in agent "${type}": managed child sessions do not support asynchronous model wakes after completion/worktree cleanup`;
+      if (intentional) throw new Error(`${reason} (requested extension "${resource.path}").`);
+      if (!warnedBackground) {
+        warnedBackground = true;
+        options.onToolActivity?.({ type: "end", toolName: `extension-error:${reason}; excluded from inherited resources` });
+      }
+      return false;
+    };
     const selectedExplicit = enabledExplicit.filter((resource) =>
-      !extensionCanonicalNames(resource.path).some((name) => excludeNames.has(name)));
-    const explicitPaths = new Set(selectedExplicit.map((resource) => resource.path));
+      !resolvedNames.get(resource.path)?.some((name) => excludeNames.has(name)) && admitChildExtension(resource, true));
+    const explicitPaths = new Set(selectedExplicit.map((resource) => extensionResourceIdentity(resource.path)));
     // For priority, use the package's declared name rather than a generic entry
     // alias like "src"; unrelated packages often have src/index.ts too.
     const explicitNames = new Set(selectedExplicit.map((resource) =>
-      extensionPackageName(resource.path) ?? extensionCanonicalName(resource.path)));
-    for (const source of extensionsSpec?.paths ?? []) {
-      if (selectedExplicit.some((resource) => resource.metadata.source === source)) {
+      resolved.packageName(resource) ?? extensionCanonicalName(resource.path)));
+    for (const [source, resources] of explicitSources) {
+      if (resources.some(resource => explicitPaths.has(extensionResourceIdentity(resource.path)))) {
         resolvedExplicitNames.add(extensionCanonicalName(source));
       }
     }
@@ -1272,15 +1352,23 @@ export async function runAgent(
       // The loader normally loads temporary paths before discovered paths. Keep
       // that priority (including for directory/package paths with many entries).
       ...selectedExplicit.map((resource) => resource.path),
-      ...enabledConfigured.filter((path) => {
-        const names = extensionCanonicalNames(path);
+      ...enabledConfigured.filter((resource) => {
+        const names = resolvedNames.get(resource.path) ?? extensionCanonicalNames(resource.path);
         if (names.some((name) => excludeNames.has(name))) return false;
-        if (explicitPaths.has(path) || explicitNames.has(extensionPackageName(path) ?? extensionCanonicalName(path))) return false;
-        return loadAll || names.some((name) => bareNames.has(name));
-      }),
+        if (explicitPaths.has(extensionResourceIdentity(resource.path)) ||
+            explicitNames.has(resolved.packageName(resource) ?? extensionCanonicalName(resource.path))) return false;
+        const intentional = names.some((name) => bareNames.has(name));
+        return (loadAll || intentional) && admitChildExtension(resource, intentional);
+      }).map((resource) => resource.path),
     ];
-    prefilteredExtensionPaths = new Set(selectedPaths);
-    additionalExtensionPaths = [...prefilteredExtensionPaths];
+    const seen = new Set<string>();
+    additionalExtensionPaths = selectedPaths.filter(path => {
+      const identity = extensionResourceIdentity(path);
+      if (seen.has(identity)) return false;
+      seen.add(identity);
+      return true;
+    });
+    prefilteredExtensionPaths = new Set(additionalExtensionPaths);
   }
 
   const loader = new DefaultResourceLoader({
@@ -1310,7 +1398,12 @@ export async function runAgent(
       throw new Error(`Pi extension settings changed while loading agent "${type}"; retry with the current settings.`);
     }
     const loadedPaths = new Set(loader.getExtensions().extensions.map((extension) => extension.path));
-    for (const path of prefilteredExtensionPaths) {
+    // Preserve ordinary unrestricted inheritance: Pi may drop a faulty factory
+    // or let a replaceable built-in yield to another discovered extension. The
+    // original restrictive preselection still requires every selected path.
+    const validateSelected = !loadAll || hasExcludes || !projectTrusted ||
+      bareNames.size > 0 || (extensionsSpec?.paths.length ?? 0) > 0;
+    for (const path of validateSelected ? prefilteredExtensionPaths : []) {
       if (!loadedPaths.has(path)) {
         const diagnostic = loader.getExtensions().errors.find((error) => error.path === path);
         throw new Error(`Selected extension "${path}" was not loaded for agent "${type}"${diagnostic ? `: ${diagnostic.error}` : " (possibly replaced by another extension)"}.`);
@@ -1371,7 +1464,7 @@ export async function runAgent(
   }
   if (keepNames.size > 0 || extNames.size > 0) {
     const survivingNames = new Set(
-      loader.getExtensions().extensions.flatMap((e) => extensionCanonicalNames(e.path)),
+      loader.getExtensions().extensions.flatMap((e) => resolvedNames.get(e.path) ?? extensionCanonicalNames(e.path)),
     );
     for (const name of keepNames) {
       // A directory/package source can resolve to entries with different
@@ -1460,8 +1553,9 @@ export async function runAgent(
   // only a human to answer, which `hasUI` decides. Isolation still suppresses
   // it: an `isolated: true` agent is defined as built-in tools only.
   const supervisorTools =
-    ctx.hasUI && !isolated && options.supervisorQuestions !== false
+    (ctx.hasUI || options.supervisorQuestions === "parent") && !isolated && options.supervisorQuestions !== false
       ? createSupervisorTool({
+          ...(options.supervisorQuestions === "parent" ? { parentQuestion: options.parentQuestion } : {}),
           // Use the canonical agent type, not display_name: the question must
           // identify the actual subagent that requested the decision.
           agentLabel: agentConfig?.name ?? type,
@@ -1471,9 +1565,34 @@ export async function runAgent(
           },
         })
       : [];
-  // One list from here on: both sets are custom tools this package injects, and
-  // the scoping pass below keeps exactly the names it is given.
-  const injectedTools = [...nestedTools, ...supervisorTools];
+  // Reviewed replacements are SDK tools, not inherited extension permissions.
+  // Admit only canonical names already allowed by the child policy.
+  let approvalSession: AgentSession | undefined;
+  // SDK winner metadata alone misses a losing late extension registration.
+  // Inspect live public maps at bind, admission and every execute guard.
+  const hasCanonicalConflict = (name: string): boolean =>
+    loader.getExtensions().extensions.some(extension => extension.tools.has(name));
+  const reviewedTools = approvalCapture && approvalService && approvalRootOrigin && toolNames.some(name => ["edit", "write", "bash"].includes(name) && !disallowedSet?.has(name))
+    ? createChildApprovalTools({
+        service: approvalService, root: ctx, rootOrigin: approvalRootOrigin, agentId: options.agentId, settings: settingsManager,
+        assertServiceCurrent: approvalCapture.assertCurrent,
+        isToolCurrent: (name) => approvalSession?.getActiveToolNames().includes(name) === true,
+        waiting: (id) => approvalSession ? approvalTimers.get(approvalSession)?.pauseHuman(id) ?? (() => {}) : () => {},
+        isBound: (): boolean => {
+          const tools = approvalSession?.getAllTools();
+          return [...reviewedNames].every(name => !hasCanonicalConflict(name) && tools?.find(tool => tool.name === name)?.sourceInfo.path === `<sdk:${name}>`);
+        },
+      }).filter(tool => toolNames.includes(tool.name) && !disallowedSet?.has(tool.name))
+    : [];
+  const reviewedNames = new Set(reviewedTools.map(tool => tool.name));
+  for (const extension of loader.getExtensions().extensions) {
+    for (const name of reviewedNames) {
+      if (extension.tools.has(name)) {
+        throw new Error(`Approval-required tool "${name}" was shadowed by "${extension.path}"; remove the conflicting child extension.`);
+      }
+    }
+  }
+  const injectedTools = [...nestedTools, ...supervisorTools, ...reviewedTools];
   const nestedToolNames = new Set(injectedTools.map(tool => tool.name));
   const askGate = createAskGate({
     askTools: agentConfig?.askTools ?? [],
@@ -1591,6 +1710,7 @@ export async function runAgent(
   }
 
   const { session } = await runInChildSessionContext(() => createAgentSession(sessionOpts));
+  approvalSession = session;
   approvalTimers.set(session, approvalTimer);
   // Pi prepares parallel siblings before running any execution closure. A
   // human dialog for the next sibling must not spend an approved tool's clock.
@@ -1609,14 +1729,44 @@ export async function runAgent(
     throwIfAborted(options.signal);
 
   const inScope = noExtensions ? undefined : extensionToolNamesInScope(session, {
-    loader, toolNames, disallowedSet, extNames, narrowing, nestedToolNames,
+    loader, toolNames, disallowedSet, extNames, narrowing, nestedToolNames, resolvedNames,
   });
-  checkToolCall = async (name, input, deadline) => {
+  captureAdmission = (name, input) => {
+    // Pi executes these captured args, even if a handler reassigns event.input.
+    const captured = session.getAllTools().find(tool => tool.name === name);
+    const requiresSchema = !!approvalService && !!captured && schemaRequiresApprovalAdapter(captured.parameters);
+    return () => {
+      if (!approvalService) return undefined;
+      if (reviewedNames.has(name)) {
+        if (hasCanonicalConflict(name) || session.getAllTools().find(tool => tool.name === name)?.sourceInfo.path !== `<sdk:${name}>`)
+          return { block: true, reason: `Approval-required tool "${name}" was shadowed; remove the conflicting child extension.` };
+        return undefined;
+      }
+      const effective = session.getAllTools().find(tool => tool.name === name);
+      if (requiresApprovalAdapter(input) || requiresSchema) {
+        try {
+          if (!captured || !effective || !childApprovalEvents || effective.parameters !== captured.parameters ||
+              effective.description !== captured.description || effective.sourceInfo.path !== captured.sourceInfo.path)
+            throw new Error("Child approval binding changed");
+          queryApprovalAdapter(childApprovalEvents, name, captured.parameters);
+        } catch {
+          return { block: true, reason: `Tool "${name}" requires exactly one live cooperative approval adapter; unreviewed fallback is blocked.` };
+        }
+      }
+      return undefined;
+    };
+  };
+  checkToolCall = async (name, input, deadline, admission) => {
     const run = async (): Promise<ToolCallEventResult | undefined> => {
       // Scope first, then approval: never prompt for a tool this child cannot use.
       if (inScope && !inScope().has(name)) {
         return { block: true, reason: `Tool "${name}" is not available to this subagent.` };
       }
+      if (reviewedNames.has(name) && (hasCanonicalConflict(name) || session.getAllTools().find(tool => tool.name === name)?.sourceInfo.path !== `<sdk:${name}>`)) {
+        return { block: true, reason: `Approval-required tool "${name}" was shadowed; only its reviewed SDK binding may execute.` };
+      }
+      const denied = admission();
+      if (denied) return denied;
       return askGate?.(name, input);
     };
     if (deadline === Infinity) return run();
@@ -1647,6 +1797,11 @@ export async function runAgent(
     },
   });
   throwIfAborted(options.signal);
+  for (const name of reviewedNames) {
+    if (hasCanonicalConflict(name) || session.getAllTools().find(tool => tool.name === name)?.sourceInfo.path !== `<sdk:${name}>`) {
+      throw new Error(`Approval-required tool "${name}" was shadowed; remove the conflicting child extension.`);
+    }
+  }
 
   // With `allowedToolNames` unset, the ACTIVE set still needs managing: Pi
   // activates default built-ins and eligible extension tools at registration.
@@ -1722,6 +1877,7 @@ export async function runAgent(
   // `contact_supervisor` is excluded: it intentionally waits for a human.
   const toolTimeouts = createToolTimeouts(session, noExtensions ? 0 : TOOL_CALL_ABORT_GRACE_MS, approvalTimer.isInteractiveAsk);
   approvalTimer.armApproved = toolTimeouts.armApproved;
+  approvalTimer.pauseHuman = toolTimeouts.pauseHuman;
   // Own finalized output before observer dispatch: a synchronous callback
   // failure must remain visible without erasing the answer it interrupted.
   const collector = collectResponseText(session);
@@ -1780,6 +1936,7 @@ export async function runAgent(
     await session.prompt(prompt);
   } finally {
     approvalTimer.armApproved = () => {};
+    approvalTimer.pauseHuman = () => () => {};
     unsubTurns();
     collector.unsubscribe();
     toolTimeouts.dispose();
@@ -1854,7 +2011,10 @@ export async function resumeAgent(
   }
   const toolTimeouts = createToolTimeouts(session, TOOL_CALL_ABORT_GRACE_MS,
     approvalTimer?.isInteractiveAsk ?? (() => false));
-  if (approvalTimer) approvalTimer.armApproved = toolTimeouts.armApproved;
+  if (approvalTimer) {
+    approvalTimer.armApproved = toolTimeouts.armApproved;
+    approvalTimer.pauseHuman = toolTimeouts.pauseHuman;
+  }
   const unsubResumeTimeout = session.subscribe((event: AgentSessionEvent) => {
     if (event.type === "tool_execution_start") toolTimeouts.start(event);
     else if (event.type === "tool_execution_end") toolTimeouts.end(event);
@@ -1864,7 +2024,10 @@ export async function resumeAgent(
     throwIfAborted(options.signal);
     await session.prompt(prompt);
   } finally {
-    if (approvalTimer) approvalTimer.armApproved = () => {};
+    if (approvalTimer) {
+      approvalTimer.armApproved = () => {};
+      approvalTimer.pauseHuman = () => () => {};
+    }
     collector.unsubscribe();
     unsubEvents();
     unsubResumeTimeout();

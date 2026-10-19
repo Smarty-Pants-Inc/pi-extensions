@@ -17,6 +17,8 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { civilDayStart, civilHourStart } from "./civil-time.js";
+import { buildObservationProofs } from "./lineage-proof.js";
 
 export { getAgentDir };
 
@@ -52,7 +54,7 @@ export interface TotalStats extends BaseStats {
 }
 
 export interface Insight {
-  /** Structure insights always show; alarms fire only when material. */
+  /** Structure is cost-based; spend alarms require materiality, integrity alarms do not. */
   kind: "structure" | "alarm";
   /** Leading stat, already formatted (e.g. "34%", "$446", "1.4×"). */
   stat: string;
@@ -79,6 +81,10 @@ interface PeriodRawData {
   nonAssistantCost: number;
   /** Usage reported by tool results, compactions, and branch summaries. */
   auxiliaryCost: number;
+  /** Aggregates retained because a partial overlap could not be proven exactly. */
+  unresolvedToolCost: number;
+  /** Integrity warnings are independent of whether a report has recorded cost. */
+  unresolvedToolCount: number;
   /** Messages at ≥ CTX_TAX_THRESHOLD context. */
   ctxHigh: CostCount;
   /** Messages below CTX_LOW_THRESHOLD context (comparison group). */
@@ -1489,8 +1495,9 @@ export async function loadUsageCache(cachePath: string, signal?: AbortSignal): P
     signal?.throwIfAborted();
     if (
       !entry ||
-      typeof entry.size !== "number" ||
-      typeof entry.mtimeMs !== "number" ||
+      !nonnegativeNumber(entry.size) ||
+      !Number.isInteger(entry.size) ||
+      !nonnegativeNumber(entry.mtimeMs) ||
       typeof entry.sessionId !== "string" ||
       typeof entry.parentSession !== "string" ||
       typeof entry.cwd !== "string" ||
@@ -1512,6 +1519,8 @@ export async function loadUsageCache(cachePath: string, signal?: AbortSignal): P
       const thinkingLevel = names[tuple[8]];
       const sourceId = names[tuple[12]];
       if (
+        ![0, 1, 8, 12].every((slot) => nameIndexValid(tuple[slot], names)) ||
+        ![2, 3, 4, 5, 6, 7, 9, 16].every((slot) => nonnegativeNumber(tuple[slot])) ||
         typeof provider !== "string" ||
         typeof model !== "string" ||
         typeof thinkingLevel !== "string" ||
@@ -1521,12 +1530,12 @@ export async function loadUsageCache(cachePath: string, signal?: AbortSignal): P
         (tuple[13] !== 0 && tuple[13] !== 1) ||
         (tuple[14] !== 0 && tuple[14] !== 1) ||
         (tuple[14] === 1 && tuple[11] !== 2) ||
-        (tuple[15] !== -1 && typeof names[tuple[15]] !== "string") ||
+        (tuple[15] !== -1 && !nameIndexValid(tuple[15], names)) ||
         typeof tuple[16] !== "number" ||
         !Number.isFinite(tuple[16]) ||
         tuple[16] < 0 ||
         (tuple[16] > 0 && tuple[11] !== 0) ||
-        (tuple[17] !== -1 && (typeof names[tuple[17]] !== "string" || tuple[11] !== 0))
+        (tuple[17] !== -1 && (!nameIndexValid(tuple[17], names) || tuple[11] !== 0))
       ) {
         valid = false;
         break;
@@ -1537,13 +1546,13 @@ export async function loadUsageCache(cachePath: string, signal?: AbortSignal): P
         thinkingLevel,
         source: tuple[11] === 1 ? "auxiliary" : tuple[11] === 2 ? "usage" : "assistant",
         sourceId,
-        cost: Number(tuple[2]) || 0,
-        input: Number(tuple[3]) || 0,
-        output: Number(tuple[4]) || 0,
-        cacheRead: Number(tuple[5]) || 0,
-        cacheWrite: Number(tuple[6]) || 0,
-        timestamp: Number(tuple[7]) || 0,
-        reasoning: Number(tuple[9]) || 0,
+        cost: tuple[2],
+        input: tuple[3],
+        output: tuple[4],
+        cacheRead: tuple[5],
+        cacheWrite: tuple[6],
+        timestamp: tuple[7],
+        reasoning: tuple[9],
         afterCompaction: tuple[10] === 1,
         ...(tuple[13] === 1 ? { afterContextEdit: true } : {}),
         ...(tuple[14] === 1 ? { cacheWarm: true } : {}),
@@ -1563,7 +1572,14 @@ export async function loadUsageCache(cachePath: string, signal?: AbortSignal): P
       const sourceId = names[tuple[0]];
       const runId = names[tuple[3]];
       const reportedUsage = cachedUsageAmount(tuple[2]);
-      if (typeof sourceId !== "string" || typeof runId !== "string" || (tuple[2] !== null && !reportedUsage)) {
+      if (
+        !nameIndexValid(tuple[0], names) ||
+        !nameIndexValid(tuple[3], names) ||
+        !nonnegativeNumber(tuple[1]) ||
+        typeof sourceId !== "string" ||
+        typeof runId !== "string" ||
+        (tuple[2] !== null && !reportedUsage)
+      ) {
         valid = false;
         break;
       }
@@ -1576,7 +1592,13 @@ export async function loadUsageCache(cachePath: string, signal?: AbortSignal): P
         }
         const sessionFile = names[childTuple[1]];
         const usage = cachedUsageAmount(childTuple[2]);
-        if (typeof childTuple[0] !== "number" || typeof sessionFile !== "string" || !usage) {
+        if (
+          !nonnegativeNumber(childTuple[0]) ||
+          !Number.isInteger(childTuple[0]) ||
+          !nameIndexValid(childTuple[1], names) ||
+          typeof sessionFile !== "string" ||
+          !usage
+        ) {
           valid = false;
           break;
         }
@@ -1585,7 +1607,7 @@ export async function loadUsageCache(cachePath: string, signal?: AbortSignal): P
       if (!valid) break;
       toolUsages.push({
         sourceId,
-        timestamp: Number(tuple[1]) || 0,
+        timestamp: tuple[1],
         reportedUsage,
         runId,
         children,
@@ -1602,12 +1624,16 @@ export async function loadUsageCache(cachePath: string, signal?: AbortSignal): P
   return result;
 }
 
+function nonnegativeNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+function nameIndexValid(value: unknown, names: unknown[]): value is number {
+  return nonnegativeNumber(value) && Number.isInteger(value) && typeof names[value] === "string";
+}
+
 function cachedUsageAmount(value: unknown): UsageAmount | null {
-  if (
-    !Array.isArray(value) ||
-    value.length !== 6 ||
-    value.some((part) => typeof part !== "number" || !Number.isFinite(part))
-  ) {
+  if (!Array.isArray(value) || value.length !== 6 || value.some((part) => !nonnegativeNumber(part))) {
     return null;
   }
   return {
@@ -1843,6 +1869,8 @@ function emptyPeriodRawData(): PeriodRawData {
     assistantCost: 0,
     nonAssistantCost: 0,
     auxiliaryCost: 0,
+    unresolvedToolCost: 0,
+    unresolvedToolCount: 0,
     ctxHigh: { cost: 0, messages: 0 },
     ctxLow: { cost: 0, messages: 0 },
     projectCosts: new Map(),
@@ -1900,7 +1928,7 @@ const HOUR_MS = 3_600_000;
 
 function addToHourlyBuckets(hourly: Map<number, Map<HourlyKey, HourlyCell>>, msg: SessionMessage): void {
   if (msg.timestamp <= 0) return; // Unknown time can't be placed on a time axis.
-  const hour = Math.floor(msg.timestamp / HOUR_MS) * HOUR_MS;
+  const hour = civilHourStart(msg.timestamp);
   let bucket = hourly.get(hour);
   if (!bucket) {
     bucket = new Map();
@@ -2037,6 +2065,10 @@ function addMessagesToUsageData(
       if (!isAssistant) {
         raw.nonAssistantCost += msg.cost;
         if (msg.source === "auxiliary") raw.auxiliaryCost += msg.cost;
+        if ("unresolvedToolUsage" in msg && msg.unresolvedToolUsage === true) {
+          raw.unresolvedToolCost += msg.cost;
+          raw.unresolvedToolCount++;
+        }
         continue;
       }
       raw.assistantCost += msg.cost;
@@ -2082,9 +2114,10 @@ function addMessagesToUsageData(
 // pi-subagents also persists as ordinary session files, which this scan
 // already counts with full model attribution. When every child session file
 // behind a report is part of the scan, the children speak for themselves and
-// the parent's aggregate is skipped. Otherwise the aggregate (or, for pre-0.81
-// legacy entries, each unresolved child's reported usage) is counted under
-// Tools / summaries.
+// the parent's aggregate is skipped. Partial canonical reports emit only missing
+// vectors when both the report sum and persisted scanned contributions are exact.
+// Otherwise retain and flag the unresolved aggregate; legacy missing children
+// remain under Tools / summaries.
 //
 // Copied branch history gets a new parent filename, so a copy's runId-derived
 // child paths can dangle even though the original's resolve. Resolved child
@@ -2096,6 +2129,8 @@ interface ScannedSessionIndex {
   paths: Set<string>;
   /** Directory of each scanned file → number of scanned files inside it. */
   fileCountByDir: Map<string, number>;
+  soleFileByDir: Map<string, string>;
+  messagesByPath: Map<string, SessionMessage[]>;
   /** Session-file lineage; absent parent paths are retained but not inferred. */
   lineage: Map<string, { parentPath?: string }>;
 }
@@ -2109,16 +2144,20 @@ function parentSessionPath(filePath: string, parentSession: string): string | un
 function buildScannedSessionIndex(states: Map<string, CachedFileState>): ScannedSessionIndex {
   const paths = new Set<string>();
   const fileCountByDir = new Map<string, number>();
+  const soleFileByDir = new Map<string, string>();
+  const messagesByPath = new Map<string, SessionMessage[]>();
   const lineage = new Map<string, { parentPath?: string }>();
   for (const [filePath, state] of states) {
     if (!state.parsed.sessionId) continue;
     const resolved = resolve(filePath);
     paths.add(resolved);
+    messagesByPath.set(resolved, state.parsed.messages);
     const dir = dirname(resolved);
     fileCountByDir.set(dir, (fileCountByDir.get(dir) ?? 0) + 1);
+    soleFileByDir.set(dir, resolved);
     lineage.set(resolved, { parentPath: parentSessionPath(resolved, state.parsed.parentSession) });
   }
-  return { paths, fileCountByDir, lineage };
+  return { paths, fileCountByDir, soleFileByDir, messagesByPath, lineage };
 }
 
 function sessionLineageContains(index: ScannedSessionIndex, descendantPath: string, ancestorPath: string): boolean {
@@ -2141,17 +2180,17 @@ function sessionsAreRelated(index: ScannedSessionIndex, leftPath: string, rightP
   return left === right || sessionLineageContains(index, left, right) || sessionLineageContains(index, right, left);
 }
 
-function childSessionScanned(
+function scannedChildPath(
   parentFilePath: string,
   tool: ToolUsageRecord,
   child: ChildToolUsage,
   index: ScannedSessionIndex,
-): boolean {
+): string | undefined {
   if (child.sessionFile) {
     const explicit = isAbsolute(child.sessionFile)
       ? resolve(child.sessionFile)
       : resolve(dirname(parentFilePath), child.sessionFile);
-    if (index.paths.has(explicit)) return true;
+    if (index.paths.has(explicit)) return explicit;
   }
   if (tool.runId) {
     const runDir = resolve(
@@ -2162,20 +2201,21 @@ function childSessionScanned(
     );
     // The run directory holds exactly one session per child run, so either the
     // conventional name or a lone scanned file inside it identifies the child.
-    if (index.paths.has(join(runDir, "session.jsonl"))) return true;
-    if (index.fileCountByDir.get(runDir) === 1) return true;
+    const conventional = join(runDir, "session.jsonl");
+    if (index.paths.has(conventional)) return conventional;
+    if (index.fileCountByDir.get(runDir) === 1) return index.soleFileByDir.get(runDir);
   }
-  return false;
+  return undefined;
 }
 
 /** Identity of one child slot of one tool entry, stable across copied history. */
 function toolChildIdentity(tool: ToolUsageRecord, child: ChildToolUsage): string {
-  const fingerprint = child.usage.input + child.usage.output + child.usage.cacheRead + child.usage.cacheWrite;
-  return `${tool.sourceId}:${tool.timestamp}:${child.resultIndex}:${fingerprint}`;
+  return JSON.stringify([tool.sourceId, tool.timestamp, child.resultIndex, cacheUsageAmount(child.usage)]);
 }
 
 interface ResolvedToolChild {
   filePath: string;
+  childPath: string;
   identity: string;
 }
 
@@ -2188,9 +2228,8 @@ function resolvedToolChildIdentities(
     for (const tool of state.parsed.toolUsages) {
       if (!tool.sourceId) continue;
       for (const child of tool.children) {
-        if (childSessionScanned(filePath, tool, child, index)) {
-          resolved.push({ filePath, identity: toolChildIdentity(tool, child) });
-        }
+        const childPath = scannedChildPath(filePath, tool, child, index);
+        if (childPath) resolved.push({ filePath, childPath, identity: toolChildIdentity(tool, child) });
       }
     }
   }
@@ -2202,17 +2241,36 @@ function toolUsageMessages(
   tool: ToolUsageRecord,
   index: ScannedSessionIndex,
   resolvedChildren: readonly ResolvedToolChild[],
-): SessionMessage[] {
+): Array<SessionMessage & { unresolvedToolUsage?: true }> {
   const scanned = (child: ChildToolUsage) =>
-    childSessionScanned(parentFilePath, tool, child, index) ||
-    (tool.sourceId !== "" &&
-      resolvedChildren.some(
-        (resolved) =>
-          resolved.identity === toolChildIdentity(tool, child) &&
-          sessionsAreRelated(index, resolved.filePath, parentFilePath),
-      ));
+    scannedChildPath(parentFilePath, tool, child, index) ??
+    (tool.sourceId
+      ? resolvedChildren.find(
+          (resolved) =>
+            resolved.identity === toolChildIdentity(tool, child) &&
+            sessionsAreRelated(index, resolved.filePath, parentFilePath),
+        )?.childPath
+      : undefined);
   if (tool.reportedUsage) {
     if (tool.children.length > 0 && tool.children.every(scanned)) return [];
+    const resolved = tool.children.map(scanned);
+    if (resolved.some(Boolean)) {
+      const distinctPaths = new Set(resolved.filter((path) => path !== undefined));
+      const proven =
+        distinctPaths.size === resolved.filter(Boolean).length &&
+        childrenExactlyReport(tool) &&
+        tool.children.every((child, i) => {
+          const path = resolved[i];
+          return !path || exactUsageSpan(index.messagesByPath.get(path) ?? [], child.usage);
+        });
+      if (proven) {
+        const missing = tool.children.filter((_child, i) => !resolved[i]);
+        return [auxiliaryMessage(sumUsage(missing.map((child) => child.usage)), tool.timestamp, tool.sourceId)];
+      }
+      // No residual arithmetic on inconsistent vectors. Keep the original
+      // report visible, but explicitly label this accounting as unresolved.
+      return [{ ...auxiliaryMessage(tool.reportedUsage, tool.timestamp, tool.sourceId), unresolvedToolUsage: true }];
+    }
     return [auxiliaryMessage(tool.reportedUsage, tool.timestamp, tool.sourceId)];
   }
   // Before Pi 0.81, recognised nested-agent tools persisted per-child usage in
@@ -2226,6 +2284,62 @@ function toolUsageMessages(
 // =============================================================================
 // Collection orchestration
 // =============================================================================
+
+function sumUsage(amounts: UsageAmount[]): UsageAmount {
+  const sum: UsageAmount = { cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 };
+  for (const amount of amounts) for (const key of USAGE_FIELDS) sum[key] += amount[key];
+  return sum;
+}
+
+const USAGE_FIELDS = ["cost", "input", "output", "cacheRead", "cacheWrite", "reasoning"] as const;
+
+function childrenExactlyReport(tool: ToolUsageRecord): boolean {
+  const total = sumUsage(tool.children.map((child) => child.usage));
+  return (
+    new Set(tool.children.map((child) => child.resultIndex)).size === tool.children.length &&
+    tool.children.every((child) => USAGE_FIELDS.every((key) => nonnegativeNumber(child.usage[key]))) &&
+    USAGE_FIELDS.every((key) => total[key] === tool.reportedUsage?.[key])
+  );
+}
+
+/** A reused child session can contain several calls. Require an exact contiguous
+ * persisted vector, not a token sum, cost-only match, or numerical tolerance. */
+function exactUsageSpan(messages: SessionMessage[], amount: UsageAmount): boolean {
+  const prefix = sumUsage([]);
+  const seen = new Set([JSON.stringify(cacheUsageAmount(prefix))]);
+  const seenEntries = new Set<string>();
+  for (const message of messages) {
+    if (EXCLUDED_PROVIDERS.has(message.provider)) continue;
+    if (message.sourceId) {
+      const identity = messageIdentity(message);
+      if (seenEntries.has(identity)) continue;
+      seenEntries.add(identity);
+    }
+    if (!USAGE_FIELDS.every((key) => nonnegativeNumber(message[key]))) return false;
+    for (const key of USAGE_FIELDS) prefix[key] += message[key];
+    const difference = USAGE_FIELDS.map((key) => prefix[key] - amount[key]);
+    if (seen.has(JSON.stringify(difference))) return true;
+    seen.add(JSON.stringify(cacheUsageAmount(prefix)));
+  }
+  return false;
+}
+
+function messageIdentity(m: SessionMessage): string {
+  return JSON.stringify([
+    m.sourceId,
+    m.provider,
+    m.model,
+    m.thinkingLevel,
+    m.source,
+    m.cost,
+    m.input,
+    m.output,
+    m.cacheRead,
+    m.cacheWrite,
+    m.reasoning,
+    m.timestamp,
+  ]);
+}
 
 const STAT_CONCURRENCY = 16;
 const DEFAULT_PARSE_CONCURRENCY = 4;
@@ -2262,28 +2376,16 @@ export async function collectUsageData(options: CollectUsageOptions = {}): Promi
   const cachePath = options.cachePath === undefined ? getDefaultCachePath() : options.cachePath;
   const parseConcurrency = Math.max(1, options.parseConcurrency ?? DEFAULT_PARSE_CONCURRENCY);
 
-  const startOfToday = new Date(now);
-  startOfToday.setHours(0, 0, 0, 0);
-  const todayMs = startOfToday.getTime();
+  const todayMs = civilDayStart(now.getTime());
 
-  // Start of current week (Monday 00:00)
-  const startOfWeek = new Date(now);
-  const dayOfWeek = startOfWeek.getDay(); // 0 = Sunday, 1 = Monday, ...
+  // Reconstruct each intended midnight independently, including when today's
+  // midnight is skipped and normalizes to 01:00.
+  const dayOfWeek = now.getDay(); // 0 = Sunday, 1 = Monday, ...
   const daysSinceMonday = dayOfWeek === 0 ? 6 : dayOfWeek - 1;
-  startOfWeek.setDate(startOfWeek.getDate() - daysSinceMonday);
-  startOfWeek.setHours(0, 0, 0, 0);
-  const weekStartMs = startOfWeek.getTime();
-
-  // Start of last week (previous Monday 00:00)
-  const startOfLastWeek = new Date(startOfWeek);
-  startOfLastWeek.setDate(startOfLastWeek.getDate() - 7);
-  const lastWeekStartMs = startOfLastWeek.getTime();
-
-  // Rolling 30-day window: the last 30 calendar days including today,
-  // i.e. from midnight 29 days before today. setDate handles DST correctly.
-  const startOfLast30Days = new Date(startOfToday);
-  startOfLast30Days.setDate(startOfLast30Days.getDate() - 29);
-  const last30DaysStartMs = startOfLast30Days.getTime();
+  const weekStartMs = civilDayStart(now.getTime(), -daysSinceMonday);
+  const lastWeekStartMs = civilDayStart(now.getTime(), -daysSinceMonday - 7);
+  // Rolling 30 calendar days including today.
+  const last30DaysStartMs = civilDayStart(now.getTime(), -29);
 
   // 1. Discover session files.
   const filePaths = await getAllSessionFiles(sessionsDir, signal);
@@ -2420,10 +2522,31 @@ export async function collectUsageData(options: CollectUsageOptions = {}): Promi
   };
   const costByDayIdx = new Map<number, number>();
   const seenSessions = new Set<string>();
-  const seenStableMessageObservations = new Map<string, Array<{ filePath: string; fingerprint: string }>>();
+  const seenStableMessageProofs = new Set<string>();
   const seenLegacyMessageKeys = new Set<string>();
   const scannedSessions = buildScannedSessionIndex(current);
   const resolvedToolChildren = resolvedToolChildIdentities(current, scannedSessions);
+  // Establish all matching observations before emitting anything. In particular,
+  // two copies can be proven by a scanned parent that sorts after both of them.
+  const messagesByFile = new Map<string, SessionMessage[]>();
+  const observations: Array<{ filePath: string; identity: string }> = [];
+  let proofFiles = 0;
+  for (const [filePath, state] of current) {
+    if (!state.parsed.sessionId) continue;
+    if (++proofFiles % AGGREGATE_YIELD_EVERY_FILES === 0) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      if (signal?.aborted) return null;
+    }
+    const toolMessages = state.parsed.toolUsages.flatMap((tool) =>
+      toolUsageMessages(filePath, tool, scannedSessions, resolvedToolChildren),
+    );
+    const messages = [...state.parsed.messages, ...toolMessages];
+    messagesByFile.set(filePath, messages);
+    for (const message of messages) {
+      if (message.sourceId) observations.push({ filePath: resolve(filePath), identity: messageIdentity(message) });
+    }
+  }
+  const proofs = buildObservationProofs(scannedSessions.lineage, observations);
   let processedFiles = 0;
 
   for (const filePath of filePaths) {
@@ -2438,10 +2561,7 @@ export async function collectUsageData(options: CollectUsageOptions = {}): Promi
     // Deduplicate copied history across branched session files, computing
     // adjacency metadata (idle gaps, previous context) on the raw file order
     // so branch copies do not distort miss classification.
-    const toolMessages = state.parsed.toolUsages.flatMap((tool) =>
-      toolUsageMessages(filePath, tool, scannedSessions, resolvedToolChildren),
-    );
-    const rawMsgs = toolMessages.length > 0 ? [...state.parsed.messages, ...toolMessages] : state.parsed.messages;
+    const rawMsgs = messagesByFile.get(filePath) ?? [];
     const deduped: SessionMessage[] = [];
     const meta: MessageMeta[] = [];
     let previousAssistant: SessionMessage | null = null;
@@ -2463,36 +2583,13 @@ export async function collectUsageData(options: CollectUsageOptions = {}): Promi
         if (m.sourceId) assistantsById.set(m.sourceId, m);
       }
 
-      // Stable Pi entry ids identify copied branch entries. Deduplicate only when
-      // the persisted session-file lineage proves that two observations belong to
-      // the same branch; independent sessions may reuse an id and accounting.
-      const stableKey = m.sourceId ? `${m.source}:${m.sourceId}` : undefined;
-      const accountingFingerprint = JSON.stringify([
-        m.provider,
-        m.model,
-        m.thinkingLevel,
-        m.source,
-        m.cost,
-        m.input,
-        m.output,
-        m.cacheRead,
-        m.cacheWrite,
-        m.reasoning,
-        m.timestamp,
-      ]);
-      if (stableKey) {
-        const observations = seenStableMessageObservations.get(stableKey) ?? [];
-        if (
-          observations.some(
-            (observation) =>
-              observation.fingerprint === accountingFingerprint &&
-              sessionsAreRelated(scannedSessions, observation.filePath, filePath),
-          )
-        ) {
-          continue;
-        }
-        observations.push({ filePath, fingerprint: accountingFingerprint });
-        seenStableMessageObservations.set(stableKey, observations);
+      // Independent reused ids and conflicting accounting never share proof.
+      if (m.sourceId) {
+        const identity = messageIdentity(m);
+        const proofPath = proofs.get(identity)?.get(resolve(filePath)) ?? resolve(filePath);
+        const proof = JSON.stringify([identity, proofPath]);
+        if (seenStableMessageProofs.has(proof)) continue;
+        seenStableMessageProofs.add(proof);
       } else {
         const legacyKey = `${filePath}:${state.parsed.sessionId}:${messageIndex}`;
         if (seenLegacyMessageKeys.has(legacyKey)) continue;
@@ -2596,21 +2693,34 @@ function fmtPercent(p: number): string {
 /**
  * Insights come in two kinds:
  * - structure: always-on decomposition of where the period's cost went.
- * - alarm: fires only when a wasteful pattern is material for the period, so
- *   an all-clear period shows a calm panel instead of a wall of 2% factoids.
- * Periods with zero recorded cost produce an empty list — the UI renders a
- * distinct empty-state for that case.
+ * - alarm: flags unresolved accounting, or a material wasteful spend pattern.
+ *   An all-clear period shows a calm panel instead of a wall of 2% factoids.
+ * Spend insights require recorded cost. Accounting-integrity warnings do not:
+ * zero/unknown-cost reports can still double-count tokens.
  */
 function computeInsights(raw: PeriodRawData, trend: TrendInfo | null): PeriodInsights {
-  if (raw.totalCost <= 0) {
-    return { insights: [] };
+  const insights: Insight[] = [];
+
+  // Integrity warnings survive even a zero-cost period's empty spend state.
+  if (raw.unresolvedToolCount > 0) {
+    insights.push({
+      kind: "alarm",
+      stat:
+        raw.unresolvedToolCost > 0
+          ? fmtMoney(raw.unresolvedToolCost)
+          : `${raw.unresolvedToolCount} report${raw.unresolvedToolCount === 1 ? "" : "s"}`,
+      headline: "tool reports have unresolved overlap with scanned child usage",
+      advice:
+        "Totals retain these reports and may double-count child usage. Exact cost and token vectors did not prove a safe reconciliation.",
+    });
   }
+
+  if (raw.totalCost <= 0) return { insights };
   const total = raw.totalCost;
   const assistantTotal = raw.assistantCost;
   const assistantPctLabel = raw.nonAssistantCost > 0 ? "assistant-message cost" : "this period";
-  const insights: Insight[] = [];
 
-  // --- Alarms (listed first) ---
+  // --- Spend alarms (listed before structure) ---
 
   const ttlPct = assistantTotal > 0 ? (raw.ttlMissCost / assistantTotal) * 100 : 0;
   if (ttlPct >= CACHE_MISS_ALARM_PERCENT && raw.ttlMissCost >= CACHE_MISS_ALARM_MIN_COST) {

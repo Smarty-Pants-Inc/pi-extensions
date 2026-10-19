@@ -47,7 +47,11 @@ resolved path or content already appears in the host's actual
 context selections. A `CLAUDE.md` alongside a different `AGENTS.override.md` is
 still Claude-specific guidance, and an unselected `AGENTS.md` cannot suppress a
 matching `CODEX.md`. On older hosts without structured prompt options, the
-fallback uses the same precedence and readability rules.
+fallback uses the same precedence and readability rules. Supplemental files are
+also deduplicated against each other. On structured hosts, guidance occupies the
+`provider_context` section without forcing a full prompt replacement, so later
+policy, context, and tool changes remain effective. An intentional earlier full
+prompt replacement is preserved with guidance appended.
 
 ## Install
 
@@ -108,6 +112,12 @@ Create `~/.pi/agent/agent-guidance.json`:
   "models": { "claude-3-5*": ["CLAUDE-3-5.md"] }
 }
 ```
+
+Model patterns are case-insensitive: `*` matches any characters, while all other
+characters are literal. The first matching model pattern takes precedence over
+provider configuration and built-in defaults. Empty arrays intentionally disable
+loading. Both `providers` and `models` must map names to arrays of strings;
+invalid configuration emits one warning naming the file and uses defaults.
 
 ## Changelog
 

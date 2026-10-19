@@ -32,11 +32,12 @@ const model = {
   maxTokens: 10_000,
 } as Model<"openai-codex-responses">;
 
+// These fixtures target transport/loadout safety; consent denial has separate authorization tests.
 const runtime: CodexCompactSettingsRuntime = {
   get: () => ({
     kind: "loaded",
     path: "unused",
-    settings: DEFAULT_CODEX_COMPACT_SETTINGS,
+    settings: { ...DEFAULT_CODEX_COMPACT_SETTINGS, allowCanonicalHistory: true },
     document: {},
   }),
   async reload() {

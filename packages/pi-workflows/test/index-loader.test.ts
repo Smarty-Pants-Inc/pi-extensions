@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ExtensionRunner } from "@earendil-works/pi-coding-agent";
+import { type ExtensionContext, ExtensionRunner } from "@earendil-works/pi-coding-agent";
 import {
   type ManagedRoutingPolicy,
   PROTOCOL_CAPABILITIES,
@@ -85,6 +85,7 @@ function createPi(child: boolean, appendFailures = 0, branch: unknown[] = [], pr
   });
   const pi = {
     events: bus,
+    registerMessageRenderer: vi.fn(),
     appendEntry: (_type: string, data: unknown) => {
       if (appendFailures > 0) {
         appendFailures -= 1;
@@ -109,13 +110,22 @@ function createPi(child: boolean, appendFailures = 0, branch: unknown[] = [], pr
     hasUI: false,
     mode: "print" as "print" | "rpc" | "tui",
     ui: {
-      setWidget: (_key: string, content: string[] | undefined) => widgetUpdates.push(content),
+      setWidget: (_key: string, content: Parameters<ExtensionContext["ui"]["setWidget"]>[1]) => {
+        if (typeof content === "function") {
+          const component = content(
+            { terminal: { rows: 24, columns: 80 }, requestRender() {} } as never,
+            { fg: (_token: string, text: string) => text } as never,
+          );
+          widgetUpdates.push(component.render(80));
+        } else widgetUpdates.push(content);
+      },
       notify: vi.fn(),
       confirm: vi.fn(async () => true),
       input: vi.fn(async () => "input"),
       select: vi.fn(async () => "choice"),
     },
     sessionManager: {
+      getSessionId: () => "workflow-fixture-session",
       getLeafId: () => (entries.length ? `entry-${entries.length}` : null),
       getBranch: () =>
         entries.map((entry, index) => {
@@ -160,6 +170,112 @@ function workflowTool(fixture: ReturnType<typeof createPi>): WorkflowTool {
 }
 
 describe("pi-workflows loader context isolation", () => {
+  it("sanitizes command notifications without changing stored workflow names and reports missing watches", async () => {
+    const fixture = createPi(false);
+    piWorkflows(fixture.pi as never);
+    await fixture.lifecycle.get("session_start")?.({}, fixture.ctx);
+    try {
+      const name = "unsafe\u001b[2J\u009b\u202e\u0000";
+      const result = await workflowTool(fixture).execute(
+        "unsafe-name",
+        {
+          script: `export const meta = { name: ${JSON.stringify(name)}, description: "test" }; return true;`,
+          background: false,
+        },
+        undefined,
+        undefined,
+        fixture.ctx,
+      );
+      expect(result.details.status).toBe("completed");
+      const command = fixture.commandDefinitions.get("workflows") as {
+        handler: (args: string, ctx: unknown) => Promise<void>;
+      };
+      for (const args of ["status", `status ${result.details.runId}`, "watch missing-id", "unknown\u001b[2J"]) {
+        await command.handler(args, fixture.ctx);
+      }
+      const notices = fixture.ctx.ui.notify.mock.calls.map(([message]) => String(message)).join("\n");
+      for (const byte of ["\u001b", "\u009b", "\u202e", "\u0000"]) expect(notices).not.toContain(byte);
+      expect(notices).toContain("\\u001b[2J");
+      expect(notices).toContain("Workflow run not found: missing-id");
+      expect(fixture.entries.find((entry) => (entry as { kind?: string }).kind === "run_created")).toMatchObject({
+        meta: { name },
+      });
+    } finally {
+      await fixture.lifecycle.get("session_shutdown")?.({}, fixture.ctx);
+    }
+  });
+
+  it("watch opens the selected live TUI inspector and retains checkpoint presentation", async () => {
+    const fixture = createPi(false);
+    const screens: string[] = [];
+    const custom = vi.fn(async (factory: Parameters<ExtensionContext["ui"]["custom"]>[0]) => {
+      let closed = false;
+      const component = await factory(
+        { terminal: { rows: 24, columns: 80 }, requestRender() {} } as never,
+        { fg: (_token: string, text: string) => text, bold: (text: string) => text } as never,
+        { matches: () => false, getKeys: () => [] } as never,
+        () => {
+          closed = true;
+        },
+      );
+      screens.push(component.render(80).join("\n"));
+      component.handleInput?.("\u001b");
+      component.handleInput?.("\u001b");
+      expect(closed).toBe(true);
+    });
+    const ctx = { ...fixture.ctx, mode: "tui" as const, hasUI: true, ui: { ...fixture.ctx.ui, custom } };
+    const inspection = vi.spyOn(WorkflowEngine.prototype, "getInspection");
+    piWorkflows(fixture.pi as never);
+    await fixture.lifecycle.get("session_start")?.({}, ctx);
+    try {
+      const result = await workflowTool(fixture).execute(
+        "checkpoint-inspection",
+        {
+          script:
+            'export const meta = { name: "watch-checkpoint", description: "test", phases: [{ title: "Verify" }] }; phase("Verify"); return await checkpoint("Continue?", { default: true });',
+          background: false,
+        },
+        undefined,
+        undefined,
+        ctx,
+      );
+      expect(result.details.status).toBe("completed");
+      const command = fixture.commandDefinitions.get("workflows") as {
+        handler: (args: string, ctx: unknown) => Promise<void>;
+      };
+      await command.handler(`watch ${result.details.runId}`, ctx);
+      expect(custom).toHaveBeenCalledOnce();
+      expect(screens[0]).toContain("watch-checkpoint");
+      expect(screens[0]).toContain("entered");
+      expect(screens[0]).not.toContain("Invalid presentation");
+      expect(
+        inspection.mock.results.some(
+          (entry) => entry.type === "return" && entry.value?.calls.some((call) => call.kind === "checkpoint"),
+        ),
+      ).toBe(true);
+    } finally {
+      await fixture.lifecycle.get("session_shutdown")?.({}, ctx);
+      inspection.mockRestore();
+    }
+  });
+
+  it("encodes delivery display copies without changing persisted content or membership", async () => {
+    const fixture = createPi(false);
+    piWorkflows(fixture.pi as never);
+    await fixture.lifecycle.get("session_start")?.({}, fixture.ctx);
+    const render = fixture.pi.registerMessageRenderer.mock.calls.find(
+      ([type]) => type === "pi-workflows:delivery",
+    )?.[1] as (message: unknown, options: unknown, theme: unknown) => { render(width: number): string[] };
+    const message = { content: "raw\u001b[2J\u009b\u202e result", details: { runIds: ["raw-run"] } };
+    const before = structuredClone(message);
+    const displayed = render(message, { expanded: true }, { fg: (_token: string, text: string) => text })
+      .render(120)
+      .join("\n");
+    for (const control of ["\u001b", "\u009b", "\u202e"]) expect(displayed).not.toContain(control);
+    expect(displayed).toContain("raw\\u001b[2J\\u009b\\u202e result");
+    expect(message).toEqual(before);
+    await fixture.lifecycle.get("session_shutdown")?.({}, fixture.ctx);
+  });
   it("binds every code-review git/gh discovery command to the command session cwd", async () => {
     const root = mkdtempSync(join(tmpdir(), "workflows-review-cwd-"));
     const a = join(root, "a");
@@ -292,6 +408,27 @@ return { local: [cwd, process.cwd()], nested: await workflow(${JSON.stringify(ch
         const controller = new AbortController();
         let dialogSignal: AbortSignal | undefined;
         let pendingDialogs = 0;
+        let markDialogOpened!: () => void;
+        const dialogOpened = new Promise<void>((resolve) => {
+          markDialogOpened = resolve;
+        });
+        if (action === "fatal") {
+          // Gate the sibling on the actual unanswered public UI dialog, not
+          // transport admission: an immediate script throw can beat UI mounting.
+          fixture.bus.on("subagents:rpc:spawn-managed", (raw) => {
+            const { requestId } = raw as { requestId: string };
+            void dialogOpened.then(() => {
+              fixture.bus.emit(`subagents:rpc:spawn-managed:reply:${requestId}`, {
+                success: true,
+                data: {
+                  id: "fatal-trigger",
+                  state: "completed",
+                  terminal: { status: "completed", result: "ready", compactionCount: 0, completedAt: Date.now() },
+                },
+              });
+            });
+          });
+        }
         const dialog = vi.fn(async (_title: string, _value: unknown, options?: { signal?: AbortSignal }) => {
           dialogSignal = options?.signal;
           pendingDialogs++;
@@ -303,6 +440,7 @@ return { local: [cwd, process.cwd()], nested: await workflow(${JSON.stringify(ch
               };
               dialogSignal?.addEventListener("abort", close, { once: true });
               if (dialogSignal?.aborted) close();
+              markDialogOpened();
             });
           } finally {
             pendingDialogs--;
@@ -319,7 +457,7 @@ return { local: [cwd, process.cwd()], nested: await workflow(${JSON.stringify(ch
         const checkpoint = `checkpoint("wait", { kind: "${kind}", choices: ["yes"], default: "fallback" })`;
         const body =
           action === "fatal"
-            ? `return await Promise.all([${checkpoint}, Promise.resolve().then(() => { throw new Error("fatal"); })]);`
+            ? `return await Promise.all([${checkpoint}, agent("release fatal").then(() => { throw new Error("fatal"); })]);`
             : `return await ${checkpoint};`;
         const pending = workflowTool(fixture).execute(
           "cancel-checkpoint",
@@ -351,7 +489,14 @@ return { local: [cwd, process.cwd()], nested: await workflow(${JSON.stringify(ch
           expect(pendingDialogs).toBe(0);
           expect(emitted.mock.calls.map(([event]) => event.type)).toEqual(["ui_prompt_start", "ui_prompt_end"]);
         });
-        expect(fixture.entries.some((entry) => (entry as { kind?: string }).kind === "call_result")).toBe(false);
+        const callResults = fixture.entries.filter((entry) => (entry as { kind?: string }).kind === "call_result");
+        // Checkpoint call 0 never commits; only the gated sibling call 1 may.
+        if (action === "fatal") {
+          expect(cancelled.details.status).toBe("failed");
+          expect(cancelled.content.map((part) => part.text).join(" ")).toContain("fatal");
+          expect(callResults).toHaveLength(1);
+          expect(callResults[0]).toMatchObject({ nodeId: "1", result: { status: "completed", result: "ready" } });
+        } else expect(callResults).toEqual([]);
         if (action === "tool-abort") {
           const control = fixture.toolDefinitions.find(
             (tool) => (tool as { name: string }).name === "workflow_control",
@@ -469,7 +614,8 @@ return { local: [cwd, process.cwd()], nested: await workflow(${JSON.stringify(ch
     const fixture = createPi(false);
     fixture.ctx.mode = "tui";
     fixture.ctx.hasUI = true;
-    let resolveConfirm: (value: boolean) => void = () => {};
+    const controller = new AbortController();
+    let resolveConfirm: ((value: boolean) => void) | undefined;
     fixture.ctx.ui.confirm.mockImplementation(
       () =>
         new Promise<boolean>((resolve) => {
@@ -484,18 +630,28 @@ return { local: [cwd, process.cwd()], nested: await workflow(${JSON.stringify(ch
         script: 'export const meta = { name: "live", description: "test" }; return await checkpoint("wait");',
         background: false,
       },
-      undefined,
+      controller.signal,
       undefined,
       fixture.ctx,
     );
-    await vi.waitFor(() => expect(fixture.widgetUpdates.some((lines) => lines && lines.length > 0)).toBe(true));
-    resolveConfirm(true);
-    await pending;
-    await fixture.lifecycle.get("session_shutdown")?.({}, fixture.ctx);
-    expect(fixture.widgetUpdates.at(-1)).toBeUndefined();
-    const updates = fixture.widgetUpdates.length;
-    await Promise.resolve();
-    expect(fixture.widgetUpdates).toHaveLength(updates);
+    try {
+      await vi.waitFor(() => expect(fixture.widgetUpdates.some((lines) => lines && lines.length > 0)).toBe(true));
+      // The live widget is published before the VM reaches its checkpoint.
+      // Wait for the actual dialog; resolving a placeholder here loses the answer.
+      await vi.waitFor(() => expect(fixture.ctx.ui.confirm).toHaveBeenCalledOnce());
+      if (!resolveConfirm) throw new Error("Checkpoint confirmation is not ready");
+      resolveConfirm(true);
+      expect((await pending).details.status).toBe("completed");
+      await fixture.lifecycle.get("session_shutdown")?.({}, fixture.ctx);
+      expect(fixture.widgetUpdates.at(-1)).toBeUndefined();
+      const updates = fixture.widgetUpdates.length;
+      await Promise.resolve();
+      expect(fixture.widgetUpdates).toHaveLength(updates);
+    } finally {
+      controller.abort();
+      await fixture.lifecycle.get("session_shutdown")?.({}, fixture.ctx);
+      await pending;
+    }
   });
   it("does not register tools, commands, ping, or journal state in a child session", async () => {
     const fixture = createPi(true);
@@ -524,7 +680,7 @@ return { local: [cwd, process.cwd()], nested: await workflow(${JSON.stringify(ch
     await fixture.lifecycle.get("session_shutdown")?.({}, fixture.ctx);
   });
 
-  it("deduplicates the workflow marker at the final context boundary", async () => {
+  it("preserves literal workflow markers at the final context boundary", async () => {
     const fixture = createPi(false);
     piWorkflows(fixture.pi as never);
     await fixture.lifecycle.get("session_start")?.({}, fixture.ctx);
@@ -542,12 +698,11 @@ return { local: [cwd, process.cwd()], nested: await workflow(${JSON.stringify(ch
       fixture.ctx,
     )) as { messages?: Array<{ content?: unknown }> } | undefined;
 
-    expect(result?.messages?.[0]?.content).toBe(`keep this\n\n${WORKFLOW_ARMED_DIRECTIVE}\nOther plugin guidance\n\n`);
-    expect(result?.messages?.[1]?.content).toEqual([]);
+    expect(result).toBeUndefined(); // No transform: native input/context is opaque.
     await fixture.lifecycle.get("session_shutdown")?.({}, fixture.ctx);
   });
 
-  it("deduplicates only its marker across text parts without joining or dropping images", async () => {
+  it("preserves every text part and image, including repeated exact directives", async () => {
     const fixture = createPi(false);
     piWorkflows(fixture.pi as never);
     await fixture.lifecycle.get("session_start")?.({}, fixture.ctx);
@@ -566,16 +721,10 @@ return { local: [cwd, process.cwd()], nested: await workflow(${JSON.stringify(ch
     )) as {
       messages: Array<{ content: unknown }>;
     };
-    expect(result.messages[0]).toBe(older);
-    expect(result.messages[1]?.content).toEqual([
-      parts[0],
-      image,
-      { type: "text", text: `second  ${unrelated} ` },
-      { type: "text", text: "" },
-    ]);
-    expect((result.messages[1]?.content as unknown[])?.[1]).toBe(image);
+    expect(result).toBeUndefined();
+    expect(parts[1]).toBe(image);
     expect(parts[2]?.text).toContain(WORKFLOW_ARMED_DIRECTIVE);
-    expect(await fixture.lifecycle.get("context")?.({ messages: result.messages }, fixture.ctx)).toBeUndefined();
+    expect(older.content).toBe(parts);
     await fixture.lifecycle.get("session_shutdown")?.({}, fixture.ctx);
   });
 

@@ -5,7 +5,7 @@ import { dirname } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionUIDialogOptions } from "@earendil-works/pi-coding-agent";
 import extension from "../index.js";
 
-function hostFixture(exec?: ExtensionAPI["exec"]) {
+function hostFixture(exec?: ExtensionAPI["exec"], snippet = "const a = 1;") {
   const handlers = new Map<string, () => void>();
   let command!: (args: string, ctx: ExtensionCommandContext) => Promise<void>;
   const pending = new Map<number, (value: boolean | string | undefined) => void>();
@@ -64,6 +64,7 @@ function hostFixture(exec?: ExtensionAPI["exec"]) {
       {
         mode: "rpc",
         hasUI: true,
+        cwd: process.cwd(),
         signal: agentSignal,
         sessionManager: {
           getSessionId: () => sessionId,
@@ -73,7 +74,7 @@ function hostFixture(exec?: ExtensionAPI["exec"]) {
               type: "message",
               id: leafId,
               timestamp: "",
-              message: { role: "assistant", content: "```ts\nconst a = 1;\n```" },
+              message: { role: "assistant", content: `\`\`\`sh\n${snippet}\n\`\`\`` },
             },
           ],
         },
@@ -270,7 +271,8 @@ for (const event of [
 }
 
 test("normal RPC action selection retains draft consent and runs only after confirmation", async () => {
-  const host = hostFixture();
+  const snippet = process.platform === "win32" ? "Write-Output 'confirmed snippet'" : "printf 'confirmed snippet';";
+  const host = hostFixture(undefined, snippet);
   const current = host.context();
   const inserting = host.command("last 1", current.ctx);
   host.reply(1, "Insert");
@@ -288,7 +290,9 @@ test("normal RPC action selection retains draft consent and runs only after conf
   assert.deepEqual(host.execs, []);
   host.reply(4, true);
   await running;
-  assert.equal(host.execs.length, 1);
+  assert.deepEqual(host.execs, [], "full-shell snippets must not use Pi's parent-only exec cancellation");
+  assert.match(host.notices.at(-1) ?? "", /confirmed snippet/);
+  assert.match(host.notices.at(-1) ?? "", /Exit code: 0/);
 });
 
 for (const event of [

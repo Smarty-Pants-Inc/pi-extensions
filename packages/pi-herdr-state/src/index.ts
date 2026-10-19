@@ -140,7 +140,10 @@ function nextReportSeq(): number {
   return reportSeq;
 }
 
-function sendRequestAttempt(request: unknown, timeoutMs: number): Promise<boolean> {
+type TransportOwner = { signal: AbortSignal; isCurrent: () => boolean };
+
+function sendRequestAttempt(request: unknown, timeoutMs: number, owner: TransportOwner): Promise<boolean> {
+  if (owner.signal.aborted || !owner.isCurrent()) return Promise.resolve(false);
   if (!enabled()) return Promise.resolve(true);
   return new Promise((resolve) => {
     let done = false;
@@ -149,6 +152,7 @@ function sendRequestAttempt(request: unknown, timeoutMs: number): Promise<boolea
       if (done) return;
       done = true;
       if (timer) clearTimeout(timer);
+      owner.signal.removeEventListener("abort", abort);
       socket.destroy();
       resolve(delivered);
     };
@@ -158,25 +162,35 @@ function sendRequestAttempt(request: unknown, timeoutMs: number): Promise<boolea
       return;
     }
     const socket = createConnection(endpoint);
+    const abort = () => finish(false);
+    owner.signal.addEventListener("abort", abort, { once: true });
     socket.on("error", () => finish(false));
-    socket.on("connect", () => socket.write(`${JSON.stringify(request)}\n`));
-    socket.on("data", () => finish(true));
+    socket.on("connect", () => {
+      if (done || owner.signal.aborted || !owner.isCurrent()) {
+        finish(false);
+        return;
+      }
+      socket.write(`${JSON.stringify(request)}\n`);
+    });
+    socket.on("data", () => finish(!owner.signal.aborted && owner.isCurrent()));
     socket.on("end", () => finish(false));
     timer = setTimeout(() => finish(false), timeoutMs);
     timer.unref?.();
+    if (owner.signal.aborted || !owner.isCurrent()) finish(false);
   });
 }
 
-async function sendRequestNow(request: unknown): Promise<void> {
+async function sendRequestNow(request: unknown, owner: TransportOwner): Promise<void> {
   const body = toRecord(request);
   const method = body.method;
   const state = toRecord(body.params).state ?? "";
   try {
-    if (await sendRequestAttempt(request, 500)) {
+    if (await sendRequestAttempt(request, 500, owner)) {
       log("SEND ok", method, state);
       return;
     }
-    const ok = await sendRequestAttempt(request, 1500);
+    if (owner.signal.aborted || !owner.isCurrent()) return;
+    const ok = await sendRequestAttempt(request, 1500, owner);
     log("SEND", ok ? "ok-retry" : "FAILED", method, state);
   } catch (error) {
     log("SEND exception", method, error);
@@ -272,9 +286,22 @@ function releaseAgent(send: RequestTransport): Promise<void> {
   });
 }
 
-export function createReporter(pi: PiApi, transport: RequestTransport = sendRequestNow): void {
+export function createReporter(pi: PiApi, transport?: RequestTransport): void {
   let disposed = false;
-  const send = createRequestQueue(transport, () => !disposed);
+  let ownerGeneration = 0;
+  let ownerController = new AbortController();
+  // Capture ownership at enqueue time, not when the serialized transport runs.
+  const queue = createRequestQueue(async (value) => {
+    const envelope = value as { generation: number; request: unknown };
+    if (!validOwner(envelope.generation)) return;
+    if (transport) await transport(envelope.request);
+    else
+      await sendRequestNow(envelope.request, {
+        signal: ownerController.signal,
+        isCurrent: () => validOwner(envelope.generation),
+      });
+  });
+  const send: RequestTransport = (request) => queue({ generation: ownerGeneration, request });
   let active = false;
   let currentSession: SessionRef | undefined;
   let working = false;
@@ -291,6 +318,34 @@ export function createReporter(pi: PiApi, transport: RequestTransport = sendRequ
   const sessionTimers = new Set<ReturnType<typeof setTimeout>>();
   let lastReportedSessionKey: string | undefined;
 
+  function retireOwner(generation: number): void {
+    if (generation !== ownerGeneration) return;
+    ownerGeneration += 1;
+    active = false;
+    lastCtx = undefined;
+    queued = undefined;
+    clearTimers();
+    ownerController.abort();
+  }
+
+  function validOwner(generation = ownerGeneration): boolean {
+    if (disposed || !active || generation !== ownerGeneration) return false;
+    try {
+      // Mode is live before our lifecycle handler runs; SDK disposal also
+      // invalidates the captured public getters without a shutdown event.
+      const context = toRecord(lastCtx);
+      if (context.mode === "tui") {
+        void context.sessionManager;
+        callNoArg(context.isIdle, lastCtx);
+        return true;
+      }
+    } catch {
+      // Resource-only retirement below, with no report to the new authority.
+    }
+    retireOwner(generation);
+    return false;
+  }
+
   function desired(): AgentState {
     if (blockedCount > 0 || uiPromptBalance > 0) return "blocked";
     return working ? "working" : "idle";
@@ -302,7 +357,7 @@ export function createReporter(pi: PiApi, transport: RequestTransport = sendRequ
     if (sending) return;
     sending = true;
     try {
-      while (queued && !disposed) {
+      while (queued && validOwner()) {
         const next = queued;
         queued = undefined;
         await reportState(send, next.state, next.message, next.ref);
@@ -315,7 +370,7 @@ export function createReporter(pi: PiApi, transport: RequestTransport = sendRequ
   }
 
   function publish(force = false): void {
-    if (!active || disposed) return;
+    if (!validOwner()) return;
     const state = desired();
     const message = state === "blocked" ? blockedMessage : undefined;
     if (!force && state === lastState && message === lastMessage) return;
@@ -357,9 +412,10 @@ export function createReporter(pi: PiApi, transport: RequestTransport = sendRequ
   function scheduleIdle(): void {
     if (disposed) return;
     if (idleTimer) clearTimeout(idleTimer);
+    const generation = ownerGeneration;
     idleTimer = setTimeout(() => {
+      if (!validOwner(generation)) return;
       idleTimer = undefined;
-      if (disposed) return;
       working = false;
       publish();
     }, idleDebounceMs);
@@ -382,13 +438,14 @@ export function createReporter(pi: PiApi, transport: RequestTransport = sendRequ
   // Allocate long-lived resources only once an active TUI session exists.
   function startPoll(): void {
     if (poll) return;
+    const generation = ownerGeneration;
     let pollTicks = 0;
     poll = setInterval(() => {
+      if (!validOwner(generation)) return;
       pollTicks += 1;
       if (pollTicks % 5 === 0) {
         log(`poll-tick active=${active} working=${working} isIdle=${safeIdle(lastCtx)}`);
       }
-      if (!active || disposed) return;
       if (pollTicks % 2 === 0) publish(true);
     }, pollMs);
     poll.unref?.();
@@ -398,8 +455,8 @@ export function createReporter(pi: PiApi, transport: RequestTransport = sendRequ
     if (disposed) return;
     const event = toRecord(rawEvent);
     const ctx = toRecord(rawCtx);
-    for (const timer of sessionTimers) clearTimeout(timer);
-    sessionTimers.clear();
+    retireOwner(ownerGeneration);
+    ownerController = new AbortController();
     sync(rawCtx);
     active = ctx.mode === "tui";
     log(`EVT session_start reason=${String(event.reason)} mode=${String(ctx.mode)} isIdle=${safeIdle(rawCtx)}`);
@@ -422,10 +479,11 @@ export function createReporter(pi: PiApi, transport: RequestTransport = sendRequ
     // drops source reports for a few seconds afterward. Re-assert the current
     // state a few times so herdr converges once its reset settles.
     if (event.reason && event.reason !== "startup") {
+      const generation = ownerGeneration;
       for (const ms of [1200, 2800, 4800, 7000]) {
         const timer = setTimeout(() => {
           sessionTimers.delete(timer);
-          if (!disposed && active) publish(true);
+          if (validOwner(generation)) publish(true);
         }, ms);
         sessionTimers.add(timer);
         timer.unref?.();
@@ -487,12 +545,13 @@ export function createReporter(pi: PiApi, transport: RequestTransport = sendRequ
     publish();
   });
 
-  pi.on("session_shutdown", async (rawEvent: unknown) => {
+  pi.on("session_shutdown", async (rawEvent: unknown, rawCtx: unknown) => {
     if (disposed) return;
     const event = toRecord(rawEvent);
     const wasActive = active;
-    clearTimers();
-    active = false;
+    // Invalidate queued reports before any awaited release transport.
+    disposed = true;
+    retireOwner(ownerGeneration);
     uiPromptBalance = 0;
     blockedCount = 0;
     blockedMessage = undefined;
@@ -500,9 +559,34 @@ export function createReporter(pi: PiApi, transport: RequestTransport = sendRequ
     try {
       if (event.reason === "quit" && wasActive) {
         log("session_shutdown quit -> release");
-        // Send release directly before enabling the disposed gate; replacement
-        // shutdowns intentionally do not release process-owned Herdr authority.
-        await releaseAgent(transport);
+        // Quit release has independent ownership: report retirement cannot
+        // cancel it, but an invalidated quit context cannot clear a replacement.
+        const releaseController = new AbortController();
+        try {
+          await releaseAgent(
+            transport ??
+              ((request) =>
+                sendRequestNow(request, {
+                  signal: releaseController.signal,
+                  isCurrent: () => {
+                    try {
+                      const context = toRecord(rawCtx);
+                      if (context.mode === "tui") {
+                        void context.sessionManager;
+                        callNoArg(context.isIdle, rawCtx);
+                        return true;
+                      }
+                    } catch {
+                      // Invalid SDK scope retires this independent release owner.
+                    }
+                    releaseController.abort();
+                    return false;
+                  },
+                })),
+          );
+        } finally {
+          releaseController.abort();
+        }
       } else {
         log("session_shutdown", event.reason, "-> dispose reporter");
       }

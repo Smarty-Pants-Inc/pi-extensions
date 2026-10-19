@@ -45,7 +45,7 @@ export type NormalizationResult = { ok: true; questions: Question[] } | { ok: fa
 
 /** Remove terminal controls and make model-provided labels safe single-line display text. */
 export function sanitizeDisplayText(value: string, maxLength: number): string {
-  const withoutTerminalSequences = stripVTControlCharacters(value);
+  const withoutTerminalSequences = stripVTControlCharacters(value).replace(/\s+/gu, " ");
   const withoutControls = Array.from(withoutTerminalSequences)
     .filter((character) => {
       const codePoint = character.codePointAt(0) ?? 0;
@@ -53,15 +53,18 @@ export function sanitizeDisplayText(value: string, maxLength: number): string {
         codePoint > 0x1f &&
         codePoint !== 0x7f &&
         !(codePoint >= 0x80 && codePoint <= 0x9f) &&
-        ![
-          0x200b, 0x200c, 0x200d, 0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067, 0x2068, 0x2069, 0xfeff,
-        ].includes(codePoint)
+        ![0x200b, 0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067, 0x2068, 0x2069, 0xfeff].includes(codePoint)
       );
     })
     .join("")
     .replace(/\s+/gu, " ")
     .trim();
-  return withoutControls.slice(0, maxLength).trim();
+  let display = "";
+  for (const { segment } of new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(withoutControls)) {
+    if (display.length + segment.length > maxLength) break;
+    display += segment;
+  }
+  return display.trim();
 }
 
 export function normalizeQuestions(input: unknown): NormalizationResult {
@@ -150,8 +153,9 @@ export function normalizeQuestions(input: unknown): NormalizationResult {
 
 function requiredText(value: unknown, maxLength: number): string | undefined {
   if (typeof value !== "string") return undefined;
-  const result = sanitizeDisplayText(value, maxLength);
-  return result.length > 0 ? result : undefined;
+  // Validate the bounded payload; sanitize only copies at the display boundary.
+  if (value.length > maxLength || !sanitizeDisplayText(value, maxLength)) return undefined;
+  return value;
 }
 
 function optionalText(value: unknown, maxLength: number): string | undefined {

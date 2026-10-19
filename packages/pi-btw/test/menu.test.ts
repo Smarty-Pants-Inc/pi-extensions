@@ -103,7 +103,6 @@ test("a completed menu cannot restore its cached old draft after Pi commits a ne
           {} as never,
           {} as never,
           ((value: unknown) => {
-            cachedEditor = "side draft";
             completed = value;
             // Commit during close so both synchronous and final restoration
             // must refuse to write through the captured old context.
@@ -120,6 +119,9 @@ test("a completed menu cannot restore its cached old draft after Pi commits a ne
   const result = await runBtwMenuPreservingEditor(ctx, async (menuContext) => {
     const ui = menuContext.ui as ExtensionCommandContext["ui"];
     await ui.custom((_tui, _theme, _keybindings, done) => {
+      // Ensure the shared adapter captures a changed draft and attempts repair
+      // after the host commits the new session during completion.
+      cachedEditor = "side draft";
       done("selected");
       return { render: () => [], invalidate() {} };
     });

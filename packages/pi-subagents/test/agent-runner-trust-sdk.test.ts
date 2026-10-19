@@ -32,6 +32,37 @@ describe("inherited child project trust (installed Pi SDK)", () => {
   let launcherMarker: string;
   let launch: ReturnType<typeof vi.fn<Pi.McpTransportFactory>>;
   let confirm: ReturnType<typeof vi.fn>;
+  let nativeApi: ExtensionAPI | undefined;
+  let expectedLaunches: number;
+  let firstTransport: Promise<void>;
+  let signalFirstTransport: () => void;
+  let started: number;
+  let trace: { event: string; ms: number; detail?: unknown }[];
+
+  function record(event: string, detail?: unknown) {
+    trace.push({ event, ms: Math.round(performance.now() - started), detail });
+  }
+
+  async function fixtureDeadline<T>(work: Promise<T>): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([work, new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`MCP fixture deadline exceeded: ${JSON.stringify(trace)}`)), 5_000);
+      })]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function expectTransports(session: AgentSession, names: string[]) {
+    // Prompt completion is not MCP readiness: the native 100ms startup wait
+    // intentionally permits a cold runtime to finish loading in the background.
+    await fixtureDeadline(firstTransport);
+    await fixtureDeadline(session.prompt("/mcp"));
+    expect(launch).toHaveBeenCalledTimes(names.length);
+    expect(launch.mock.calls.map(([entry]) => entry.name).sort()).toEqual([...names].sort());
+    expectedLaunches = names.length;
+  }
 
   function skill(base: string, name: string, text: string): string {
     const dir = join(base, "skills", name);
@@ -61,6 +92,11 @@ export default function(pi) { writeFileSync(${JSON.stringify(factoryMarker)}, "f
   }
 
   beforeEach(async () => {
+    started = performance.now();
+    trace = [];
+    nativeApi = undefined;
+    expectedLaunches = 0;
+    firstTransport = new Promise<void>((resolve) => { signalFirstTransport = resolve; });
     root = mkdtempSync(join(tmpdir(), "subagent-trust-sdk-"));
     cwd = join(root, "project");
     agentDir = join(root, "agent");
@@ -77,12 +113,43 @@ export default function(pi) { writeFileSync(${JSON.stringify(factoryMarker)}, "f
     // Intercept the public MCP transport factory: even a regression cannot
     // spawn a real stdio process or make a network request. A trusted positive
     // control proves the project entry would reach this launcher.
-    launch = vi.fn<Pi.McpTransportFactory>((_entry, _cwd) => {
+    launch = vi.fn<Pi.McpTransportFactory>((entry, transportCwd) => {
+      // This public callback is also the first observable evidence that the
+      // native lazy runtime is ready; no private runtime imports are patched.
+      record("runtime-ready/transport", { entry, cwd: transportCwd });
+      signalFirstTransport();
       writeFileSync(launcherMarker, "launch attempted");
       throw new Error("Safe fixture transport intercepted; no MCP launched");
     });
     const createMcp = Pi.createMcpExtension;
-    vi.spyOn(Pi, "createMcpExtension").mockImplementation((options) => createMcp({ ...options, createTransport: launch, startupWaitMs: 100 }));
+    vi.spyOn(Pi, "createMcpExtension").mockImplementation((options) => {
+      const native = createMcp({ ...options, createTransport: launch, startupWaitMs: 100 });
+      return (pi) => {
+        nativeApi = pi;
+        return native(new Proxy(pi, {
+          get(target, key, receiver) {
+            if (key === "on") return ((event: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) => {
+              return Reflect.apply(target.on, target, [event, (payload: unknown, context: ExtensionContext) => {
+                if (event === "session_start") {
+                  // Observe files and authority without replacing native loadConfig.
+                  record("native-config", {
+                    cwd: context.cwd, trusted: context.isProjectTrusted(),
+                    files: [join(agentDir, "mcp.json"), ...(context.isProjectTrusted() ? [join(context.cwd, ".pi", "mcp.json")] : [])]
+                      .filter(existsSync).map(source => ({ source, realpath: realpathSync.native(source), text: readFileSync(source, "utf8") })),
+                  });
+                }
+                if (event === "before_agent_start") record("prompt-start");
+                return handler(payload, { ...context, ui: { ...context.ui, notify: (message, type) => {
+                  record("native-notify", { message, type });
+                  context.ui.notify(message, type);
+                } } });
+              }]);
+            }) as ExtensionAPI["on"];
+            return Reflect.get(target, key, receiver);
+          },
+        }));
+      };
+    });
     faux = fauxProvider({ provider: "trust-faux", models: [{ id: "physical", contextWindow: 200_000 }] });
     const runtime = await ModelRuntime.create({ authPath: join(agentDir, "auth.json"), modelsPath: null, allowModelNetwork: false });
     runtime.registerNativeProvider(faux.provider);
@@ -100,15 +167,28 @@ export default function(pi) { writeFileSync(${JSON.stringify(factoryMarker)}, "f
   });
 
   afterEach(async () => {
-    for (const session of sessions) await shutdownAndDisposeSession(session);
-    vi.restoreAllMocks();
-    registerAgents(new Map());
-    setScopeModelsEnabled(false);
-    setAgentTiersSettings({});
-    faux.setResponses([]);
-    if (oldAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-    else process.env.PI_CODING_AGENT_DIR = oldAgentDir;
-    rmSync(root, { recursive: true, force: true });
+    try {
+      // The native public command awaits pending startup. In particular, a
+      // negative assertion at prompt completion must not conceal a late launch.
+      for (const session of sessions) {
+        if (session.extensionRunner.getCommand("mcp")) await fixtureDeadline(session.prompt("/mcp"));
+      }
+      expect(launch).toHaveBeenCalledTimes(expectedLaunches);
+    } finally {
+      try {
+        for (const session of sessions) await shutdownAndDisposeSession(session);
+      } finally {
+        if (trace.some(item => item.event === "native-config")) console.info("MCP fixture trace", JSON.stringify(trace));
+        vi.restoreAllMocks();
+        registerAgents(new Map());
+        setScopeModelsEnabled(false);
+        setAgentTiersSettings({});
+        faux.setResponses([]);
+        if (oldAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+        else process.env.PI_CODING_AGENT_DIR = oldAgentDir;
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
   });
 
   async function spawn(config: Partial<AgentConfig> = {}, options: Partial<RunOptions> = {}, parent = ctx) {
@@ -125,6 +205,7 @@ export default function(pi) { writeFileSync(${JSON.stringify(factoryMarker)}, "f
       onSessionCreated: (session) => sessions.push(session),
       ...options,
     });
+    record("prompt-complete", { launches: launch.mock.calls.length });
     expect(result.responseText).toBe("CHILD_OK");
     expect(providerCall).toHaveBeenCalledOnce();
     return result.session;
@@ -256,8 +337,11 @@ export default function(pi) { writeFileSync(${JSON.stringify(factoryMarker)}, "f
       expect(session.settingsManager.getBlockImages()).toBe(true);
       expect(launch).not.toHaveBeenCalled();
     } else {
+      await expectTransports(session, ["dotdot-global"]);
       expect(launch).toHaveBeenCalledOnce();
       expect(launch.mock.calls[0][0].name).toBe("dotdot-global");
+      expect(launch.mock.calls[0][0].source).toBe(alias);
+      expect(launch.mock.calls[0][0].scope).toBe("global");
     }
   });
 
@@ -510,6 +594,7 @@ export default function () { writeFileSync(${JSON.stringify(globalMarker)}, "fac
     expect(existsSync(globalMarker)).toBe(true);
     expect(session.resourceLoader.getSkills().skills.map((s) => s.name)).toContain("trust-probe");
     expect(session.resourceLoader.getSkills().skills.map((s) => s.filePath)).not.toContain(projectSkill);
+    await expectTransports(session, ["global-server"]);
     expect(launch).toHaveBeenCalledOnce();
     expect(launch.mock.calls[0][0].name).toBe("global-server");
     expect(existsSync(launcherMarker)).toBe(true);
@@ -585,6 +670,7 @@ export default function () { writeFileSync(${JSON.stringify(globalMarker)}, "fac
     expect(session.settingsManager.getBlockImages()).toBe(true);
     expect(session.resourceLoader.getSkills().skills.map((s) => s.name)).toContain("trust-probe");
     expect(existsSync(factoryMarker)).toBe(true);
+    await expectTransports(session, ["project-server"]);
     expect(launch).toHaveBeenCalledOnce();
     expect(launch.mock.calls[0][0].name).toBe("project-server");
     expect(session.systemPrompt).not.toContain("PROJECT_PROMPT_SECRET");
@@ -600,6 +686,7 @@ export default function () { writeFileSync(${JSON.stringify(globalMarker)}, "fac
     expect(session.sessionManager.getCwd()).toBe(worktree);
     expect(session.settingsManager.isProjectTrusted()).toBe(true);
     expect(session.systemPrompt).toContain("PROJECT_SKILL_SECRET");
+    await expectTransports(session, ["project-server"]);
     expect(launch).toHaveBeenCalledOnce();
     expect(launch.mock.calls[0][0].name).toBe("project-server");
     expect(launch.mock.calls[0][1]).toBe(cwd);
@@ -624,6 +711,7 @@ export default function () { writeFileSync(${JSON.stringify(globalMarker)}, "fac
     const session = await spawn({ extensions: ["mcp"] }, { configCwd: alias }, { ...ctx, isProjectTrusted: () => true });
     expect(session.settingsManager.isProjectTrusted()).toBe(true);
     expect(session.settingsManager.getBlockImages()).toBe(true);
+    await expectTransports(session, ["project-server"]);
     expect(launch).toHaveBeenCalledOnce();
     expect(launch.mock.calls[0][0].name).toBe("project-server");
     expect(launch.mock.calls[0][1]).toBe(alias);
@@ -710,6 +798,7 @@ export default function(pi) {
     expect(session.settingsManager.isProjectTrusted()).toBe(false);
     expect(session.settingsManager.getProjectSettings()).toEqual({});
     expect(existsSync(factoryMarker)).toBe(true);
+    await expectTransports(session, ["registered-parent"]);
     expect(launch).toHaveBeenCalledOnce();
     expect(launch.mock.calls[0][0].name).toBe("registered-parent");
     expect(confirm).not.toHaveBeenCalled();
@@ -749,8 +838,20 @@ export default function () { writeFileSync(${JSON.stringify(globalMarker)}, "fac
     const session = await spawn({ extensions: ["mcp", projectExtension] }, {}, { ...ctx, isProjectTrusted: () => true });
     expect(session.settingsManager.isProjectTrusted()).toBe(true);
     expect(existsSync(factoryMarker)).toBe(true);
+    await expectTransports(session, ["project-server", "registered-parent"]);
     expect(launch.mock.calls.some(([entry]) => entry.name === "registered-parent")).toBe(true);
     expect(existsSync(launcherMarker)).toBe(true);
+    // Deterministic delayed readiness through the native public registration
+    // API: the prompt has completed, but the next callback has not even begun.
+    // No sleeps, runtime-loader patches, or real transport are involved.
+    firstTransport = new Promise<void>((resolve) => { signalFirstTransport = resolve; });
+    const ready = expectTransports(session, ["project-server", "registered-parent", "registered-late"]);
+    expect(launch).toHaveBeenCalledTimes(2);
+    expect(nativeApi).toBeDefined();
+    record("release-late-registration");
+    nativeApi!.registerMcpServer("registered-late", { type: "stdio", command: "NEVER_EXECUTE_TRUST_FIXTURE", exposure: "direct" });
+    await ready;
+    expect(launch.mock.calls[2][0].name).toBe("registered-late");
   });
 
   it("captures parent trust before async environment detection can change it", async () => {

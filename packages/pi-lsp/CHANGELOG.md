@@ -1,5 +1,10 @@
 # @signalridge/pi-lsp
 
+## 1.2.6
+### Patch Changes
+
+- c2fd867: Retain ownership of language-server subprocesses until confirmed closure, escalating TERM-resistant children to SIGKILL after a bounded grace period. Await cleanup after shutdown, cancellation, and protocol failure, and isolate restart cleanup from the next child. Failed escalation reports a bounded cleanup failure without claiming reaping or releasing ownership; restart remains blocked until close. Preserve an existing tool-call error when cleanup also fails. Bound post-KILL close confirmation independently even when signalling returns true, and retain unconfirmed client leases across diagnostics/fix runner invocations for the same actual adapter/launcher/environment and workspace root. Rescan every current owner synchronously after waits before admitting a lease, without blocking concurrent active clients. Canonicalize root and launcher aliases and hash the effective inherited-plus-overridden environment snapshot used for spawning so equivalent calls cannot bypass cleanup guards or retain secrets in lease keys. Release leases only on confirmed close; unrelated adapters, environments, and roots remain available.
+
 ## 1.2.5
 ### Patch Changes
 

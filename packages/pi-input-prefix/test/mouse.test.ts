@@ -8,6 +8,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Editor, type EditorTheme, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { test, vi } from "vitest";
+import { installEditor } from "../src/editor-install.js";
 import extension from "../src/index.js";
 
 function editor(
@@ -298,4 +299,55 @@ test("narrow widths without a detached bang keep native hit-testing; drag stays 
     assert.equal(click(instance, 30, 4, 1, type), undefined);
     assert.equal(instance.getCursor().col, 11);
   }
+});
+
+for (const focused of [undefined, null, { getText: () => assert.fail("unknown focus must not be read") }]) {
+  test(`startup capture leaves unknown focus alone (${focused === null ? "null" : typeof focused})`, () => {
+    const instance = editor();
+    let mounts = 0;
+    installEditor(
+      {
+        setEditorComponent(factory) {
+          assert.ok(factory);
+          const tui = focused === undefined ? {} : { getFocusedComponent: () => focused };
+          const next = factory(tui as TUI, {} as never, {} as never);
+          next.setText("normal draft");
+          mounts++;
+        },
+      } as ExtensionContext["ui"],
+      () => instance,
+    );
+    assert.equal(instance.getText(), "normal draft");
+    assert.equal(mounts, 1);
+  });
+}
+
+test("expanded draft restoration is synchronous and only applies to the host's copied snapshot", () => {
+  const instance = editor();
+  const nativeSetText = vi.spyOn(instance, "setText");
+  const draft = {
+    getText: () => "[paste #1]",
+    getExpandedText: () => "completed large paste",
+    setText() {},
+    handleInput() {},
+    render: () => [],
+  };
+  let saved: Parameters<ExtensionContext["ui"]["setEditorComponent"]>[0];
+  const tui = { getFocusedComponent: () => draft } as unknown as TUI;
+  installEditor(
+    {
+      setEditorComponent(factory) {
+        assert.ok(factory);
+        saved = factory;
+        factory(tui, {} as never, {} as never).setText("[paste #1]");
+      },
+    } as ExtensionContext["ui"],
+    () => instance,
+  );
+  assert.deepEqual(nativeSetText.mock.calls, [["[paste #1]"], ["completed large paste"]]);
+  assert.equal(instance.getText(), "completed large paste");
+  nativeSetText.mockClear();
+  saved?.(tui, {} as never, {} as never).setText("queued streaming input");
+  assert.deepEqual(nativeSetText.mock.calls, [["queued streaming input"]]);
+  assert.equal(instance.getText(), "queued streaming input");
 });

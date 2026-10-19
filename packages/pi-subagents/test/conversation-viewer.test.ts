@@ -387,7 +387,7 @@ describe("ConversationViewer", () => {
   describe("stop key", () => {
     const W = 80;
 
-    it("two-press x stops a running agent (first arms, second aborts)", () => {
+    it("x arms and a distinct y confirms stopping a running agent", () => {
       const onStop = vi.fn();
       const tui = mockTui(30, W);
       const viewer = new ConversationViewer(
@@ -401,10 +401,12 @@ describe("ConversationViewer", () => {
       viewer.handleInput("x");
       expect(onStop).not.toHaveBeenCalled();
       expect(tui.requestRender).toHaveBeenCalled();
-      expect(viewer.render(W).join("\n")).toContain("x again to STOP");
+      expect(viewer.render(W).join("\n")).toContain("y confirm STOP");
 
-      // Second press aborts.
+      // Repeating the arm key cannot confirm; the distinct key does.
       viewer.handleInput("x");
+      expect(onStop).not.toHaveBeenCalled();
+      viewer.handleInput("y");
       expect(onStop).toHaveBeenCalledTimes(1);
     });
 
@@ -417,7 +419,7 @@ describe("ConversationViewer", () => {
       viewer.handleInput("x");                       // arm
       viewer.handleInput("j");                       // scroll → disarm
       expect(viewer.render(W).join("\n")).toContain("x stop");
-      expect(viewer.render(W).join("\n")).not.toContain("x again to STOP");
+      expect(viewer.render(W).join("\n")).not.toContain("y confirm STOP");
 
       viewer.handleInput("x");                       // arms again, does NOT stop
       expect(onStop).not.toHaveBeenCalled();

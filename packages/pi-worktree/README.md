@@ -23,6 +23,8 @@ This package is the full interactive worktree manager. It is publishable and sta
 - Always previews stale metadata before pruning it and revalidates the preview after confirmation.
 - Runs Git through argv-based subprocess calls, without interpolating user input into shell commands.
 
+Stdin Git cancellation and timeout use bounded TERM/KILL escalation on the captured process handle. If termination remains unconfirmed, equivalent cwd/argv invocations are blocked until every failed live handle exits, including when multiple invocations were already concurrent. A late exit releases only its own handle; no saved PID is adopted or signaled. Captured output and signal failure diagnostics remain available for recovery.
+
 ## Install
 
 ```bash

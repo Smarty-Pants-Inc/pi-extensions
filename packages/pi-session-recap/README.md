@@ -20,6 +20,8 @@ Also fires automatically on `/resume` and `/fork` so you know where the prior se
 
 The temporary recap clears when you type, new agent work begins, you successfully navigate the session tree, or the session is replaced. It is not saved in session history or sent to the model.
 
+Pending timers and drafts validate the live opening manager, session ID, leaf and complete raw branch-ID prefix before history reads, authentication, provider dispatch and presentation. Metadata-only sibling navigation invalidates a draft even when its model-visible context is unchanged, and even before this extension receives the committed tree event. Observed divergence permanently retires that operation; ordinary prefix appends and canceled navigation remain valid (a changed recap context still invalidates a draft).
+
 Quick alt-tabs without a settled agent cost nothing before the away threshold. If an agent settles while you're blurred, returning before its three-second debounce cancels that recap; otherwise it may draft sooner than the away threshold. If you return while a recap is already drafting, it's allowed to finish — it lands moments after you're back.
 
 ## Terminal compatibility

@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.4.4
+### Patch Changes
+
+- c2fd867: Bind ready-plan revision and completion to accepted native user or owned Plan deliveries, with execution-time one-use completion tickets. Invalidate readiness at native acceptance, preserve unique provenance amid distinct queued steers/follow-ups, and fail closed on identical-content collisions. Persist compact validated branch-local handoff attribution across reload/clear without storing prompt bodies or rewriting user text/images. Bound pending provenance and reject authenticated stale runtime deliveries without unbounded replay caches. Preserve delivery provenance across delayed input handlers and workflow retirement, abort only positively attributed stale native requests, and fence cached state/retention against the live full native branch before persistence, tool policy, or model guidance. Keep late canceled authentication from consuming the source plan. Retain bounded unfinished accepted-native handoff provenance across pre-commit retirement, cancel only the exact still-current owned operation (not automatic retention cleanup of its accepted first request), and do not let candidate expiry authorize authenticated old deliveries. Preserve independent real-input literal/image exemptions and loaded-module factory authentication without replay caches. Pin the complete authoritative Plan-state entry as well as the native branch prefix, so descendant state cannot inherit ancestor authority before delayed tree notification; refresh source anchors only after successful owned appends and rebuild fresh destination setup state. Verify public-SDK delayed message/input/context/tree races, long-clock and reload controls, equal-payload distinct native state entries, and guard-disabled failure evidence.
+- Updated dependencies [c2fd867]
+  - @signalridge/pi-ui@1.4.0
+
 ## 1.4.3
 ### Patch Changes
 

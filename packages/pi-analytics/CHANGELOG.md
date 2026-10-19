@@ -1,5 +1,12 @@
 # @signalridge/pi-analytics
 
+## 1.3.4
+### Patch Changes
+
+- c2fd867: Preserve extension-sourced inputs as the trigger for response cycles after settlement, without attributing synthetic skill commands to explicit user skill activations. Publish complete private initialization markers atomically without replacement, and reconcile top-level tool error flags against host-finalized turn results without changing execution timing or nested-tool accounting.
+- Updated dependencies [c2fd867]
+  - @signalridge/pi-ui@1.4.0
+
 ## 1.3.3
 ### Patch Changes
 

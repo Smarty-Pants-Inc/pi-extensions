@@ -296,9 +296,14 @@ export default function githubPr(pi: ExtensionAPI, options: GithubPrOptions = {}
   };
 
   pi.on("session_start", (_event, ctx) => {
-    closeBranchWatcher();
+    // Retire the outgoing owner even if the destination is print/RPC. Ambient
+    // PR monitoring belongs to a TUI; manual runGhPrView remains mode-independent.
     branchWatch.generation += 1;
     branchWatch.session += 1;
+    branchWatch.sessionManager = undefined;
+    branchWatch.cwd = undefined;
+    closeBranchWatcher();
+    if (ctx.mode !== "tui") return;
     branchWatch.sessionManager = ctx.sessionManager;
     branchWatch.cwd = ctx.cwd;
     try {
@@ -319,12 +324,12 @@ export default function githubPr(pi: ExtensionAPI, options: GithubPrOptions = {}
   });
 
   pi.on("agent_end", async (_event, ctx) => {
-    if (ctx.sessionManager !== branchWatch.sessionManager || ctx.signal?.aborted) return;
+    if (ctx.mode !== "tui" || !ownsSession(branchWatch.session, ctx) || ctx.signal?.aborted) return;
     await refreshAndReschedule(ctx, branchWatch.session, branchWatch.generation, ctx.signal);
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
-    if (ctx.sessionManager !== branchWatch.sessionManager) return;
+    if (ctx.mode !== "tui" || !ownsSession(branchWatch.session, ctx)) return;
     branchWatch.sessionManager = undefined;
     branchWatch.cwd = undefined;
     branchWatch.generation += 1;

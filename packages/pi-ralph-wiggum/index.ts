@@ -7,6 +7,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
+import { captureOwner, extendsOwner, hasCompletionMarker, IterationOwnership, type LoopOwner } from "./ownership.ts";
+import { type LoopState, publishLoopState, readLoopState } from "./state-store.ts";
 
 const RALPH_DIR = ".ralph";
 const COMPLETE_MARKER = "<promise>COMPLETE</promise>";
@@ -49,7 +51,7 @@ Before completion:
 const DEFAULT_STALE_PROMPT_GUARD = `STALE PROMPT GUARD
 
 Before doing any work from a Ralph prompt, reload the loop state file named in the prompt (usually .ralph/<name>.state.json).
-If the state says "status": "completed", do not edit files, do not run task commands, and do not call ralph_done. Reply briefly that the stale prompt was ignored because the loop is already completed.`;
+If the state status is not "active", do not edit files, do not run task commands, and do not call ralph_done. Reply briefly that the stale prompt was ignored because the loop is already completed.`;
 
 const DEFAULT_REFLECT_INSTRUCTIONS = `REFLECTION CHECKPOINT
 
@@ -64,34 +66,60 @@ Update the task file with your reflection, then continue working.`;
 
 type LoopStatus = "active" | "paused" | "completed";
 
-interface LoopState {
-  name: string;
-  taskFile: string;
-  iteration: number;
-  maxIterations: number;
-  itemsPerIteration: number; // Prompt hint only - "process N items per turn"
-  reflectEvery: number; // Reflect every N iterations
-  reflectInstructions: string;
-  active: boolean; // Backwards compat
-  status: LoopStatus;
-  startedAt: string;
-  completedAt?: string;
-  lastReflectionAt: number; // Last iteration we reflected at
-  ownerSessionId?: string; // Session that currently owns automatic prompt injection for this loop
-}
-
-type LegacyLoopState = Partial<LoopState> & {
-  name: string;
-  reflectEveryItems?: number;
-  lastReflectionAtItems?: number;
-};
-
 const STATUS_ICONS: Record<LoopStatus, string> = { active: "▶", paused: "⏸", completed: "✓" };
 
 export default function (pi: ExtensionAPI) {
   let currentLoop: string | null = null;
   let sessionController = new AbortController();
   let activeSessionId: string | undefined;
+  let liveOwner: LoopOwner | undefined;
+  const ownership = new IterationOwnership();
+
+  let acceptedRun:
+    | { ctx: ExtensionContext; signal: AbortSignal; nonce: string; loop: string; owner: LoopOwner }
+    | undefined;
+  function retireOwnership(ctx?: ExtensionContext) {
+    const run = acceptedRun;
+    acceptedRun = undefined;
+    // Commands have no run signal. Abort through the positively accepted run's
+    // public context only while its manager, native branch and nonce still own
+    // the live operation. Never abort a new root through a captured old context.
+    if (
+      ctx &&
+      run &&
+      !run.signal.aborted &&
+      run.loop === currentLoop &&
+      ownership.ownsRun(run.nonce) &&
+      extendsOwner(ctx, run.owner) &&
+      extendsOwner(ctx, liveOwner) &&
+      run.ctx.signal === run.signal
+    ) {
+      run.ctx.abort();
+    }
+    ownership.retire();
+    liveOwner = undefined;
+    currentLoop = null;
+  }
+
+  function claimLoop(ctx: ExtensionContext, state: LoopState) {
+    acceptedRun = undefined;
+    ownership.retire();
+    currentLoop = state.name;
+    liveOwner = captureOwner(ctx);
+    state.ownerSessionId = sessionId(ctx);
+    state.ownerBranchIds = liveOwner?.branch;
+  }
+
+  function sendIteration(ctx: ExtensionContext, state: LoopState, content: string, reflection: boolean) {
+    const token = ownership.send(
+      state.name,
+      state.iteration,
+      buildPrompt(state, content, reflection),
+      captureOwner(ctx),
+    );
+    ownership.finishIteration();
+    pi.sendUserMessage(token, { deliverAs: "followUp" });
+  }
 
   // --- File helpers ---
 
@@ -206,29 +234,27 @@ export default function (pi: ExtensionAPI) {
 
   // --- State management ---
 
-  function migrateState(raw: LegacyLoopState): LoopState {
-    if (!raw.status) raw.status = raw.active ? "active" : "paused";
-    raw.active = raw.status === "active";
-    // Migrate old field names
-    if ("reflectEveryItems" in raw && !raw.reflectEvery) {
-      raw.reflectEvery = raw.reflectEveryItems;
-    }
-    if ("lastReflectionAtItems" in raw && raw.lastReflectionAt === undefined) {
-      raw.lastReflectionAt = raw.lastReflectionAtItems;
-    }
-    return raw as LoopState;
+  function warnState(ctx: ExtensionContext, message: string) {
+    if (ctx.hasUI) ctx.ui.notify(message, "warning");
+    else console.warn(`[pi-ralph-wiggum] ${message}`);
   }
 
   function loadState(ctx: ExtensionContext, name: string, archived = false): LoopState | null {
-    const content = tryRead(getPath(ctx, name, ".state.json", archived));
-    return content ? migrateState(JSON.parse(content)) : null;
+    return readLoopState(getPath(ctx, name, ".state.json", archived), (message) => warnState(ctx, message));
   }
 
   function saveState(ctx: ExtensionContext, state: LoopState, archived = false): void {
     state.active = state.status === "active";
     const filePath = getPath(ctx, state.name, ".state.json", archived);
-    ensureDir(filePath);
-    fs.writeFileSync(filePath, JSON.stringify(state, null, 2), "utf-8");
+    if (fs.existsSync(filePath) && !loadState(ctx, state.name, archived)) {
+      throw new Error(`Refusing to overwrite invalid Ralph state: ${filePath}`);
+    }
+    const owner = captureOwner(ctx);
+    if (currentLoop === state.name && extendsOwner(ctx, liveOwner)) {
+      liveOwner = owner;
+      state.ownerBranchIds = owner?.branch;
+    }
+    publishLoopState(filePath, state);
   }
 
   function listLoops(ctx: ExtensionContext, archived = false): LoopState[] {
@@ -237,29 +263,39 @@ export default function (pi: ExtensionAPI) {
     return fs
       .readdirSync(dir)
       .filter((f) => f.endsWith(".state.json"))
-      .map((f) => {
-        const content = tryRead(path.join(dir, f));
-        return content ? migrateState(JSON.parse(content)) : null;
-      })
+      .map((f) => readLoopState(path.join(dir, f), (message) => warnState(ctx, message)))
       .filter((s): s is LoopState => s !== null);
   }
 
   function isOwnedByCurrentSession(ctx: ExtensionContext, state: LoopState): boolean {
     const currentSessionId = sessionId(ctx);
-    return Boolean(currentSessionId && state.ownerSessionId === currentSessionId);
+    return Boolean(
+      currentSessionId &&
+        state.ownerSessionId === currentSessionId &&
+        state.ownerBranchIds &&
+        (state.ownerBranchIds.length > 0 || (currentLoop === state.name && liveOwner !== undefined)) &&
+        extendsOwner(ctx, { sessionId: currentSessionId, branch: state.ownerBranchIds }),
+    );
   }
 
   function getCurrentOwnedState(ctx: ExtensionContext): LoopState | null {
     if (!currentLoop) return null;
     const state = loadState(ctx, currentLoop);
-    if (!state || !isOwnedByCurrentSession(ctx, state)) {
-      currentLoop = null;
+    if (
+      state?.status !== "active" ||
+      !isOwnedByCurrentSession(ctx, state) ||
+      !extendsOwner(ctx, liveOwner) ||
+      (ownership.iteration && ownership.iteration.iteration !== state.iteration)
+    ) {
+      retireOwnership();
       return null;
     }
+    liveOwner = captureOwner(ctx);
     return state;
   }
 
   function findActiveOwnedState(ctx: ExtensionContext): LoopState | undefined {
+    if (!extendsOwner(ctx, liveOwner)) return undefined;
     return listLoops(ctx).find((state) => state.status === "active" && isOwnedByCurrentSession(ctx, state));
   }
 
@@ -269,7 +305,7 @@ export default function (pi: ExtensionAPI) {
     state.status = "paused";
     state.active = false;
     saveState(ctx, state);
-    currentLoop = null;
+    retireOwnership(ctx);
     updateUI(ctx);
     if (message && ctx.hasUI) ctx.ui.notify(message, "info");
   }
@@ -279,7 +315,7 @@ export default function (pi: ExtensionAPI) {
     state.completedAt = new Date().toISOString();
     state.active = false;
     saveState(ctx, state);
-    currentLoop = null;
+    retireOwnership();
     updateUI(ctx);
     pi.sendUserMessage(banner, { deliverAs: "followUp" });
   }
@@ -289,7 +325,7 @@ export default function (pi: ExtensionAPI) {
     state.completedAt = new Date().toISOString();
     state.active = false;
     saveState(ctx, state);
-    currentLoop = null;
+    retireOwnership();
     updateUI(ctx);
     if (message && ctx.hasUI) ctx.ui.notify(message, "info");
   }
@@ -321,7 +357,7 @@ export default function (pi: ExtensionAPI) {
     const title = theme.fg("success", theme.bold("Ralph Wiggum"));
     const status = theme.fg(
       "dim",
-      ` · 🔁 ${state.name} · ${STATUS_ICONS[state.status]} ${state.status} · 🔢 ${state.iteration}${maxStr} · 📄 ${state.taskFile}${reflection} · Esc pause · msg resume · /ralph-stop stop`,
+      ` · 🔁 ${state.name} · ${STATUS_ICONS[state.status]} ${state.status} · 🔢 ${state.iteration}${maxStr} · 📄 ${state.taskFile}${reflection} · Esc pause · /ralph resume · /ralph-stop stop`,
     );
 
     ctx.ui.setStatus("ralph", `${title}${status}`);
@@ -344,7 +380,7 @@ export default function (pi: ExtensionAPI) {
     parts.push(`\n## Completion Gate\n\n${DEFAULT_COMPLETION_GATE}\n`);
     parts.push(`\n## Instructions\n`);
     parts.push(
-      "User controls: ESC pauses the assistant. Send a message to resume. Run /ralph-stop when idle to stop the loop.\n",
+      "User controls: ESC pauses the assistant. Use /ralph resume <name> to resume a paused or unbound loop. Run /ralph-stop when idle to stop the loop.\n",
     );
     parts.push(
       `You are in a Ralph loop (iteration ${state.iteration}${state.maxIterations > 0 ? ` of ${state.maxIterations}` : ""}).\n`,
@@ -415,6 +451,7 @@ export default function (pi: ExtensionAPI) {
       const taskFile = isPath ? args.name : path.join(RALPH_DIR, `${loopName}.md`);
 
       const existing = loadState(ctx, loopName);
+      if (!existing && fs.existsSync(getPath(ctx, loopName, ".state.json"))) return;
       if (existing?.status === "active") {
         ctx.ui.notify(`Loop "${loopName}" is already active. Use /ralph resume ${loopName}`, "warning");
         return;
@@ -446,8 +483,8 @@ export default function (pi: ExtensionAPI) {
         ownerSessionId: sessionId(ctx),
       };
 
+      claimLoop(ctx, state);
       saveState(ctx, state);
-      currentLoop = loopName;
       updateUI(ctx);
 
       const content = tryRead(fullPath);
@@ -455,7 +492,7 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify(`Could not read task file: ${taskFile}`, "error");
         return;
       }
-      pi.sendUserMessage(buildPrompt(state, content, false), { deliverAs: "followUp" });
+      sendIteration(ctx, state, content, false);
     },
 
     stop(_rest, ctx) {
@@ -496,8 +533,8 @@ export default function (pi: ExtensionAPI) {
       state.active = true;
       state.ownerSessionId = sessionId(ctx);
       state.iteration++;
+      claimLoop(ctx, state);
       saveState(ctx, state);
-      currentLoop = loopName;
       updateUI(ctx);
 
       ctx.ui.notify(`Resumed: ${loopName} (iteration ${state.iteration})`, "info");
@@ -510,7 +547,7 @@ export default function (pi: ExtensionAPI) {
 
       const needsReflection =
         state.reflectEvery > 0 && state.iteration > 1 && (state.iteration - 1) % state.reflectEvery === 0;
-      pi.sendUserMessage(buildPrompt(state, content, needsReflection), { deliverAs: "followUp" });
+      sendIteration(ctx, state, content, needsReflection);
     },
 
     status(_rest, ctx) {
@@ -532,7 +569,7 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify(`Loop "${loopName}" not found`, "error");
         return;
       }
-      if (currentLoop === loopName) currentLoop = null;
+      if (currentLoop === loopName) retireOwnership(ctx);
       tryDelete(getPath(ctx, loopName, ".state.json"));
       ctx.ui.notify(`Cancelled: ${loopName}`, "info");
       updateUI(ctx);
@@ -554,7 +591,7 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      if (currentLoop === loopName) currentLoop = null;
+      if (currentLoop === loopName) retireOwnership();
 
       const srcState = getPath(ctx, loopName, ".state.json");
       const dstState = getPath(ctx, loopName, ".state.json", true);
@@ -583,7 +620,7 @@ export default function (pi: ExtensionAPI) {
       for (const loop of completed) {
         tryDelete(getPath(ctx, loop.name, ".state.json"));
         if (all) tryDelete(getPath(ctx, loop.name, ".md"));
-        if (currentLoop === loop.name) currentLoop = null;
+        if (currentLoop === loop.name) retireOwnership();
       }
 
       const suffix = all ? " (all files)" : " (state only)";
@@ -615,10 +652,14 @@ export default function (pi: ExtensionAPI) {
       const warning = "This deletes all .ralph state, task, and archive files. External task files are not removed.";
       const controller = sessionController;
       const owner = sessionId(ctx);
+      const branchOwner = captureOwner(ctx);
       const dir = ralphDir(ctx);
       // Test plain captured ownership before touching a possibly retired context.
       const isCurrent = () =>
-        controller === sessionController && !controller.signal.aborted && owner === activeSessionId;
+        controller === sessionController &&
+        !controller.signal.aborted &&
+        owner === activeSessionId &&
+        extendsOwner(ctx, branchOwner);
       let onAbort: (() => void) | undefined;
       try {
         if (!isCurrent()) return;
@@ -643,7 +684,7 @@ export default function (pi: ExtensionAPI) {
           if (ctx.hasUI) ctx.ui.notify("No .ralph directory found.", "info");
           return;
         }
-        currentLoop = null;
+        retireOwnership(ctx);
         const ok = tryRemoveDir(dir);
         if (ctx.hasUI) {
           ctx.ui.notify(ok ? "Removed .ralph directory." : "Failed to remove .ralph directory.", ok ? "info" : "error");
@@ -741,7 +782,14 @@ Examples:
       const loopName = sanitize(params.name);
       const taskFile = path.join(RALPH_DIR, `${loopName}.md`);
 
-      if (loadState(ctx, loopName)?.status === "active") {
+      const existing = loadState(ctx, loopName);
+      if (!existing && fs.existsSync(getPath(ctx, loopName, ".state.json"))) {
+        return {
+          content: [{ type: "text", text: `Invalid Ralph state for "${loopName}"; left unchanged.` }],
+          details: {},
+        };
+      }
+      if (existing?.status === "active") {
         return { content: [{ type: "text", text: `Loop "${loopName}" already active.` }], details: {} };
       }
 
@@ -770,11 +818,11 @@ Examples:
         ownerSessionId: sessionId(ctx),
       };
 
+      claimLoop(ctx, state);
       saveState(ctx, state);
-      currentLoop = loopName;
       updateUI(ctx);
 
-      pi.sendUserMessage(buildPrompt(state, params.taskContent, false), { deliverAs: "followUp" });
+      sendIteration(ctx, state, params.taskContent, false);
 
       return {
         content: [{ type: "text", text: `Started loop "${loopName}" (max ${state.maxIterations} iterations).` }],
@@ -797,7 +845,7 @@ Examples:
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
       const state = getCurrentOwnedState(ctx);
-      if (state?.status !== "active") {
+      if (state?.status !== "active" || !ownership.current(ctx, currentLoop, state.iteration)) {
         updateUI(ctx);
         return { content: [{ type: "text", text: "No active Ralph loop owned by this session." }], details: {} };
       }
@@ -809,7 +857,8 @@ Examples:
         };
       }
 
-      // Increment iteration
+      // Consume this iteration's authority before publishing the next one.
+      ownership.finishIteration();
       state.iteration++;
 
       // Check max iterations
@@ -837,7 +886,7 @@ Examples:
       }
 
       // Queue next iteration - use followUp so user can still interrupt
-      pi.sendUserMessage(buildPrompt(state, content, needsReflection), { deliverAs: "followUp" });
+      sendIteration(ctx, state, content, needsReflection);
 
       return {
         content: [{ type: "text", text: `Iteration ${state.iteration - 1} complete. Next iteration queued.` }],
@@ -848,38 +897,98 @@ Examples:
 
   // --- Event handlers ---
 
-  pi.on("before_agent_start", async (event, ctx) => {
+  pi.on("input", (event, ctx) => {
+    getCurrentOwnedState(ctx);
+    return ownership.input(event, ctx);
+  });
+
+  pi.on("before_agent_start", (_event, ctx) => {
+    // Queued steers/follow-ups need not pass this boundary. Authorization is
+    // bound to the accepted native message, never to the mere start of a run.
+    getCurrentOwnedState(ctx);
+  });
+
+  pi.on("message_start", (event, ctx) => {
+    if (event.message.role === "user") acceptedRun = undefined;
     const state = getCurrentOwnedState(ctx);
-    if (state?.status !== "active") {
-      updateUI(ctx);
-      return;
+    ownership.bind(event.message, state?.status === "active" ? currentLoop : null, liveOwner, ctx, state?.iteration);
+  });
+
+  pi.on("context", (event, ctx) => {
+    const state = getCurrentOwnedState(ctx);
+    const iteration = ownership.context(
+      event.messages,
+      ctx,
+      state?.status === "active" ? currentLoop : null,
+      liveOwner,
+      state?.iteration,
+    );
+    if (ownership.rejected) {
+      retireOwnership();
+      if (!ctx.signal?.aborted) ctx.abort();
     }
-
-    const iterStr = `${state.iteration}${state.maxIterations > 0 ? `/${state.maxIterations}` : ""}`;
-
-    let instructions = `You are in a Ralph loop working on: ${state.taskFile}\n`;
-    instructions += `- Before doing work, reload .ralph/${state.name}.state.json; if status is completed, ignore this stale prompt and do not call ralph_done\n`;
-    if (state.itemsPerIteration > 0) {
-      instructions += `- Work on ~${state.itemsPerIteration} items this iteration\n`;
+    // Request-local guidance: native user text/images and history stay intact.
+    const messages = event.messages.filter((message) => !ownership.isDelivery(message));
+    if (!iteration || !state) {
+      if (
+        !acceptedRun ||
+        ctx.signal !== acceptedRun.signal ||
+        !ownership.ownsRun(acceptedRun.nonce) ||
+        !extendsOwner(ctx, acceptedRun.owner)
+      )
+        acceptedRun = undefined;
+      return { messages };
     }
-    instructions += `- Update the task file as you progress\n`;
-    instructions += `- Preserve artifacts needed by final verification\n`;
-    instructions += `- Record an exact monitor-rerunnable final command before completion\n`;
-    instructions += `- When FULLY COMPLETE and externally rerunnable: ${COMPLETE_MARKER}\n`;
-    instructions += `- Otherwise, call ralph_done tool to proceed to next iteration`;
-
+    if (ctx.signal && iteration.owner && iteration.token) {
+      acceptedRun = { ctx, signal: ctx.signal, nonce: iteration.nonce, loop: iteration.loop, owner: iteration.owner };
+    }
+    // Persist the positively accepted native path, including an initially empty
+    // session's first anchor; a vacuous disk prefix is not reload proof.
+    saveState(ctx, state);
+    const content = iteration.body ?? buildPrompt(state, readTaskFile(ctx, state.taskFile) ?? "", false);
+    iteration.body = undefined;
     return {
-      systemPrompt: `${event.systemPrompt}\n[RALPH LOOP - ${state.name} - Iteration ${iterStr}]\n\n${instructions}`,
+      messages: [
+        ...messages,
+        {
+          role: "custom" as const,
+          customType: "ralph-iteration-context",
+          content: `[RALPH LOOP - ${state.name} - Iteration ${state.iteration}${state.maxIterations > 0 ? `/${state.maxIterations}` : ""}]\n\n${content}`,
+          display: false,
+          timestamp: Date.now(),
+        },
+      ],
     };
+  });
+
+  pi.on("tool_call", (_event, ctx) => {
+    getCurrentOwnedState(ctx);
+    if (!ownership.rejected) return;
+    if (!ctx.signal?.aborted) ctx.abort();
+    return { block: true, reason: "Retired Ralph iteration delivery." };
+  });
+
+  pi.on("session_tree", (_event, ctx) => {
+    sessionController.abort();
+    sessionController = new AbortController();
+    retireOwnership();
+    updateUI(ctx);
+  });
+
+  pi.on("agent_settled", () => {
+    acceptedRun = undefined;
+    ownership.settled();
   });
 
   pi.on("agent_end", async (event, ctx) => {
     const state = getCurrentOwnedState(ctx);
-    if (state?.status !== "active") {
+    if (state?.status !== "active" || !ownership.current(ctx, currentLoop, state.iteration)) {
       updateUI(ctx);
       return;
     }
 
+    // Publish the final native branch anchor, without advancing the iteration.
+    saveState(ctx, state);
     // Check for completion marker
     const lastAssistant = [...event.messages].reverse().find((m) => m.role === "assistant");
     // Interrupted/failed turns and queued final prompts are not completed work.
@@ -894,7 +1003,7 @@ Examples:
             .join("\n")
         : "";
 
-    if (text.includes(COMPLETE_MARKER)) {
+    if (hasCompletionMarker(text)) {
       completeLoop(
         ctx,
         state,
@@ -925,7 +1034,7 @@ Examples:
     sessionController.abort();
     sessionController = new AbortController();
     activeSessionId = sessionId(ctx);
-    currentLoop = null;
+    retireOwnership();
     const active = listLoops(ctx).filter((l) => l.status === "active");
     const owned = active.filter((state) => isOwnedByCurrentSession(ctx, state));
 
@@ -939,6 +1048,7 @@ Examples:
         return candidateMtime > bestMtime ? candidate : best;
       });
       currentLoop = mostRecent.name;
+      liveOwner = captureOwner(ctx);
     }
 
     if (active.length > 0 && ctx.hasUI) {
@@ -955,5 +1065,6 @@ Examples:
     activeSessionId = undefined;
     const state = getCurrentOwnedState(ctx);
     if (state) saveState(ctx, state);
+    retireOwnership();
   });
 }

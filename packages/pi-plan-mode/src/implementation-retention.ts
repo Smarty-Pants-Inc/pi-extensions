@@ -35,7 +35,7 @@ export interface ImplementationContextResult {
 
 export interface ImplementationRetentionCoordinator {
   restore(activeImplementation: ActiveImplementationPlan | undefined): void;
-  transformContext(messages: unknown[], state: PlanModeState): ImplementationContextResult;
+  transformContext(messages: unknown[], state: PlanModeState, acceptedUserInput?: boolean): ImplementationContextResult;
   implementationSettled(activeImplementation: ActiveImplementationPlan | undefined): string | undefined;
   reset(): void;
 }
@@ -49,7 +49,7 @@ export function createImplementationRetentionCoordinator(): ImplementationRetent
       restoredImplementationAwaitingContext =
         activeImplementation && activeImplementation.retention !== "keep" ? activeImplementation.id : undefined;
     },
-    transformContext(messages, state) {
+    transformContext(messages, state, acceptedUserInput = false) {
       const messagesWithoutPlanContext = messages.filter(
         (message) =>
           !messageContainsLegacyPlanModeContextArtifact(message) &&
@@ -78,9 +78,13 @@ export function createImplementationRetentionCoordinator(): ImplementationRetent
       // A busy /plan implement queues its handoff behind an older run. Do not arm cleanup
       // until that exact handoff reaches context; a restored session has no older run to drain.
       const deliveredCurrentHandoff =
-        restoredImplementationAwaitingContext === activeImplementation.id ||
+        (acceptedUserInput && restoredImplementationAwaitingContext === activeImplementation.id) ||
         filteredMessages.some((message) =>
-          messageContainsExactPlanModeImplementationHandoff(message, activeImplementation.plan),
+          messageContainsExactPlanModeImplementationHandoff(
+            message,
+            activeImplementation.plan,
+            activeImplementation.id,
+          ),
         );
       if (!deliveredCurrentHandoff) return { messages: contextualMessages };
       restoredImplementationAwaitingContext = undefined;

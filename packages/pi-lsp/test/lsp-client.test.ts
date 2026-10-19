@@ -87,6 +87,7 @@ test("restarting a client does not reuse the previous server's stderr", async ()
     });
   } finally {
     client.close();
+    await client.shutdown();
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -104,6 +105,7 @@ test("a restart discards a partial JSON-RPC response from the old server", async
     await client.initialize(root);
   } finally {
     client.close();
+    await client.shutdown();
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -132,6 +134,7 @@ test("a restart does not reuse diagnostics from the previous server", async () =
     assert.deepEqual(await client.diagnostics(uri), []);
   } finally {
     client.close();
+    await client.shutdown();
     rmSync(root, { recursive: true, force: true });
   }
 });
