@@ -2,6 +2,18 @@
 
 Shared UI primitives for Signalridge Pi extensions.
 
+## Untrusted terminal text
+
+Use `sanitizeTerminalText(content)` at a display boundary **before** wrapping the result in theme colours or other application-owned ANSI styling. It removes OSC (including OSC52 clipboard writes), CSI, other terminal escape/control sequences, DEL, and Unicode bidi controls. Tabs, LF newlines, printable Unicode and emoji are preserved. Unterminated control strings are discarded through the end of the input.
+
+```ts
+import { sanitizeTerminalText } from "@signalridge/pi-ui";
+
+const row = theme.fg("text", sanitizeTerminalText(untrustedContent));
+```
+
+This is a display-only operation: retain original source/prompt text separately for editing, selection payloads and persistence. Do not apply it to a finished styled frame: content-supplied ANSI is deliberately removed, while application styling added afterward is retained.
+
 ## Bordered custom UI
 
 Pi's native `ctx.ui.select()`, `confirm()`, `input()`, and `editor()` dialogs already own their terminal framing and RPC protocol. For extension-owned `ctx.ui.custom()` surfaces, use `withBorderedCustomUi()` when passing a context to a menu or UI library:

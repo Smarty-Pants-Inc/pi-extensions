@@ -2,6 +2,7 @@ import { readFileSync, statSync } from "node:fs";
 import { relative } from "node:path";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { sanitizeTerminalText } from "@signalridge/pi-ui";
 
 import { DEFAULT_VIEWER_HEIGHT, MAX_VIEWER_HEIGHT, MIN_PANEL_HEIGHT, SEARCH_SCROLL_OFFSET } from "./constants.js";
 import { loadFileContent } from "./file-viewer.js";
@@ -436,7 +437,10 @@ export function createViewer(
       for (let i = 0; i < state.height; i++) {
         if (i < visible.length) {
           const lineIdx = state.scroll + i;
-          const row = isSourceSelectionMode() ? `${String(lineIdx + 1).padStart(4)} │ ${visible[i]}` : visible[i];
+          // Treat loaded/rendered file rows and raw selection snapshots as content,
+          // not terminal instructions. Apply our own selection styling only afterward.
+          const content = sanitizeTerminalText(visible[i]);
+          const row = isSourceSelectionMode() ? `${String(lineIdx + 1).padStart(4)} │ ${content}` : content;
           let line = truncateToWidth(row || "", width);
           if (
             (state.mode === "select" || state.mode === "comment") &&
