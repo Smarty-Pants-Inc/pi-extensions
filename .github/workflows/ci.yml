@@ -3,12 +3,18 @@ on:
   push:
     branches: [main]
   pull_request:
+  merge_group:
 jobs:
   check:
     # The fork's branch protection requires smarty-ci (smarty-dev#755).
     name: smarty-ci
-    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: smarty-linux-x64
     steps:
+      - name: Install Forge base prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates curl git unzip
       # Full history: check:changesets compares against the merge base.
       - uses: actions/checkout@v4
         with:
