@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
+import { sanitizeTerminalText } from "@signalridge/pi-ui";
 
 import {
   DEFAULT_BROWSER_HEIGHT,
@@ -249,14 +250,15 @@ function withSymlinkMarker(label: string, node: FileNode, theme: Theme): string 
 }
 
 function formatNodeName(node: FileNode, theme: Theme): string {
-  if (isIgnoredStatus(node.gitStatus)) return withSymlinkMarker(theme.fg("dim", node.name), node, theme);
+  const name = sanitizeTerminalText(node.name).replace(/\n/g, " ");
+  if (isIgnoredStatus(node.gitStatus)) return withSymlinkMarker(theme.fg("dim", name), node, theme);
   if (node.isDirectory) {
-    const label = node.hasChangedChildren ? theme.fg("warning", node.name) : theme.fg("accent", node.name);
+    const label = node.hasChangedChildren ? theme.fg("warning", name) : theme.fg("accent", name);
     const rendered = withSymlinkMarker(label, node, theme);
     return node.loading ? `${rendered}${theme.fg("dim", " ⏳")}` : rendered;
   }
-  if (node.gitStatus) return withSymlinkMarker(theme.fg("warning", node.name), node, theme);
-  return withSymlinkMarker(node.name, node, theme);
+  if (node.gitStatus) return withSymlinkMarker(theme.fg("warning", name), node, theme);
+  return withSymlinkMarker(name, node, theme);
 }
 
 function collapseAllExcept(node: FileNode, keep: Set<FileNode>): void {
@@ -953,8 +955,11 @@ export function createFileBrowser(
 
   function renderBrowser(width: number): string[] {
     const lines: string[] = [];
-    const pathDisplay = formatRootPath(rootPath);
-    const branchDisplay = gitBranch ? theme.fg("accent", ` (${gitBranch})`) : "";
+    const pathDisplay = sanitizeTerminalText(formatRootPath(rootPath)).replace(/\n/g, " ");
+    const branchDisplay = gitBranch
+      ? theme.fg("accent", ` (${sanitizeTerminalText(gitBranch).replace(/\n/g, " ")})`)
+      : "";
+    const searchDisplay = sanitizeTerminalText(browser.searchQuery).replace(/\n/g, " ");
     const stats = browser.stats;
 
     let statsDisplay = "";
@@ -975,7 +980,7 @@ export function createFileBrowser(
     const activityIndicator = activityParts.length > 0 ? theme.fg("dim", ` ${activityParts.join(" ")}`) : "";
     const partialIndicator = browser.scanState.isPartial ? theme.fg("warning", " [partial]") : "";
 
-    const searchIndicator = browser.searchMode ? theme.fg("accent", `  /${browser.searchQuery}█`) : "";
+    const searchIndicator = browser.searchMode ? theme.fg("accent", `  /${searchDisplay}█`) : "";
 
     lines.push(
       truncateToWidth(
@@ -989,7 +994,7 @@ export function createFileBrowser(
     if (displayList.length === 0) {
       const emptyLabel = browser.scanState.isScanning
         ? "  (loading...)"
-        : `  (no files${browser.searchQuery ? ` matching '${browser.searchQuery}'` : ""})`;
+        : `  (no files${browser.searchQuery ? ` matching '${searchDisplay}'` : ""})`;
       lines.push(theme.fg("dim", emptyLabel));
       for (let i = 1; i < browser.browserHeight; i++) {
         lines.push("");
