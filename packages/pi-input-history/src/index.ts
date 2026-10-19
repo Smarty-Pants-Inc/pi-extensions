@@ -39,6 +39,7 @@ import {
   visibleWidth,
   wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
+import { sanitizeTerminalText } from "@signalridge/pi-ui";
 
 const MAX_MESSAGES = 100;
 /** Repeat presses while the history scan is pending cannot grow without bound. */
@@ -353,6 +354,8 @@ function highlightMatch(text: string, query: string, theme: Pick<Theme, "fg">, m
 export class HistoryPopupComponent implements Component, Focusable {
   private _focused = false;
   private readonly input = new Input();
+  /** Display-only copy shared by the list summary and full-text preview. */
+  private readonly displayTexts: string[];
 
   private query = "";
   /** Indices into `history` that match the query, newest-first. */
@@ -369,6 +372,8 @@ export class HistoryPopupComponent implements Component, Focusable {
     private readonly done: Done,
     initialSelection = 0,
   ) {
+    // Never rewrite recalled prompts or persisted history; only previews are plain text.
+    this.displayTexts = history.map((entry) => sanitizeTerminalText(entry.text));
     this.input.onEscape = () => this.done(null);
     this.input.onSubmit = () => {
       this.done(this.getCurrentEntry()?.text ?? null);
@@ -460,7 +465,11 @@ export class HistoryPopupComponent implements Component, Focusable {
 
     const before = this.input.getValue();
     this.input.handleInput(data);
-    const after = this.input.getValue();
+    // Input owns its styling/cursor, so normalize the editable filter before it
+    // renders (including bracketed paste and undo), never the stored prompts.
+    const value = this.input.getValue();
+    const after = sanitizeTerminalText(value).replace(/\n/g, " ");
+    if (after !== value) this.input.setValue(after);
 
     if (after !== before) {
       this.query = after;
@@ -506,7 +515,7 @@ export class HistoryPopupComponent implements Component, Focusable {
     const historyIndex = this.matchIndices[matchIdx];
     const entry = historyIndex === undefined ? undefined : this.history[historyIndex];
     if (!entry) return "";
-    const text = toSingleLinePreview(entry.text);
+    const text = toSingleLinePreview(this.displayTexts[historyIndex] ?? "");
 
     const marker = isSelected ? "▌ " : "  ";
     const gutter = `${String(matchIdx + 1).padStart(indexWidth)} ${relativeAge(entry.timestamp, now).padStart(
@@ -531,13 +540,16 @@ export class HistoryPopupComponent implements Component, Focusable {
     const entry = this.getCurrentEntry();
     if (!entry || height <= 0) return [];
 
-    const wrapped = wrapTextWithAnsi(entry.text, width);
+    const historyIndex = this.matchIndices[this.matchPointer];
+    const wrapped = wrapTextWithAnsi(this.displayTexts[historyIndex] ?? "", width);
     const maxOffset = Math.max(0, wrapped.length - height);
     // Clamp here rather than in the key handler: the pane height is only known
     // at render time, so Ctrl+D cannot know where the end is.
     this.previewOffset = Math.min(this.previewOffset, maxOffset);
 
-    const lines = wrapped.slice(this.previewOffset, this.previewOffset + height).map((line) => t.fg("text", line));
+    const lines = wrapped
+      .slice(this.previewOffset, this.previewOffset + height)
+      .map((line) => t.fg("text", truncateToWidth(line, width)));
 
     if (maxOffset > 0 && lines.length > 0) {
       // Spend the last row on a scroll indicator — without it, a truncated

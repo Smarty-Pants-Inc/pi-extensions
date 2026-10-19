@@ -2,6 +2,8 @@ import { stripVTControlCharacters } from "node:util";
 import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { Container, type SizeValue } from "@earendil-works/pi-tui";
 
+export { sanitizeTerminalText } from "./terminal-text.js";
+
 // Structural native mouse contract: older supported hosts do not export these types.
 interface TuiMouseEvent {
   type: "press" | "release" | "move" | "drag" | "click" | "wheel";

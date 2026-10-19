@@ -9,6 +9,9 @@
   "piExtension": {
     "lifecycle": "stable"
   },
+  "dependencies": {
+    "@signalridge/pi-ui": "^1.3.3"
+  },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",

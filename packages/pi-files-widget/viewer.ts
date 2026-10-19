@@ -2,6 +2,7 @@ import { readFileSync, statSync } from "node:fs";
 import { relative } from "node:path";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { sanitizeTerminalText } from "@signalridge/pi-ui";
 
 import { DEFAULT_VIEWER_HEIGHT, MAX_VIEWER_HEIGHT, MIN_PANEL_HEIGHT, SEARCH_SCROLL_OFFSET } from "./constants.js";
 import { loadFileContent } from "./file-viewer.js";
@@ -277,7 +278,7 @@ export function createViewer(
     if (!state.file) return "";
     const isUntracked = isUntrackedStatus(state.file.gitStatus);
 
-    let header = theme.bold(state.file.name);
+    let header = theme.bold(sanitizeTerminalText(state.file.name).replace(/\n/g, " "));
     if (isUntracked) {
       header += theme.fg("dim", " [UNTRACKED]");
     } else if (state.diffMode) {
@@ -305,7 +306,7 @@ export function createViewer(
     }
 
     if (state.mode === "search") {
-      header += theme.fg("accent", `  /${state.searchQuery}█`);
+      header += theme.fg("accent", `  /${sanitizeTerminalText(state.searchQuery).replace(/\n/g, " ")}█`);
     } else if (state.searchQuery && state.searchMatches.length > 0) {
       header += theme.fg("dim", ` [${state.searchIndex + 1}/${state.searchMatches.length}]`);
     }
@@ -316,7 +317,7 @@ export function createViewer(
   function renderCommentEditor(width: number): string[] {
     const contentWidth = Math.max(1, width - 2);
     const wrappedLines: string[] = [];
-    const logicalLines = state.commentText.split("\n");
+    const logicalLines = sanitizeTerminalText(state.commentText).split("\n");
 
     for (const line of logicalLines) {
       if (line.length === 0) {
@@ -436,7 +437,10 @@ export function createViewer(
       for (let i = 0; i < state.height; i++) {
         if (i < visible.length) {
           const lineIdx = state.scroll + i;
-          const row = isSourceSelectionMode() ? `${String(lineIdx + 1).padStart(4)} │ ${visible[i]}` : visible[i];
+          // Treat loaded/rendered file rows and raw selection snapshots as content,
+          // not terminal instructions. Apply our own selection styling only afterward.
+          const content = sanitizeTerminalText(visible[i]).replace(/\n/g, " ");
+          const row = isSourceSelectionMode() ? `${String(lineIdx + 1).padStart(4)} │ ${content}` : content;
           let line = truncateToWidth(row || "", width);
           if (
             (state.mode === "select" || state.mode === "comment") &&
